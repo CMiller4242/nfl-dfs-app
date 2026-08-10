@@ -75,6 +75,48 @@ def load_players_prior_season_baseline() -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+@st.cache_data(show_spinner=False)
+def load_depth_chart_current() -> pd.DataFrame:
+    path = os.path.join(DATA_DIR, "depth_charts_current.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_injuries_current() -> pd.DataFrame:
+    path = os.path.join(DATA_DIR, "injuries_current.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_player_role_context() -> pd.DataFrame:
+    path = os.path.join(DATA_DIR, "player_role_context.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_depth_chart_metadata() -> dict:
+    path = os.path.join(DATA_DIR, "depth_chart_metadata.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+@st.cache_data(show_spinner=False)
+def load_injury_metadata() -> dict:
+    path = os.path.join(DATA_DIR, "injury_metadata.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
 def get_app_mode() -> str:
     """"in_season" or "preseason_week_1_baseline" - see dfs_data_pipeline.determine_app_mode."""
     return load_metadata().get("app_mode", "in_season")

@@ -10,15 +10,23 @@ Power BI refresh required.
 
 ```
 dfs_data_pipeline.py   Pure-function pipeline: nflreadpy -> Parquet in /data
+refresh_role_context.py  Standalone CLI: depth chart + injury role/eligibility refresh
 lib/data.py             Cached Parquet loaders shared by every page
 lib/dk_helper.py        DraftKings CSV parsing, player matching, projections
+lib/player_identity.py  Canonical player identity, team-code aliasing, strict DK<->role matching
+lib/role_config.py      Single config module for eligibility tiers, injury vocabulary, freshness limits
+lib/espn_injuries.py    ESPN roster/injury ingestion (HTTP retries, schema validation, status classification)
+lib/eligibility.py      Role/eligibility engine (depth-chart + injury -> role_classification)
+lib/manual_overrides.py Loader/validator for the manually-maintained eligibility override CSV
 app.py                  Home page (multi-page Streamlit entry point)
 pages/
   1_Position_Explorer.py   Per-position efficiency, volume/efficiency, trend
   2_Defense_Matchups.py    Defense-vs-position heatmap + detail
-  3_DFS_Lineup_Helper.py   DK salary upload -> matched, projected player pool
-tests/                  pytest suite for the pipeline and matching/projection logic
-.github/workflows/refresh_data.yml   Weekly (+ manual) data refresh
+  3_DFS_Lineup_Helper.py   DK salary upload -> matched, projected, role-filtered player pool
+tests/                  pytest suite for the pipeline, matching/projection, and role/eligibility logic
+data/manual/eligibility_overrides.csv   Manually-maintained, validated, expiring eligibility overrides
+.github/workflows/refresh_data.yml           Weekly (+ manual) player/team stat refresh
+.github/workflows/refresh_role_context.yml   Separate, faster-cadence depth-chart/injury refresh
 ```
 
 **Raw vs. derived data.** The pipeline writes two kinds of Parquet output:
@@ -31,10 +39,18 @@ tests/                  pytest suite for the pipeline and matching/projection lo
 | `data/team_summary.parquet` | one row per team | pass/rush volume, pass rate, sacks & turnovers forced per game |
 | `data/team_stats.parquet` | one row per team per completed week | raw team-week stats from nflreadpy |
 | `data/metadata.json` | - | season, latest completed week, next slate week, refresh status/timestamp |
+| `data/depth_charts_current.parquet` | one row per (player, position group) | canonical identity crosswalk + depth rank, from nflreadpy's `load_depth_charts()` |
+| `data/injuries_current.parquet` | one row per rostered ESPN athlete | ESPN roster/injury status, classified into the role-engine's availability vocabulary |
+| `data/player_role_context.parquet` | one row per (player, position group) | `role_classification`, eligibility flags, and the reasoning behind them - see "Depth chart & injury role/eligibility engine" below |
+| `data/depth_chart_metadata.json` / `data/injury_metadata.json` | - | per-source retrieval timestamp, success/failure detail, staleness inputs |
 
 The pipeline is a pure function of nflreadpy's source data - every run
 recomputes every output from scratch and overwrites the Parquet files, so
-re-running it never produces duplicate rows.
+re-running it never produces duplicate rows. Depth-chart/injury/role-context
+files follow the same "pure recomputation" rule for `player_role_context.parquet`
+specifically, but the two *source* snapshots (`depth_charts_current.parquet`,
+`injuries_current.parquet`) are the one exception - see the fail-closed
+refresh behavior below.
 
 ## Local setup
 
@@ -199,6 +215,152 @@ projections comes exclusively from `defense_matchups.parquet`
 (`matchup_delta`), which is computed only from fantasy points an opposing
 defense has allowed to a position - a completely separate calculation.
 
+## Player identity & the DK / nflreadpy / ESPN crosswalk
+
+DraftKings' salary CSV, nflreadpy's player stats, nflreadpy's depth charts,
+and ESPN's roster/injury API each have their own identifier space, and none
+of them was assumed to line up without checking. What's actually available,
+inspected directly rather than guessed:
+
+- **DK salary CSV**: no stable cross-source player ID at all - just `Name`
+  (display string), `TeamAbbrev` (DK's own team code, sometimes different
+  from nflreadpy's), and `Position`. A DK export's own `ID` column is
+  DK-internal (stable only across DK's own exports) and has no known mapping
+  to nflreadpy or ESPN, so it's never used as a join key.
+- **nflreadpy player stats**: `player_id` (a stable "gsis" ID, e.g.
+  `00-0033873`) is the backbone ID for everything else in this app
+  (`players_current.parquet`, `players_weekly.parquet`).
+- **nflreadpy depth charts** (`nflreadpy.load_depth_charts()`): a real,
+  roughly-daily-updated depth chart for all 32 teams where - critically -
+  each row carries **both** `gsis_id` (nflreadpy's ID space) **and**
+  `espn_id` (ESPN's athlete ID space) together. This is a verified,
+  source-provided crosswalk between nflreadpy and ESPN identity, not a name
+  guess, and it's what `lib/player_identity.build_identity_crosswalk` uses
+  directly. (The DynastyProcess player-ID crosswalk, `nfl.load_ff_playerids()`,
+  was evaluated and consistently returns `403 Forbidden` - it is not used or
+  relied on anywhere in this app.)
+- **ESPN roster/injury responses**: each athlete carries ESPN's own numeric
+  athlete `id`, `displayName`, and position/team context - the same ID space
+  captured as `espn_id` in nflreadpy's depth charts above.
+
+Because DK's CSV carries no stable ID, a DK row is joined to role/injury
+context through **normalized name + canonical team + position** -
+`lib/player_identity.match_dk_row_to_role_context` - deliberately stricter
+(zero fuzzy tolerance) than the stats matcher described above, because a
+wrong match here doesn't just cost a bad stat lookup, it can put a real
+injury or promotion label on the wrong player. Zero or multiple exact
+candidates both resolve to "no match," never a guess.
+
+## Depth chart & injury role/eligibility engine
+
+Projected value alone doesn't mean a player has a path to fantasy relevance -
+a talented backup buried on the depth chart can still show up with a strong
+`projected_value` from a good matchup, even though there's no real chance
+they see the field. The role/eligibility engine (`lib/eligibility.py`) exists
+specifically to keep bench players with no documented path out of the
+default **Top Value Plays**, while surfacing genuinely plausible backups
+(via injury) as clearly-labeled, evidence-backed plays.
+
+**Scope.** The engine is built around the NFL Sunday main slate (1pm-4pm
+ET) - it evaluates whoever the current depth chart and injury data say is
+active for that slate, not primetime/international games specifically.
+
+**Availability vocabulary** (`lib/espn_injuries.normalize_availability_classification`,
+statuses configured in `lib/role_config.py`):
+
+| `availability_classification` | Raw ESPN statuses | Meaning |
+|---|---|---|
+| `confirmed_unavailable` | Out, IR/Injured Reserve, Suspended, PUP, officially inactive, etc. | The **only** bucket that can elevate a backup |
+| `conditional` | Questionable, Doubtful | Monitor-only - **never** treated as confirmed-unavailable, never triggers an automatic elevation on its own |
+| `available` | Healthy, Active, Probable, or no injury entry listed at all | Normal availability |
+| `unknown` | Unrecognized status string, or no record at all for this player | Never treated as confirmation of anything either way |
+
+**Role classifications** (`role_classification`, computed per (team,
+position group), in priority order):
+
+1. **`role_unresolved`** - depth-chart data is stale/missing, this player's
+   own injury status is `unknown`, or the depth chart and injury source
+   disagree about this player's team (a safety check against a source that
+   hasn't caught up to a trade). Never eligible for anything. This is the
+   engine's fail-closed default - every DK row starts here and is only
+   overwritten by an exact identity match to role context, so any unresolved,
+   ambiguous, or unmatched player defaults to excluded, not "probably fine."
+2. **`inactive`** - the player is themselves `confirmed_unavailable`.
+   Never eligible, regardless of depth rank.
+3. **`confirmed_starter`** (depth rank 1) / **`standard_eligible_rotation`**
+   (rank within the configured tier) - eligible **regardless of anyone
+   else's injury status**; these are never mislabeled as an injury
+   replacement. Default eligible tiers (`DEFAULT_ELIGIBLE_DEPTH_RANK` in
+   `lib/role_config.py`, the one place to change them): QB1, RB1-2, WR1-3,
+   TE1-2.
+4. **`injury_elevated_backup`** - a bench-tier player where **every**
+   higher-ranked player at the same team+position is `confirmed_unavailable`.
+   Eligible, and always labeled "elevated" with the specific blocker(s) named
+   in `eligibility_reason` (e.g. *"Elevated role - Kirk Cousins (QB1) is
+   Out."*) - never relabeled with the injured starter's own rank.
+5. **`contingent_backup`** - a bench-tier player where no higher-ranked
+   player is available/unknown, but not every one of them is confirmed
+   unavailable either (at least one is merely `conditional`). Shown in the
+   **Plays to Monitor** section, included in the Player Pool only via the
+   "Include conditional injury replacements" toggle (**off by default**),
+   and **never** eligible for Top Value Plays regardless of that toggle.
+6. **`bench_no_clear_path`** - a bench-tier player with at least one
+   available-or-unknown player still ahead of them. Never eligible.
+
+Depth rank is deliberately **not** used as a stand-in for target share, snap
+share, or route rate - it's role context (who's ahead of whom), shown as its
+own auditable column, never smoothed into a fabricated opportunity metric.
+
+**Fail-closed freshness.** `INJURY_FRESHNESS_HOURS` (48) and
+`DEPTH_CHART_FRESHNESS_HOURS` (168, i.e. 7 days) in `lib/role_config.py`
+bound how old each source can be before it's treated as stale; stale data
+degrades to `role_unresolved` exactly like a failed fetch - the engine never
+asserts a confident classification off data that might no longer reflect
+reality, and the Lineup Helper page's freshness banner shows the same
+timestamps the engine used. A per-team ESPN fetch failure marks only that
+team's players `role_unresolved` (see `lib/espn_injuries.fetch_espn_injuries`)
+- there is no silent "assume healthy" fallback anywhere in this path, and a
+failed/empty refresh never overwrites the last-known-good depth-chart or
+injury Parquet file (`dfs_data_pipeline.write_snapshot_with_fallback`)
+- `player_role_context.parquet` is the one file always safe to write fresh,
+since it's a pure recomputation of whatever source data (fresh or preserved)
+is currently on disk.
+
+**On the Lineup Helper page:** the player pool is split into **Player Pool**
+(eligible plays), **Plays to Monitor** (`contingent_backup` - conditional
+injury paths), **Excluded by Role Context** (`inactive` / `bench_no_clear_path`,
+with the blocking player(s) named), **Needs Review** (unmatched/low-confidence
+stat rows, now also covering `role_unresolved` identity matches), and a
+collapsed **Inactive** section - each with the specific reason and, for
+elevated/monitor rows, the exact evidence chain.
+
+## Manual eligibility overrides
+
+`data/manual/eligibility_overrides.csv` is the one place a human can correct
+the automated engine - e.g. a beat-writer report that lands after the last
+scheduled refresh. It's loaded and validated exactly as strictly as any
+external source (`lib/manual_overrides.load_overrides`):
+
+- Required columns: `season, week, team, player_id, player_name, position,
+  override_status, reason, expires_at, updated_at`.
+- `player_id`, `reason`, `expires_at`, `team`, and `position` must all be
+  present and non-blank; `season`/`week` may be left blank to apply to any
+  active season/week, or filled in to scope the override to a specific slate.
+- `override_status` must be one of the engine's own real classifications
+  (`VALID_OVERRIDE_STATUSES` in `lib/role_config.py`) - **`role_unresolved`
+  is deliberately not a valid override value**, since it's a fail-closed
+  default, not something a human should need to assert.
+- `expires_at` must be a parseable, non-expired timestamp - an override
+  silently outliving its relevance is exactly the kind of stale-trust
+  failure this whole engine is designed to avoid.
+- Every row in the file gets a trace line (applied or dropped-with-reason)
+  printed by the pipeline, so a malformed or expired override is never
+  silently ignored.
+- An override is applied **only** when it uniquely identifies exactly one
+  `(player_id, canonical_team, position_group)` row in the current role
+  context - never across teams or positions, never a guess (see
+  `lib/eligibility._apply_overrides`).
+
 ## GitHub Actions refresh
 
 `.github/workflows/refresh_data.yml` runs `dfs_data_pipeline.py` every
@@ -223,6 +385,46 @@ means the pipeline or the commit step failed (open the run for the actual
 error); a run still queued or in progress means it's waiting behind the
 concurrency group or hasn't reached its scheduled time yet.
 
+### Depth chart / injury role-context refresh
+
+`.github/workflows/refresh_role_context.yml` is a **separate** workflow from
+the one above, on its own faster cadence and its own concurrency group
+(`refresh-role-context`) - depth charts and injury reports change more often,
+and closer to kickoff, than season-long player stats. It runs
+`refresh_role_context.py` (a thin CLI wrapper around
+`dfs_data_pipeline.run_role_refresh`) on:
+
+- Friday ~4pm EST (after that week's final injury report typically posts)
+- Sunday morning through early afternoon EST, ahead of the 1pm-4pm main
+  slate (8:00am, 10:00am, 11:30am, 12:45pm)
+- `workflow_dispatch` (manual trigger)
+
+and commits only the 5 role-context files
+(`depth_charts_current.parquet`, `injuries_current.parquet`,
+`player_role_context.parquet`, `depth_chart_metadata.json`,
+`injury_metadata.json`) if they changed.
+
+**Known limitation - cron is UTC, not DST-aware.** GitHub Actions cron
+schedules run in UTC and don't shift for daylight saving time. The times
+above are anchored to EST (UTC-5); during EDT portions of the season (early
+and late season) each run lands about an hour earlier in local ET than
+intended. The app never claims this data is real-time regardless of drift -
+it always displays the actual source retrieval timestamps and a staleness
+warning (see the freshness banner on the Lineup Helper page and the
+freshness limits in `lib/role_config.py`) rather than implying a schedule
+that isn't quite what it says.
+
+**Sandbox/CI limitation - ESPN's API is unreachable from some restricted
+network environments.** `site.api.espn.com` is an undocumented, unofficial
+endpoint; some sandboxed development environments block outbound requests to
+it entirely. `lib/espn_injuries.fetch_espn_injuries` was verified against
+that exact failure mode - it degrades gracefully (returns `source_success:
+False` with a specific error, never raises, never fabricates data) - but
+genuine end-to-end ESPN responses could only be exercised against synthetic
+payloads during development; real traffic only actually reaches ESPN once
+this runs in GitHub Actions or another environment with normal outbound
+access.
+
 ## Testing
 
 ```bash
@@ -246,6 +448,29 @@ best-candidate tracking, the no-fallback projection policy (`review_required`
 gets null projections, matchup_delta null-vs-resolved), and best-value-per-
 position filtering that excludes every non-`"ok"` row.
 
+The role/eligibility engine has its own dedicated test files:
+
+- `tests/test_player_identity.py` - the identity crosswalk (latest-snapshot
+  selection, fantasy-position filtering, missing-ID handling) and the
+  adversarial DK-row matcher (cross-team and cross-position rejection,
+  ambiguous-duplicate fail-closed, DK team-alias resolution).
+- `tests/test_espn_injuries.py` - the full status-classification vocabulary
+  (Questionable/Doubtful are never confirmed-unavailable), HTTP retry/backoff
+  behavior (5xx retried, 4xx not, exponential backoff), and per-team failure
+  isolation (one team's roster failure never drops another team's players or
+  flips the whole run to "healthy").
+- `tests/test_eligibility.py` - every role classification and the exact
+  edge cases from the product spec (e.g. "QB1 Out and QB2 Out -> QB3 may
+  become `injury_elevated_backup`"), cross-team/cross-position identity
+  safety (a NYJ player can never inherit a same-named NE player's injury),
+  fail-closed staleness/failure/team-mismatch handling with correct
+  per-source attribution, manual-override scoping, and a comprehensive check
+  that only the three eligible classifications ever carry
+  `role_eligible_for_top_values = True`.
+- `tests/test_manual_overrides.py` - override-file validation (missing
+  columns, missing fields, unrecognized/`role_unresolved` status, unparseable
+  or expired timestamps, season/week scoping) with a trace line for every row.
+
 ## Known limitations
 
 - **Early-season small samples.** With 1-2 games played, `consistency_score`
@@ -268,3 +493,18 @@ position filtering that excludes every non-`"ok"` row.
 - **Matching assumes one active player per (team, position) name.** If two
   players share a normalized name on the same team and position in a given
   season, the exact-match step arbitrarily returns the first one found.
+- **ESPN is an external, unofficial, imperfect source.** It is not an
+  official game-day inactive list, is not guaranteed real-time, and its
+  response schema could change without notice - see "Depth chart & injury
+  role/eligibility engine" above for how staleness, per-team failures, and
+  schema drift all fail closed rather than silently assuming health.
+- **Cron scheduling is UTC-fixed, not DST-aware** (see "GitHub Actions
+  refresh" above) - the role-context refresh workflow's Friday/Sunday times
+  drift by about an hour in local ET depending on the time of year.
+- **Manual overrides require a human to maintain them.** There is
+  intentionally no automated write path into
+  `data/manual/eligibility_overrides.csv` - it's a deliberate, auditable,
+  expiring correction mechanism, not another automated data source.
+- **Main-slate scope.** The role/eligibility engine is built around the
+  Sunday 1pm-4pm ET main slate; it does not special-case Thursday/Monday
+  night or international games.

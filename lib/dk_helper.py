@@ -11,20 +11,10 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 
 from dfs_data_pipeline import POSITIONS, safe_divide
-
-# DraftKings sometimes uses different team codes than nflreadpy. This is the
-# single shared mapping: DK's code -> the nflreadpy standard code.
-TEAM_ALIASES = {
-    "JAC": "JAX",
-    "LAR": "LA",
-    "LVR": "LV",
-    "OAK": "LV",
-    "SD": "LAC",
-    "STL": "LA",
-    "WSH": "WAS",
-}
-
-SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+# Canonical team-code aliasing and name normalization live in
+# lib.player_identity (the single shared identity module) - re-exported here
+# so existing imports of these names from lib.dk_helper keep working.
+from lib.player_identity import SUFFIXES, TEAM_ALIASES, normalize_name, normalize_team  # noqa: F401
 
 REQUIRED_DK_COLUMNS = ["Position", "Name", "Salary", "Game Info", "TeamAbbrev"]
 
@@ -49,21 +39,6 @@ MOMENTUM_ADJUSTMENT_WEIGHT = 0.20
 MATCHUP_ADJUSTMENT_WEIGHT = 0.30
 
 BEST_VALUE_TOP_N = 3
-
-
-def normalize_team(abbrev) -> str:
-    if not isinstance(abbrev, str):
-        return ""
-    code = abbrev.strip().upper()
-    return TEAM_ALIASES.get(code, code)
-
-
-def normalize_name(name) -> str:
-    if not isinstance(name, str):
-        return ""
-    name = name.lower().strip().replace(".", "").replace("'", "").replace("-", " ")
-    tokens = [t for t in name.split() if t not in SUFFIXES]
-    return " ".join(tokens)
 
 
 def validate_dk_columns(df: pd.DataFrame) -> list:

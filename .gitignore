@@ -20,10 +20,15 @@ data/consolidated/
 # Live/manual DraftKings salary uploads - never commit real slate data.
 # The app reads uploads in-memory only and never writes them to disk itself;
 # this just guards against someone dropping an export in the repo by hand.
+# data/dk_salaries/current.csv is a LOCAL convenience auto-load path (see
+# the Lineup Helper page) - place your current week's export there so you
+# don't have to re-upload every session; it's never committed.
 DKSalaries*.csv
 dk_salaries*.csv
 *.dksalaries.csv
+data/dk_salaries/*.csv
 /uploads/
 
-# NOTE: data/*.parquet and data/metadata.json are intentionally NOT ignored -
-# GitHub Actions commits the pipeline's refreshed output there every week.
+# NOTE: data/*.parquet, data/metadata.json, data/*_metadata.json, and
+# data/manual/eligibility_overrides.csv ARE intentionally NOT ignored -
+# GitHub Actions commits the pipeline's refreshed output there on schedule.

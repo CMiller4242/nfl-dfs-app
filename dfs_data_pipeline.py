@@ -210,6 +210,77 @@ def load_raw_team_stats(season):
     return df[cols].copy()
 
 
+def load_raw_depth_charts(season):
+    """
+    Raw depth-chart rows from nflreadpy - a real, roughly-daily-updated feed
+    covering all 32 teams, with each row carrying BOTH nflreadpy's own
+    `gsis_id` and ESPN's `espn_id` together (a verified identity crosswalk,
+    not a name guess). See lib/player_identity.py for how this gets turned
+    into the app's canonical identity crosswalk. NOT the same thing as the
+    old root-level `nfl_depth_chart.py`, which is a hardcoded, static Python
+    list frozen at some past roster snapshot and is no longer used by the
+    pipeline.
+    """
+    try:
+        return nfl.load_depth_charts([season]).to_pandas()
+    except Exception as exc:
+        print(f"Warning: could not load depth charts: {exc}")
+        return pd.DataFrame()
+
+
+def build_depth_chart_snapshot(raw_depth_chart_df, season, week):
+    """
+    The app's normalized depth-chart snapshot: canonical player identity
+    (`player_id` = gsis, `espn_id`), canonical team, fantasy position group
+    (QB/RB/WR/TE only), source-specific position, depth rank, source
+    timestamp, plus the season/week this snapshot is being used for (the
+    raw feed itself is just "current as of `dt`," not week-indexed - this
+    stamps which slate we're treating it as informing).
+
+    Depth rank means different things by position group and this is
+    deliberately NOT smoothed over: QB rank is normally a direct read of who
+    starts; RB/WR/TE rank is role CONTEXT (who's ahead of whom on the depth
+    chart), not a fabricated snap-share or target-share projection. Source
+    position and depth rank are kept as their own visible columns
+    specifically so this stays auditable rather than papered over.
+    """
+    from lib.player_identity import IDENTITY_CROSSWALK_COLUMNS, build_identity_crosswalk
+
+    crosswalk = build_identity_crosswalk(raw_depth_chart_df)
+    empty_columns = IDENTITY_CROSSWALK_COLUMNS + ["season", "week"]
+    if crosswalk.empty:
+        return pd.DataFrame(columns=empty_columns)
+
+    crosswalk = crosswalk.copy()
+    crosswalk["season"] = season
+    crosswalk["week"] = week
+    return crosswalk[empty_columns]
+
+
+def write_snapshot_with_fallback(df, path, label):
+    """
+    Write `df` to `path` UNLESS it's empty/invalid and a prior good file
+    already exists there - in that case the prior file is left untouched
+    (a failed refresh must never overwrite last-known-good depth-chart or
+    injury data with nothing). Returns True if `path` now holds a freshly
+    written snapshot, False if a prior snapshot was kept instead.
+    """
+    is_valid = df is not None and not df.empty
+    if is_valid:
+        df.to_parquet(path, index=False)
+        return True
+
+    if os.path.exists(path):
+        print(f"Warning: new {label} snapshot is empty/invalid - keeping the existing file at {path} unchanged.")
+        return False
+
+    # Nothing valid ever existed here either - write the empty-but-correctly
+    # -shaped frame so downstream loaders see a consistent (if empty) file
+    # rather than a missing one.
+    df.to_parquet(path, index=False)
+    return True
+
+
 def build_players_weekly(raw_player_df, season, latest_completed_week):
     """One row per player per COMPLETED week this season. Raw stats only -
     no rolling averages or ratios live here, just the observed box score
@@ -509,6 +580,91 @@ def build_team_summary(raw_team_df, season, latest_completed_week):
     return agg[[c for c in TEAM_SUMMARY_EMPTY_COLUMNS if c in agg.columns]]
 
 
+def run_role_refresh(season, week, data_dir=None):
+    """
+    Refresh depth-chart + ESPN injury + role/eligibility outputs. Deliberately
+    independent of the player-stat pipeline above - injury reports and depth
+    charts change on their own cadence (see .github/workflows for the
+    separate Friday/Sunday schedule) and this is fast enough to re-run close
+    to lock without re-pulling the whole season's stats.
+
+    A failed/empty depth-chart or injury fetch NEVER overwrites the last
+    known good Parquet file for that source (see `write_snapshot_with_fallback`)
+    - `player_role_context.parquet`, by contrast, is always safe to write
+    fresh, since it's a pure recomputation from whatever depth/injury data is
+    currently on disk (freshly fetched or a preserved prior snapshot either
+    way), never itself "the last known good source."
+    """
+    from lib.eligibility import compute_role_context
+    from lib.espn_injuries import fetch_espn_injuries
+    from lib.manual_overrides import load_overrides
+
+    data_dir = data_dir or DATA_DIR
+    os.makedirs(data_dir, exist_ok=True)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    raw_depth = load_raw_depth_charts(season)
+    depth_df = build_depth_chart_snapshot(raw_depth, season, week)
+    depth_chart_source_timestamp = (
+        depth_df["depth_chart_source_timestamp"].iloc[0] if not depth_df.empty else None
+    )
+
+    injuries_df, injury_run_metadata = fetch_espn_injuries()
+
+    overrides_df, override_log = load_overrides(season=season, week=week)
+    for line in override_log:
+        print(f"[manual override] {line}")
+
+    role_context_df = compute_role_context(depth_df, injuries_df, injury_run_metadata, overrides_df)
+
+    depth_path = os.path.join(data_dir, "depth_charts_current.parquet")
+    injuries_path = os.path.join(data_dir, "injuries_current.parquet")
+    role_path = os.path.join(data_dir, "player_role_context.parquet")
+
+    depth_written_fresh = write_snapshot_with_fallback(depth_df, depth_path, "depth chart")
+    injuries_written_fresh = write_snapshot_with_fallback(injuries_df, injuries_path, "ESPN injury")
+    role_context_df.to_parquet(role_path, index=False)
+
+    if depth_written_fresh and not depth_df.empty:
+        depth_status = "ok"
+    elif not depth_written_fresh:
+        depth_status = "stale_kept"
+    else:
+        depth_status = "unavailable"
+
+    depth_chart_metadata = {
+        "season": season,
+        "week": week,
+        "fetched_at": now_iso,
+        "source_timestamp": depth_chart_source_timestamp,
+        "record_count": int(len(depth_df)),
+        "teams_covered": int(depth_df["canonical_team"].nunique()) if not depth_df.empty else 0,
+        "status": depth_status,
+    }
+    with open(os.path.join(data_dir, "depth_chart_metadata.json"), "w") as f:
+        json.dump(depth_chart_metadata, f, indent=2)
+
+    injury_metadata = {**injury_run_metadata, "season": season, "week": week, "written_fresh": injuries_written_fresh}
+    with open(os.path.join(data_dir, "injury_metadata.json"), "w") as f:
+        json.dump(injury_metadata, f, indent=2)
+
+    print(f"Depth chart snapshot: {json.dumps(depth_chart_metadata, indent=2)}")
+    print(
+        f"ESPN injuries: {injury_run_metadata.get('teams_succeeded')}/"
+        f"{injury_run_metadata.get('teams_attempted')} teams succeeded, "
+        f"source_success={injury_run_metadata.get('source_success')}"
+    )
+    print(f"Role context: {len(role_context_df)} players classified")
+    if not role_context_df.empty:
+        print(role_context_df["role_classification"].value_counts().to_string())
+
+    return {
+        "depth_chart_metadata": depth_chart_metadata,
+        "injury_metadata": injury_metadata,
+        "role_context_rows": int(len(role_context_df)),
+    }
+
+
 def run_pipeline():
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -595,6 +751,10 @@ def run_pipeline():
     print(f"  team_summary.parquet:                {len(team_summary_df):>6} rows")
     print(f"  team_stats.parquet (raw):            {len(raw_team_df):>6} rows")
     print(f"  players_prior_season_baseline.parquet: {len(baseline_df):>4} rows")
+
+    print("\nRefreshing role/eligibility context (depth chart + ESPN injuries)...")
+    role_week = next_slate_week if next_slate_week is not None else (latest_completed_week or 1)
+    metadata["role_refresh"] = run_role_refresh(active_season, role_week)
 
     return metadata
 

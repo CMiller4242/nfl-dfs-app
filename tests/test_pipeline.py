@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -8,6 +10,7 @@ from dfs_data_pipeline import (
     _classify_opportunity_trend,
     _player_recent_form,
     build_defense_matchups,
+    build_depth_chart_snapshot,
     build_players_current,
     build_players_weekly,
     build_prior_season_baseline,
@@ -16,6 +19,7 @@ from dfs_data_pipeline import (
     determine_app_mode,
     determine_week_status,
     safe_divide,
+    write_snapshot_with_fallback,
 )
 
 
@@ -428,3 +432,76 @@ def test_prior_season_baseline_empty_input_has_schema():
     assert "historical_team" in baseline.columns
     assert "avg_fantasy_points" in baseline.columns
     assert "momentum_score" not in baseline.columns
+
+
+# ---------------------------------------------------------------------------
+# build_depth_chart_snapshot
+# ---------------------------------------------------------------------------
+def _raw_depth_chart_row(gsis_id, espn_id, name, team, pos_abb, pos_rank, dt="2026-09-01T00:00:00Z"):
+    return {
+        "dt": dt, "team": team, "player_name": name, "espn_id": espn_id, "gsis_id": gsis_id,
+        "pos_grp_id": 1, "pos_grp": "Offense", "pos_id": 1, "pos_name": pos_abb,
+        "pos_abb": pos_abb, "pos_slot": pos_rank, "pos_rank": pos_rank,
+    }
+
+
+def test_build_depth_chart_snapshot_stamps_season_and_week():
+    raw = pd.DataFrame([_raw_depth_chart_row("00-1", "1", "Some Guy", "KC", "QB", 1)])
+    snapshot = build_depth_chart_snapshot(raw, season=2026, week=1)
+    assert len(snapshot) == 1
+    assert snapshot.iloc[0]["season"] == 2026
+    assert snapshot.iloc[0]["week"] == 1
+    assert snapshot.iloc[0]["player_id"] == "00-1"
+
+
+def test_build_depth_chart_snapshot_empty_input_has_schema():
+    snapshot = build_depth_chart_snapshot(pd.DataFrame(), season=2026, week=1)
+    assert snapshot.empty
+    assert "season" in snapshot.columns
+    assert "week" in snapshot.columns
+    assert "player_id" in snapshot.columns
+
+
+# ---------------------------------------------------------------------------
+# write_snapshot_with_fallback - never overwrite last-known-good data with
+# an empty/failed refresh
+# ---------------------------------------------------------------------------
+def test_write_snapshot_with_fallback_writes_valid_data(tmp_path):
+    path = str(tmp_path / "snapshot.parquet")
+    df = pd.DataFrame([{"a": 1}])
+    written_fresh = write_snapshot_with_fallback(df, path, label="test")
+    assert written_fresh is True
+    assert pd.read_parquet(path)["a"].tolist() == [1]
+
+
+def test_write_snapshot_with_fallback_writes_empty_frame_when_nothing_existed_before(tmp_path):
+    path = str(tmp_path / "snapshot.parquet")
+    df = pd.DataFrame(columns=["a"])
+    written_fresh = write_snapshot_with_fallback(df, path, label="test")
+    assert written_fresh is True
+    assert os.path.exists(path)
+    assert pd.read_parquet(path).empty
+
+
+def test_write_snapshot_with_fallback_preserves_prior_good_file_on_empty_refresh(tmp_path):
+    path = str(tmp_path / "snapshot.parquet")
+    good_df = pd.DataFrame([{"a": 1}, {"a": 2}])
+    write_snapshot_with_fallback(good_df, path, label="test")
+
+    empty_df = pd.DataFrame(columns=["a"])
+    written_fresh = write_snapshot_with_fallback(empty_df, path, label="test")
+
+    assert written_fresh is False
+    # The original good data must still be there, untouched.
+    assert pd.read_parquet(path)["a"].tolist() == [1, 2]
+
+
+def test_write_snapshot_with_fallback_preserves_prior_good_file_on_none(tmp_path):
+    path = str(tmp_path / "snapshot.parquet")
+    good_df = pd.DataFrame([{"a": 1}])
+    write_snapshot_with_fallback(good_df, path, label="test")
+
+    written_fresh = write_snapshot_with_fallback(None, path, label="test")
+
+    assert written_fresh is False
+    assert pd.read_parquet(path)["a"].tolist() == [1]
