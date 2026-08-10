@@ -1,0 +1,17 @@
+away_team,home_team,game_date,total,spread,implied_away_total,implied_home_total
+Dallas Cowboys,Washington Commanders,2025-12-25T18:00:00Z,50.5,7.0,21.75,28.75
+Detroit Lions,Minnesota Vikings,2025-12-25T21:30:00Z,43.5,7.5,18.0,25.5
+Denver Broncos,Kansas City Chiefs,2025-12-26T01:15:00Z,36.5,13.5,11.5,25.0
+Houston Texans,Los Angeles Chargers,2025-12-27T21:30:00Z,39.5,-2.5,21.0,18.5
+Baltimore Ravens,Green Bay Packers,2025-12-28T01:00:00Z,40.5,-3.0,21.75,18.75
+Arizona Cardinals,Cincinnati Bengals,2025-12-28T18:00:00Z,52.5,-7.0,29.75,22.75
+Seattle Seahawks,Carolina Panthers,2025-12-28T18:00:00Z,42.5,7.0,17.75,24.75
+Pittsburgh Steelers,Cleveland Browns,2025-12-28T18:00:00Z,33.5,3.0,15.25,18.25
+Jacksonville Jaguars,Indianapolis Colts,2025-12-28T18:00:00Z,48.5,6.5,21.0,27.5
+Tampa Bay Buccaneers,Miami Dolphins,2025-12-28T18:00:00Z,45.5,5.5,20.0,25.5
+New England Patriots,New York Jets,2025-12-28T18:00:00Z,42.5,13.5,14.5,28.0
+New Orleans Saints,Tennessee Titans,2025-12-28T18:00:00Z,39.5,2.5,18.5,21.0
+New York Giants,Las Vegas Raiders,2025-12-28T21:05:00Z,41.5,-1.5,21.5,20.0
+Philadelphia Eagles,Buffalo Bills,2025-12-28T21:25:00Z,43.5,-1.5,22.5,21.0
+Chicago Bears,San Francisco 49ers,2025-12-29T01:20:00Z,52.5,-3.0,27.75,24.75
+Los Angeles Rams,Atlanta Falcons,2025-12-30T01:15:00Z,49.5,7.5,21.0,28.5

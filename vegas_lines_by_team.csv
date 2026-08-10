@@ -1,0 +1,33 @@
+team,opponent,game_date,game_total,spread,implied_total,is_home
+Washington Commanders,Dallas Cowboys,2025-12-25T18:00:00Z,50.5,7.0,28.75,True
+Dallas Cowboys,Washington Commanders,2025-12-25T18:00:00Z,50.5,-7.0,21.75,False
+Minnesota Vikings,Detroit Lions,2025-12-25T21:30:00Z,43.5,7.5,25.5,True
+Detroit Lions,Minnesota Vikings,2025-12-25T21:30:00Z,43.5,-7.5,18.0,False
+Kansas City Chiefs,Denver Broncos,2025-12-26T01:15:00Z,36.5,13.5,25.0,True
+Denver Broncos,Kansas City Chiefs,2025-12-26T01:15:00Z,36.5,-13.5,11.5,False
+Los Angeles Chargers,Houston Texans,2025-12-27T21:30:00Z,39.5,-2.5,18.5,True
+Houston Texans,Los Angeles Chargers,2025-12-27T21:30:00Z,39.5,2.5,21.0,False
+Green Bay Packers,Baltimore Ravens,2025-12-28T01:00:00Z,40.5,-3.0,18.75,True
+Baltimore Ravens,Green Bay Packers,2025-12-28T01:00:00Z,40.5,3.0,21.75,False
+Cincinnati Bengals,Arizona Cardinals,2025-12-28T18:00:00Z,52.5,-7.0,22.75,True
+Arizona Cardinals,Cincinnati Bengals,2025-12-28T18:00:00Z,52.5,7.0,29.75,False
+Carolina Panthers,Seattle Seahawks,2025-12-28T18:00:00Z,42.5,7.0,24.75,True
+Seattle Seahawks,Carolina Panthers,2025-12-28T18:00:00Z,42.5,-7.0,17.75,False
+Cleveland Browns,Pittsburgh Steelers,2025-12-28T18:00:00Z,33.5,3.0,18.25,True
+Pittsburgh Steelers,Cleveland Browns,2025-12-28T18:00:00Z,33.5,-3.0,15.25,False
+Indianapolis Colts,Jacksonville Jaguars,2025-12-28T18:00:00Z,48.5,6.5,27.5,True
+Jacksonville Jaguars,Indianapolis Colts,2025-12-28T18:00:00Z,48.5,-6.5,21.0,False
+Miami Dolphins,Tampa Bay Buccaneers,2025-12-28T18:00:00Z,45.5,5.5,25.5,True
+Tampa Bay Buccaneers,Miami Dolphins,2025-12-28T18:00:00Z,45.5,-5.5,20.0,False
+New York Jets,New England Patriots,2025-12-28T18:00:00Z,42.5,13.5,28.0,True
+New England Patriots,New York Jets,2025-12-28T18:00:00Z,42.5,-13.5,14.5,False
+Tennessee Titans,New Orleans Saints,2025-12-28T18:00:00Z,39.5,2.5,21.0,True
+New Orleans Saints,Tennessee Titans,2025-12-28T18:00:00Z,39.5,-2.5,18.5,False
+Las Vegas Raiders,New York Giants,2025-12-28T21:05:00Z,41.5,-1.5,20.0,True
+New York Giants,Las Vegas Raiders,2025-12-28T21:05:00Z,41.5,1.5,21.5,False
+Buffalo Bills,Philadelphia Eagles,2025-12-28T21:25:00Z,43.5,-1.5,21.0,True
+Philadelphia Eagles,Buffalo Bills,2025-12-28T21:25:00Z,43.5,1.5,22.5,False
+San Francisco 49ers,Chicago Bears,2025-12-29T01:20:00Z,52.5,-3.0,24.75,True
+Chicago Bears,San Francisco 49ers,2025-12-29T01:20:00Z,52.5,3.0,27.75,False
+Atlanta Falcons,Los Angeles Rams,2025-12-30T01:15:00Z,49.5,7.5,28.5,True
+Los Angeles Rams,Atlanta Falcons,2025-12-30T01:15:00Z,49.5,-7.5,21.0,False
