@@ -287,3 +287,149 @@ def best_value_by_position(df: pd.DataFrame, positions=POSITIONS, top_n: int = B
         pos: eligible[eligible["Position"] == pos].sort_values("projected_value", ascending=False).head(top_n)
         for pos in positions
     }
+
+
+# ---------------------------------------------------------------------------
+# Week 1 / preseason baseline mode
+#
+# Used only when the active season has no completed regular-season week yet
+# (see dfs_data_pipeline.determine_app_mode). Entirely additive - none of the
+# in-season functions above are modified or called from here, so in-season
+# behavior is unaffected.
+# ---------------------------------------------------------------------------
+
+# players_prior_season_baseline columns carried onto a matched DK row,
+# prefixed with `stat_`. No momentum/WoW/matchup fields exist on that table
+# by design (see build_prior_season_baseline).
+PRIOR_SEASON_STAT_COLUMNS_TO_CARRY = [
+    "player_id", "player_display_name", "position", "historical_team", "season",
+    "games_played", "avg_fantasy_points", "total_touches", "total_targets", "total_carries",
+    "yards_per_target", "yards_per_carry", "catch_rate", "points_per_touch",
+    "yards_per_touch", "target_share_pct", "air_yards_share_pct", "consistency_score",
+]
+
+
+def match_dk_players_prior_season(dk_df: pd.DataFrame, prior_stats_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Match DK salary rows to a PRIOR season's baseline stats. Conservative by
+    construction - only two exact-match tiers, no fuzzy matching at all:
+
+      1. normalized name + DK's current team + position, exact - covers
+         every player who didn't change teams over the offseason.
+      2. normalized name + position only (team ignored, since the player may
+         have moved), accepted ONLY when it uniquely identifies exactly one
+         player in the prior season's data. Labeled `prior_team_identity_match`.
+
+    If step 2 finds zero candidates (no prior-season history - e.g. a
+    rookie) or 2+ candidates (an ambiguous common name at that position),
+    the row is left unmatched for manual review rather than guessed -
+    `match_method` distinguishes the two cases (`unmatched` vs
+    `ambiguous_prior_season_match`) so a reviewer knows why. There is no
+    fuzzy-name step here at all, let alone an unrestricted one.
+
+    Adds `match_method`, `match_score` (100.0 for either exact tier, else
+    None), `matched_player_name`, `best_candidate_name` (a "; "-joined list
+    of the ambiguous candidates' names, when that's the reason for review),
+    `historical_team`, `current_team` (DK's own team, canonicalized), and
+    `stat_*`-prefixed columns from `PRIOR_SEASON_STAT_COLUMNS_TO_CARRY`.
+    """
+    stats = prior_stats_df.copy()
+    stats["_norm_name"] = stats["player_display_name"].apply(normalize_name)
+    stats["_norm_team"] = stats["historical_team"].apply(normalize_team)
+
+    exact_name_team_position = {}
+    name_position_groups = {}
+    for idx, row in stats.iterrows():
+        exact_name_team_position.setdefault((row["_norm_name"], row["_norm_team"], row["position"]), idx)
+        name_position_groups.setdefault((row["_norm_name"], row["position"]), []).append(idx)
+
+    records = []
+    for _, dk_row in dk_df.iterrows():
+        dk_name_norm = normalize_name(dk_row.get("Name"))
+        dk_team_norm = normalize_team(dk_row.get("TeamAbbrev"))
+        dk_position = dk_row.get("Position")
+
+        match_idx = None
+        match_method = "unmatched"
+        match_score = None
+        best_candidate_name = None
+
+        key_full = (dk_name_norm, dk_team_norm, dk_position)
+        if key_full in exact_name_team_position:
+            match_idx = exact_name_team_position[key_full]
+            match_method = "exact_name_team_position"
+            match_score = 100.0
+        else:
+            candidates = name_position_groups.get((dk_name_norm, dk_position), [])
+            if len(candidates) == 1:
+                match_idx = candidates[0]
+                match_method = "prior_team_identity_match"
+                match_score = 100.0
+            elif len(candidates) >= 2:
+                match_method = "ambiguous_prior_season_match"
+                best_candidate_name = "; ".join(
+                    sorted(stats.loc[i, "player_display_name"] for i in candidates)
+                )
+            # len(candidates) == 0 -> no prior-season history at all (e.g. a rookie) - stays "unmatched"
+
+        record = dk_row.to_dict()
+        record["match_method"] = match_method
+        record["match_score"] = match_score
+        record["matched_player_name"] = None
+        record["best_candidate_name"] = best_candidate_name
+        record["historical_team"] = None
+        record["current_team"] = dk_team_norm
+        if match_idx is not None:
+            stat_row = stats.loc[match_idx]
+            record["matched_player_name"] = stat_row["player_display_name"]
+            record["historical_team"] = stat_row["historical_team"]
+            for col in PRIOR_SEASON_STAT_COLUMNS_TO_CARRY:
+                if col in stat_row.index:
+                    record[f"stat_{col}"] = stat_row[col]
+        records.append(record)
+
+    return pd.DataFrame(records)
+
+
+def compute_prior_season_projections(matched_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Week 1 baseline projection: for a confidently-matched player with prior-
+    season history, `projected_points = prior_season_avg_fantasy_points` -
+    no momentum or matchup adjustment, because neither exists yet this
+    season. `momentum_score` and `matchup_delta` are set to null (not 0.0)
+    so it's unambiguous they're unavailable rather than neutral. `opponent`
+    is still parsed from the DK row's own `Game Info` for display, even
+    though there's no matchup-quality data to look it up against.
+
+    `projection_status` follows the same vocabulary as in-season mode
+    (`ok` / `review_required` / `no_player_average` / `no_salary`), reusing
+    `needs_review()` and `best_value_by_position()` unchanged.
+    """
+    df = matched_df.copy()
+
+    df["opponent"] = df.apply(lambda r: parse_opponent(r.get("Game Info"), r.get("TeamAbbrev")), axis=1)
+
+    is_matched = df["match_method"].isin(["exact_name_team_position", "prior_team_identity_match"])
+
+    stat_player_avg = df["stat_avg_fantasy_points"] if "stat_avg_fantasy_points" in df.columns else pd.Series(pd.NA, index=df.index)
+    player_avg = stat_player_avg.where(is_matched)
+
+    salary = pd.to_numeric(df["Salary"], errors="coerce")
+    no_salary = salary.isna() | (salary <= 0)
+    no_avg = player_avg.isna()
+
+    projected_points = player_avg.mask(~is_matched | no_salary | no_avg)
+
+    status = pd.Series("ok", index=df.index)
+    status = status.mask(no_salary, "no_salary")
+    status = status.mask(no_avg, "no_player_average")
+    status = status.mask(~is_matched, "review_required")
+
+    df["player_avg"] = player_avg.round(2)
+    df["momentum_score"] = pd.NA  # never available in preseason mode - null, not 0.0
+    df["matchup_delta"] = pd.NA   # never available in preseason mode - null, not 0.0
+    df["projected_points"] = projected_points.round(2)
+    df["projected_value"] = safe_divide(projected_points, salary / 1000).round(2)
+    df["projection_status"] = status
+
+    return df
