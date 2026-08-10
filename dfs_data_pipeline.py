@@ -193,13 +193,26 @@ def build_players_weekly(raw_player_df, season, latest_completed_week):
 
     df["touches"] = df[["targets", "carries"]].fillna(0).sum(axis=1)
 
-    # Idempotency guard: a rerun always recomputes from source, but dedupe
-    # defensively in case nflreadpy ever emits more than one row for the
-    # same player/week (e.g. a corrected stat re-publish).
+    # Uniqueness: one row per player per week. `player_id` is a stable,
+    # globally-unique id in nflreadpy's schema (not team-scoped), and a
+    # player is only ever on one team for a given week's game, so
+    # (player_id, week) - not (player_id, team, week) - is the correct grain;
+    # collapsing on it also self-heals the rare case of a player_id somehow
+    # carrying two different team values for the same week.
+    dup_mask = df.duplicated(subset=["player_id", "week"], keep=False)
+    if dup_mask.any():
+        print(
+            f"Warning: {int(dup_mask.sum())} duplicate player-week rows found in source "
+            f"data (same player_id + week); keeping one row per player-week."
+        )
+
     df = (
         df.sort_values(["player_id", "week"])
         .drop_duplicates(subset=["player_id", "week"], keep="last")
         .reset_index(drop=True)
+    )
+    assert not df.duplicated(subset=["player_id", "week"]).any(), (
+        "player-week uniqueness violated after dedup - this should be unreachable"
     )
     return df
 
@@ -369,7 +382,16 @@ def build_defense_matchups(weekly_df):
 
 def build_team_summary(raw_team_df, season, latest_completed_week):
     """
-    Team-level offense volume + defensive production, completed weeks only.
+    Team-level offense volume + the team's OWN defensive production
+    (sacks_per_game, turnovers_forced_per_game come from that team's
+    def_sacks/def_interceptions/def_fumbles_forced - what that team's
+    defense did, not what was done to it), completed weeks only.
+
+    This table is informational context only and is never read by the DK
+    Lineup Helper's projection formula - matchup quality there comes
+    exclusively from `defense_matchups` (fantasy points a defense allows to
+    a position), computed in `build_defense_matchups` below.
+
     Intentionally does NOT include a points-allowed field: nflreadpy's
     team_stats has no scoring column, and fabricating one from other fields
     would be misleading.
@@ -447,6 +469,14 @@ def run_pipeline():
 
     print(f"Wrote Parquet files + metadata.json to {DATA_DIR}")
     print(json.dumps(metadata, indent=2))
+
+    print("\nRecord counts:")
+    print(f"  players_weekly.parquet:     {len(weekly_df):>6} rows")
+    print(f"  players_current.parquet:    {len(current_df):>6} rows")
+    print(f"  defense_matchups.parquet:   {len(defense_matchups_df):>6} rows")
+    print(f"  team_summary.parquet:       {len(team_summary_df):>6} rows")
+    print(f"  team_stats.parquet (raw):   {len(raw_team_df):>6} rows")
+
     return metadata
 
 

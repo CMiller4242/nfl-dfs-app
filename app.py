@@ -29,8 +29,8 @@ if not meta or meta.get("status") != "ok" or current.empty:
 # Quick summary stats
 # ---------------------------------------------------------------------------
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Latest Completed Week", meta.get("latest_completed_week", "?"))
-col2.metric("Next Slate Week", meta.get("next_slate_week") or "Season complete")
+col1.metric("Data Through Week", meta.get("latest_completed_week", "?"))
+col2.metric("Building Week", meta.get("next_slate_week") or "Season complete")
 col3.metric("Players Tracked", f"{meta.get('player_count', len(current)):,}")
 col4.metric("Teams", len(meta.get("teams", [])))
 

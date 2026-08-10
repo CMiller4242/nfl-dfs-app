@@ -11,6 +11,7 @@ from lib.dk_helper import (
     best_value_by_position,
     compute_projections,
     match_dk_players,
+    needs_review,
     validate_dk_columns,
 )
 
@@ -51,14 +52,15 @@ except ValueError as exc:
     st.error(str(exc))
     st.stop()
 
-confident = result[result["match_method"] != "unmatched"]
-review = result[result["match_method"] == "unmatched"]
+matched_mask = result["match_method"] != "unmatched"
+review_needed = needs_review(result)
 st.success(
-    f"{len(confident)} of {len(result)} players matched with confidence "
+    f"{matched_mask.sum()} of {len(result)} players matched with confidence "
     f"({(result['match_method'] == 'exact_name_team_position').sum()} exact name+team+position, "
     f"{(result['match_method'] == 'exact_name_team').sum()} exact name+team, "
     f"{(result['match_method'] == 'fuzzy_team_position').sum()} fuzzy). "
-    f"{len(review)} need manual review."
+    f"{len(review_needed)} row(s) need review (unresolved match, missing average, or missing salary) "
+    "and are excluded from value rankings below."
 )
 
 st.divider()
@@ -77,20 +79,20 @@ with f3:
     team_options = sorted(result["TeamAbbrev"].dropna().unique())
     team_filter = st.multiselect("Team", team_options, default=[])
 with f4:
-    valid_values = result["projected_value"].dropna()
     min_value_filter = st.number_input(
         "Min projected value", min_value=0.0, value=0.0, step=0.1, format="%.1f",
-        help="Filters on projected points per $1000 salary."
+        help="Filters on projected points per $1000 salary. Only applies to rows with a real projection."
     )
 with f5:
     matchup_quality = st.multiselect(
-        "Matchup quality", ["Favorable", "Neutral", "Tough"], default=["Favorable", "Neutral", "Tough"]
+        "Matchup quality", ["Favorable", "Neutral", "Tough", "Unknown"],
+        default=["Favorable", "Neutral", "Tough", "Unknown"],
     )
 
 
 def _matchup_bucket(delta):
     if pd.isna(delta):
-        return "Neutral"
+        return "Unknown"
     if delta >= 0.5:
         return "Favorable"
     if delta <= -0.5:
@@ -98,15 +100,24 @@ def _matchup_bucket(delta):
     return "Neutral"
 
 
+result = result.copy()
 result["matchup_quality"] = result["matchup_delta"].apply(_matchup_bucket)
 
-filtered = result[result["Position"].isin(pos_filter)] if pos_filter else result
-filtered = filtered[filtered["Salary"] >= min_salary_filter]
+# Position/team/salary scope the whole page (pool + review). Value and
+# matchup-quality filters only make sense for rows with a real projection,
+# so they're applied after splitting off the review-required rows below.
+base_filtered = result[result["Position"].isin(pos_filter)] if pos_filter else result
+base_filtered = base_filtered[base_filtered["Salary"] >= min_salary_filter]
 if team_filter:
-    filtered = filtered[filtered["TeamAbbrev"].isin(team_filter)]
+    base_filtered = base_filtered[base_filtered["TeamAbbrev"].isin(team_filter)]
+
+pool_rows = base_filtered[base_filtered["projection_status"] == "ok"]
 if min_value_filter > 0:
-    filtered = filtered[filtered["projected_value"].fillna(-1) >= min_value_filter]
-filtered = filtered[filtered["matchup_quality"].isin(matchup_quality)] if matchup_quality else filtered
+    pool_rows = pool_rows[pool_rows["projected_value"] >= min_value_filter]
+if matchup_quality:
+    pool_rows = pool_rows[pool_rows["matchup_quality"].isin(matchup_quality)]
+
+review_rows = needs_review(base_filtered)
 
 st.divider()
 
@@ -115,13 +126,14 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.subheader("💎 Top Value Plays by Position")
 st.caption(
-    "Filtered to each position first, then ranked by projected value. Excludes players with "
-    "no/zero salary or an unresolved match, so a labeled fallback can never show up as a value play."
+    "Filtered to each position first, then ranked by projected value. Only rows with a "
+    "confident player match, a real season average, and a usable salary are eligible - "
+    "review-required, unmatched, and $0/missing-salary rows never appear here."
 )
-best_value = best_value_by_position(filtered)
+best_value = best_value_by_position(pool_rows)
 value_cols = st.columns(len(POSITIONS))
 for col, pos in zip(value_cols, POSITIONS):
-    pos_df = best_value.get(pos, filtered.iloc[0:0])
+    pos_df = best_value.get(pos, pool_rows.iloc[0:0])
     with col:
         st.markdown(f"**{pos}**")
         if pos_df.empty:
@@ -135,11 +147,12 @@ for col, pos in zip(value_cols, POSITIONS):
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Full player pool (confident matches only, review table is separate below)
+# Player pool - only rows with a real, confident projection (projection_status == "ok")
 # ---------------------------------------------------------------------------
 st.subheader("Player Pool")
+st.caption("Only players with a confident match and a computable projection. See \"Needs Review\" below for everything else.")
 
-pool = filtered.rename(
+pool = pool_rows.rename(
     columns={
         "TeamAbbrev": "Team",
         "opponent": "Opponent",
@@ -150,59 +163,70 @@ pool = filtered.rename(
         "projected_value": "Projected Value",
         "match_method": "Match Method",
         "match_score": "Match Score",
-        "projection_status": "Status",
+        "matchup_quality": "Matchup Quality",
     }
 )[
     ["Name", "Position", "Team", "Opponent", "Salary", "Season Avg", "Momentum", "Matchup Delta",
-     "Projected Points", "Projected Value", "matchup_quality", "Match Method", "Status"]
-].rename(columns={"matchup_quality": "Matchup Quality"}).sort_values("Projected Value", ascending=False, na_position="last")
+     "Projected Points", "Projected Value", "Matchup Quality", "Match Method", "Match Score"]
+].sort_values("Projected Value", ascending=False, na_position="last")
 
-st.dataframe(
-    pool,
-    width="stretch",
-    hide_index=True,
-    column_config={
-        "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
-        "Season Avg": st.column_config.NumberColumn("Season Avg", format="%.1f"),
-        "Momentum": st.column_config.NumberColumn("Momentum", format="%.1f"),
-        "Matchup Delta": st.column_config.NumberColumn("Matchup Delta", format="%.1f"),
-        "Projected Points": st.column_config.NumberColumn("Projected Points", format="%.1f"),
-        "Projected Value": st.column_config.ProgressColumn(
-            "Value (pts/$1k)", min_value=0,
-            max_value=max(float(pool["Projected Value"].max() or 1), 1), format="%.2f"
-        ),
-    },
-)
+if pool.empty:
+    st.info("No players with a confident, computable projection in the current filter.")
+else:
+    st.dataframe(
+        pool,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
+            "Season Avg": st.column_config.NumberColumn("Season Avg", format="%.1f"),
+            "Momentum": st.column_config.NumberColumn("Momentum", format="%.1f"),
+            "Matchup Delta": st.column_config.NumberColumn("Matchup Delta", format="%.1f"),
+            "Projected Points": st.column_config.NumberColumn("Projected Points", format="%.1f"),
+            "Projected Value": st.column_config.ProgressColumn(
+                "Value (pts/$1k)", min_value=0,
+                max_value=max(float(pool["Projected Value"].max() or 1), 1), format="%.2f"
+            ),
+        },
+    )
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Unmatched / low-confidence review table
+# Needs Review: everything projection_status != "ok" - unmatched, low-confidence,
+# missing average, or missing/zero salary. Never ranked, never in value plays.
 # ---------------------------------------------------------------------------
-st.subheader("⚠️ Needs Review: Unmatched or Low-Confidence Players")
+st.subheader("⚠️ Needs Review")
 st.caption(
-    f"Fuzzy matches below a score of {FUZZY_MATCH_THRESHOLD} (out of 100) are never auto-accepted. "
-    "These rows either found no name+team candidate at all, or the best fuzzy candidate within the "
-    "same team and position scored too low to trust. Their projections (if any) use DK's own "
-    "AvgPointsPerGame as a clearly-labeled fallback."
+    f"No fallback projections are ever computed for these rows. A row lands here if the player "
+    f"couldn't be confidently matched (fuzzy candidates below {FUZZY_MATCH_THRESHOLD}/100 are never "
+    "auto-accepted), has no usable season average, or has a missing/zero salary."
 )
 
-review_display = filtered[filtered["match_method"] == "unmatched"][
-    ["Name", "Position", "TeamAbbrev", "Salary", "Game Info", "AvgPointsPerGame", "match_score", "projection_status"]
-].rename(columns={
+review_display = review_rows.copy()
+review_display["Matched / Best Candidate"] = review_display["matched_player_name"].fillna(
+    review_display["best_candidate_name"]
+)
+review_display = review_display.rename(columns={
+    "Name": "DK Name",
     "TeamAbbrev": "Team",
-    "match_score": "Best Fuzzy Score",
-    "projection_status": "Status",
-})
+    "opponent": "Opponent",
+    "match_method": "match_method",
+    "match_score": "match_score",
+    "projection_status": "projection_status",
+})[
+    ["DK Name", "Position", "Team", "Opponent", "Salary", "match_method", "match_score",
+     "Matched / Best Candidate", "projection_status"]
+]
 
 if review_display.empty:
-    st.success("No unmatched or low-confidence players in the current filter.")
+    st.success("No players need review in the current filter.")
 else:
     st.dataframe(review_display, width="stretch", hide_index=True)
     st.download_button(
         "Download review list as CSV",
         review_display.to_csv(index=False).encode("utf-8"),
-        file_name="dk_unmatched_review.csv",
+        file_name="dk_needs_review.csv",
         mime="text/csv",
     )
 
@@ -221,13 +245,19 @@ with st.expander("How projections are calculated"):
   (50% / 30% / 20%, most recent first; renormalized if fewer than 3 games are available).
 - **matchup_delta**: the upcoming opponent's average fantasy points allowed to this
   position, minus the position's league average - looked up from DK's own Position
-  and the opponent parsed from `Game Info`, independent of player matching.
+  and the opponent parsed from `Game Info`, independent of player matching. It's left
+  blank/null unless that lookup actually resolves (a real opponent + matchup history for
+  that position) - never defaulted to a "neutral" guess.
 
 **Player matching** tries, in order: (1) normalized name + team + position exact match,
 (2) normalized name + team exact match, (3) a fuzzy name match restricted to the same
 team and position, accepted only above a score of {FUZZY_MATCH_THRESHOLD}/100. There is no
-unrestricted, name-only fuzzy fallback. Anything that doesn't clear one of those bars
-lands in the review table above and its projection (if shown) falls back to DK's own
-AvgPointsPerGame - never silently presented as a confident number.
+unrestricted, name-only fuzzy fallback.
+
+**No fallback projections.** A row that doesn't clear one of those match bars gets
+`projected_points = null` and `projected_value = null` - it is never assigned DK's own
+AvgPointsPerGame or any other stand-in average. Only `projection_status == "ok"` rows
+(confident match + real average + usable salary) ever appear in the Player Pool, value
+plots, or Top Value Plays cards; everything else lands in "Needs Review" above.
         """
     )

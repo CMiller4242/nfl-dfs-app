@@ -52,11 +52,28 @@ python dfs_data_pipeline.py
 This auto-detects the current season and the **latest fully-completed
 week** (every game in a week must have a final score - a week with a game
 still in progress is never treated as complete) directly from the
-schedule, so there's nothing to hand-edit week to week. If no week has
-finished yet this season, the pipeline still runs successfully: it writes
-empty-but-correctly-shaped Parquet files and sets
-`metadata.json["status"] = "no_completed_weeks_yet"` so the app can show a
-clear message instead of an error.
+schedule, so there's nothing to hand-edit week to week. Verified behavior
+across the season lifecycle (see `tests/test_pipeline.py`):
+
+- **Before Week 1 / no games played yet:** `latest_completed_week` is
+  `null`, `next_slate_week` is `1`, and the pipeline still runs
+  successfully - it writes empty-but-correctly-shaped Parquet files and
+  sets `metadata.json["status"] = "no_completed_weeks_yet"` instead of
+  failing.
+- **During Week 1 (or any week) with some games played and some not:** that
+  week is *not* counted as completed until every game in it has a final
+  score - `latest_completed_week` stays at the previous fully-finished
+  week (or `null`, during Week 1 itself).
+- **After the regular season ends:** `latest_completed_week` is the final
+  week and `next_slate_week` is `null` ("season complete, no further
+  slates" in the app).
+
+The app always describes this as **"Data through Week X"** (=
+`latest_completed_week`) and, separately, **"Building Week Y"** (=
+`next_slate_week`) - the two are never conflated.
+
+Every pipeline run ends by logging the row count of each Parquet file it
+wrote, so a stale-looking refresh is easy to diagnose from the logs alone.
 
 ## Run the app
 
@@ -100,12 +117,15 @@ Matching is tried in this exact order, and stops at the first hit:
 
 There is deliberately no unrestricted, name-only fuzzy fallback across all
 teams. Anything that doesn't clear one of the three bars above is left
-`unmatched` and shown in a separate review table on the Lineup Helper page
-(downloadable as CSV), along with the best fuzzy score it did find, so you
-can eyeball whether it's a near-miss worth fixing in the source data.
+`unmatched` and shown in the **Needs Review** table on the Lineup Helper page
+(downloadable as CSV) rather than in the Player Pool - see "Value plays only
+come from confident matches" below.
 
-Every row carries `match_method`, `match_score`, and `matched_player_name`
-so a projection is always auditable back to how (or whether) it was matched.
+Every row carries `match_method`, `match_score`, `matched_player_name` (the
+confirmed match, if any), and `best_candidate_name` (the closest fuzzy
+candidate even when it scored below the threshold, so a near-miss is easy to
+spot and fix at the source), so a projection - or the lack of one - is always
+auditable back to how the player was matched.
 
 ## Projection formula
 
@@ -124,10 +144,16 @@ projected_value = projected_points / (Salary / 1000)
   uses those three games, not "week minus 1/2/3"). With fewer than 3 games
   played, the leading weights are renormalized to sum to 1.0.
 - **matchup_delta**: the upcoming opponent's average fantasy points allowed
-  to this position, minus that position's league average. Looked up from
-  the DK row's own `Position` and the opponent parsed out of `Game Info` -
-  independent of whether the player itself matched, so a bad name match
-  doesn't also cost you matchup context.
+  to this position, minus that position's league average (from
+  `defense_matchups.parquet` - see "Team defense stats vs. matchup ratings"
+  below). Looked up from the DK row's own `Position` and the opponent parsed
+  out of `Game Info`, independent of whether the player itself matched, so a
+  bad name match doesn't also cost you matchup context. It's left **null**
+  unless that lookup actually resolves (a parseable opponent *and* matchup
+  history for that defense/position) - never defaulted to a "neutral" 0.0
+  guess. A confidently-matched player with an unresolvable matchup still gets
+  a projection (the matchup term just contributes 0 internally), but the
+  displayed `matchup_delta` stays null so it's clear that piece is missing.
 
 Weights are named constants in `lib/dk_helper.py`, tunable in one place:
 
@@ -136,28 +162,66 @@ MOMENTUM_ADJUSTMENT_WEIGHT = 0.20
 MATCHUP_ADJUSTMENT_WEIGHT = 0.30
 ```
 
-**Labeling, not silent guessing.** `projection_status` marks every row:
-- `ok` - confident match, valid salary, real player average
-- `unmatched_fallback` - no confident player match; DK's own
-  `AvgPointsPerGame` is used for both `player_avg` and `momentum_score`
-  (so the momentum term is exactly 0), never presented as equally confident
-- `no_player_average` - no average available from any source
-- `no_salary` - missing/zero/negative salary; no projection is computed
+### No fallback projections - `projection_status` meanings
 
-Best-value cards filter to a position **first**, then rank by projected
-value within that subset, and always exclude `no_salary` and
-`unmatched_fallback` rows - so a fallback projection or a $0-salary row can
-never appear as a "top value play."
+An unmatched or low-confidence row gets **no projection at all** - not even
+a labeled one. `player_avg`, `momentum_score`, `projected_points`, and
+`projected_value` are all null; DK's own `AvgPointsPerGame` is never
+substituted in. `projection_status` says exactly why:
+
+| Status | Meaning | In value tables/plots? |
+|---|---|---|
+| `ok` | Confident match (exact or fuzzy above threshold), real season average, usable salary | **Yes** - the only status that is |
+| `review_required` | No confident player match (unmatched, or the best fuzzy candidate scored below `FUZZY_MATCH_THRESHOLD`) | No |
+| `no_player_average` | Matched, but no season average is available | No |
+| `no_salary` | Missing/zero/negative salary | No |
+
+### Value plays only come from confident matches
+
+The **Player Pool** table, **Top Value Plays** cards, and best-value
+rankings all show only `projection_status == "ok"` rows - filtered to a
+position first, then ranked by projected value within that subset. Every
+other row (`review_required`, `no_player_average`, `no_salary`) lives
+exclusively in the **Needs Review** table, so a review-required guess or a
+$0-salary row can never appear as a "top value play." Needs Review shows: DK
+Name, Position, Team, parsed Opponent, Salary, `match_method`, `match_score`,
+the matched player name (or best fuzzy candidate if there wasn't a confident
+match), and `projection_status` - and is downloadable as CSV.
+
+### Team defense stats vs. matchup ratings
+
+`team_summary.parquet`'s `sacks_per_game` and `turnovers_forced_per_game`
+are a team's **own** defensive production (from that team's
+`def_sacks` / `def_interceptions` / `def_fumbles_forced` - what its defense
+did, not what was done to it). This table is informational context only and
+is **never** read by the projection formula above. Matchup quality in
+projections comes exclusively from `defense_matchups.parquet`
+(`matchup_delta`), which is computed only from fantasy points an opposing
+defense has allowed to a position - a completely separate calculation.
 
 ## GitHub Actions refresh
 
 `.github/workflows/refresh_data.yml` runs `dfs_data_pipeline.py` every
 Tuesday at 11:00 UTC (after Monday Night Football has finished) and commits
-any changed Parquet/metadata files back to the branch it runs on.
+any changed Parquet/metadata files back to the branch it runs on. Only
+`data/*.parquet` and `data/metadata.json` are ever staged, and the commit
+step is skipped entirely (`git diff --cached --quiet`) when the pipeline
+produced no changes - it never force-commits or touches anything else in
+the repo. A `concurrency` group (`refresh-dfs-data`, `cancel-in-progress:
+false`) means an overlapping scheduled + manual run queues instead of
+racing another run's git push. Nothing in the workflow suppresses errors -
+a pipeline failure or a git failure fails the step and the run shows red in
+the Actions tab.
 
 **Manual trigger:** GitHub repo -> Actions tab -> "Refresh DFS Data" ->
 "Run workflow". Locally, just run `python dfs_data_pipeline.py` and commit
 the changed files under `data/` yourself.
+
+**If the app's "last refreshed" timestamp looks stale:** GitHub repo ->
+Actions tab -> "Refresh DFS Data" -> check the most recent run. A red X
+means the pipeline or the commit step failed (open the run for the actual
+error); a run still queued or in progress means it's waiting behind the
+concurrency group or hasn't reached its scheduled time yet.
 
 ## Testing
 
@@ -170,14 +234,17 @@ than one Python environment on your machine - it guarantees the same
 interpreter that has the project's dependencies installed is the one
 running the tests.)
 
-The suite (`tests/`) covers: completed-week detection (including
-in-progress and no-completed-weeks-yet cases), momentum scoring for 1/2/3+
-games and across a bye week, week-over-week touches across a bye, safe
-division never producing infinities, defense-vs-position deltas and
-position-specific percentiles, DK opponent parsing (home/away/alias/
-malformed), the full match-method ladder (exact/fuzzy-restricted/
-low-confidence-unmatched), the projection formula, and best-value-per-
-position filtering.
+The suite (`tests/`) covers: completed-week detection across the season
+lifecycle (before Week 1, mid-Week-1 with a partial slate, after the season
+ends, no-completed-weeks-yet), duplicate player-week row handling, momentum
+scoring for 1/2/3+ games and across a bye week, week-over-week touches
+across a bye, safe division never producing infinities, defense-vs-position
+deltas and position-specific percentiles, team_summary's own-defense
+semantics, DK opponent parsing (home/away/alias/malformed), the full
+match-method ladder (exact/fuzzy-restricted/low-confidence-unmatched) with
+best-candidate tracking, the no-fallback projection policy (`review_required`
+gets null projections, matchup_delta null-vs-resolved), and best-value-per-
+position filtering that excludes every non-`"ok"` row.
 
 ## Known limitations
 
@@ -195,8 +262,9 @@ position filtering.
 - **DK/nflreadpy name and team drift.** The alias map and name
   normalization cover the common cases (team relocations/abbreviation
   differences, suffixes, punctuation), but a DK export with an unusual
-  spelling can still land in the unmatched review table - that's by design
-  (see "How player matching works" above), not a bug.
+  spelling can still land in the Needs Review table with no projection at
+  all - that's by design (see "No fallback projections" above), not a bug.
+  Check `best_candidate_name` there before assuming it's a genuine miss.
 - **Matching assumes one active player per (team, position) name.** If two
   players share a normalized name on the same team and position in a given
   season, the exact-match step arbitrarily returns the first one found.

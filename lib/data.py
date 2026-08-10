@@ -85,8 +85,13 @@ def data_freshness_caption() -> str:
             f"finished). Last checked {updated}."
         )
 
-    week_line = f"Data as of Week {meta['latest_completed_week']}, {season} season"
+    # "Data through Week X" always reflects latest_completed_week (a week only
+    # counts once every game in it has a final score); "Building Week Y"
+    # always reflects next_slate_week (the week that hasn't happened yet).
+    week_line = f"Data through Week {meta['latest_completed_week']}, {season} season"
     next_week = meta.get("next_slate_week")
     if next_week is not None:
-        week_line += f" · next slate: Week {next_week}"
+        week_line += f" · Building Week {next_week}"
+    else:
+        week_line += " · season complete, no further slates"
     return f"{week_line} · last refreshed {updated}"

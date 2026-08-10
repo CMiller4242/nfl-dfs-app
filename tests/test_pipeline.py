@@ -8,6 +8,7 @@ from dfs_data_pipeline import (
     build_defense_matchups,
     build_players_current,
     build_players_weekly,
+    build_team_summary,
     determine_week_status,
     safe_divide,
 )
@@ -277,3 +278,92 @@ def test_defense_matchups_empty_input():
     dm = build_defense_matchups(pd.DataFrame())
     assert dm.empty
     assert "matchup_rating_percentile" in dm.columns
+
+
+# ---------------------------------------------------------------------------
+# Season-lifecycle edge cases: before Week 1, mid-Week-1, after the season ends
+# ---------------------------------------------------------------------------
+def test_before_week1_no_games_played_yet():
+    # Full slate scheduled, nothing played - preseason/week-1-not-yet-kicked-off.
+    schedule = _make_schedule(2025, {1: [(None, None), (None, None), (None, None)]})
+    latest, next_slate = determine_week_status(schedule, 2025)
+    assert latest is None
+    assert next_slate == 1
+
+    weekly = build_players_weekly(pd.DataFrame([_raw_player_row(1, "BUF", 10)]), 2025, latest)
+    current = build_players_current(weekly)
+    defense = build_defense_matchups(weekly)
+    assert weekly.empty and current.empty and defense.empty
+
+
+def test_during_week1_partial_slate_is_not_completed():
+    # Thursday night game final, Sunday/Monday games not yet played.
+    schedule = _make_schedule(2025, {1: [(24, 17), (None, None), (None, None)]})
+    latest, next_slate = determine_week_status(schedule, 2025)
+    assert latest is None  # week 1 itself isn't done just because one game is
+    assert next_slate == 1
+
+
+def test_after_regular_season_ends_next_slate_is_none():
+    schedule = _make_schedule(2025, {w: [(21, 14)] for w in range(1, 19)})
+    latest, next_slate = determine_week_status(schedule, 2025)
+    assert latest == 18
+    assert next_slate is None
+    # Metadata built from this state must clearly say "no more slates."
+    assert next_slate is None and latest is not None
+
+
+def test_players_weekly_duplicate_source_rows_collapse_to_one_and_assertion_holds():
+    raw = pd.DataFrame([
+        _raw_player_row(1, "BUF", 10),
+        _raw_player_row(1, "BUF", 999),  # corrupted/duplicate re-publish for the same player+week
+    ])
+    weekly = build_players_weekly(raw, 2025, latest_completed_week=1)
+    assert len(weekly) == 1
+    assert not weekly.duplicated(subset=["player_id", "week"]).any()
+
+
+# ---------------------------------------------------------------------------
+# build_team_summary - completed weeks only, safe division, own-defense semantics
+# ---------------------------------------------------------------------------
+def _raw_team_row(team, week, passing_yards=200, rushing_yards=100, attempts=30, carries=25,
+                   def_sacks=2, def_interceptions=1, def_fumbles_forced=1, opponent="OPP"):
+    return {
+        "season": 2025, "week": week, "team": team, "season_type": "REG", "opponent_team": opponent,
+        "attempts": attempts, "passing_yards": passing_yards, "carries": carries, "rushing_yards": rushing_yards,
+        "def_sacks": def_sacks, "def_interceptions": def_interceptions, "def_fumbles_forced": def_fumbles_forced,
+    }
+
+
+def test_team_summary_before_any_completed_week_is_empty_with_schema():
+    raw = pd.DataFrame([_raw_team_row("KC", 1)])
+    summary = build_team_summary(raw, 2025, latest_completed_week=None)
+    assert summary.empty
+    assert "sacks_per_game" in summary.columns
+
+
+def test_team_summary_computes_own_defense_production_and_pass_rate():
+    raw = pd.DataFrame([
+        _raw_team_row("KC", 1, passing_yards=300, rushing_yards=100, attempts=40, carries=20,
+                       def_sacks=3, def_interceptions=2, def_fumbles_forced=0),
+        _raw_team_row("KC", 2, passing_yards=200, rushing_yards=140, attempts=20, carries=20,
+                       def_sacks=1, def_interceptions=0, def_fumbles_forced=1),
+    ])
+    summary = build_team_summary(raw, 2025, latest_completed_week=2)
+    row = summary[summary.team == "KC"].iloc[0]
+
+    assert row["games_played"] == 2
+    assert row["pass_yards_per_game"] == pytest.approx((300 + 200) / 2)
+    assert row["rush_yards_per_game"] == pytest.approx((100 + 140) / 2)
+    assert row["pass_rate_pct"] == pytest.approx((40 + 20) / (40 + 20 + 20 + 20) * 100)
+    # sacks_per_game/turnovers_forced_per_game are THIS team's own defense
+    # (def_sacks / def_interceptions / def_fumbles_forced), not points allowed.
+    assert row["sacks_per_game"] == pytest.approx((3 + 1) / 2)
+    assert row["turnovers_forced_per_game"] == pytest.approx((2 + 0 + 0 + 1) / 2)
+    assert "points_allowed" not in summary.columns
+
+
+def test_team_summary_excludes_future_weeks():
+    raw = pd.DataFrame([_raw_team_row("KC", 1), _raw_team_row("KC", 2)])
+    summary = build_team_summary(raw, 2025, latest_completed_week=1)
+    assert summary[summary.team == "KC"].iloc[0]["games_played"] == 1

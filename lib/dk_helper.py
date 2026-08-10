@@ -107,7 +107,10 @@ def match_dk_players(dk_df: pd.DataFrame, stats_df: pd.DataFrame) -> pd.DataFram
     There is no unrestricted, name-only fuzzy fallback - a low-confidence
     or team/position mismatch is left `unmatched` for manual review rather
     than silently guessed. Adds `match_method`, `match_score`,
-    `matched_player_name`, and `stat_*`-prefixed columns when matched.
+    `matched_player_name` (the confirmed match, if any), `best_candidate_name`
+    (the closest fuzzy candidate even when it scored below the threshold -
+    useful for a human reviewing near-misses), and `stat_*`-prefixed columns
+    when matched.
     """
     stats = stats_df.copy()
     stats["_norm_name"] = stats["player_display_name"].apply(normalize_name)
@@ -130,6 +133,7 @@ def match_dk_players(dk_df: pd.DataFrame, stats_df: pd.DataFrame) -> pd.DataFram
         match_idx = None
         match_method = "unmatched"
         match_score = None
+        best_candidate_name = None  # best fuzzy candidate even if below threshold, for review
 
         key_full = (dk_name_norm, dk_team_norm, dk_position)
         key_name_team = (dk_name_norm, dk_team_norm)
@@ -150,14 +154,17 @@ def match_dk_players(dk_df: pd.DataFrame, stats_df: pd.DataFrame) -> pd.DataFram
                 if result:
                     best_name, best_score, _ = result
                     match_score = float(best_score)
+                    candidate_idx = next(idx for n, idx in candidates if n == best_name)
+                    best_candidate_name = stats.loc[candidate_idx, "player_display_name"]
                     if best_score >= FUZZY_MATCH_THRESHOLD:
-                        match_idx = next(idx for n, idx in candidates if n == best_name)
+                        match_idx = candidate_idx
                         match_method = "fuzzy_team_position"
 
         record = dk_row.to_dict()
         record["match_method"] = match_method
         record["match_score"] = match_score
         record["matched_player_name"] = None
+        record["best_candidate_name"] = best_candidate_name
         if match_idx is not None:
             stat_row = stats.loc[match_idx]
             record["matched_player_name"] = stat_row["player_display_name"]
@@ -167,6 +174,11 @@ def match_dk_players(dk_df: pd.DataFrame, stats_df: pd.DataFrame) -> pd.DataFram
         records.append(record)
 
     return pd.DataFrame(records)
+
+
+# Any status other than "ok" means the row must never be ranked/valued -
+# it belongs in the "Needs Review" table instead. See compute_projections.
+REVIEW_STATUSES = {"review_required", "no_player_average", "no_salary"}
 
 
 def compute_projections(matched_df: pd.DataFrame, defense_matchups: pd.DataFrame) -> pd.DataFrame:
@@ -182,12 +194,21 @@ def compute_projections(matched_df: pd.DataFrame, defense_matchups: pd.DataFrame
 
     `matchup_delta` is looked up from DK's own Position + parsed opponent,
     independent of whether the player matched - a bad player match doesn't
-    have to cost you matchup context. `projection_status` clearly labels
-    rows that used a fallback or couldn't be projected at all:
-      - "ok": confident match, valid salary, real player average
-      - "unmatched_fallback": no confident player match; DK's own
-        AvgPointsPerGame is used as player_avg (so the momentum term is 0)
-      - "no_player_average": no player average available from any source
+    have to cost you matchup context. It's null unless it's independently
+    resolvable that way (opponent parses AND that defense/position pair has
+    matchup data), never defaulted to a "neutral" number.
+
+    Unmatched/low-confidence rows get NO projection - never a fallback to
+    DK's own AvgPointsPerGame. A row that couldn't be confidently matched to
+    real stats has no legitimate `player_avg` or `momentum_score` to blend,
+    so guessing one (even a labeled one) risks being read as a real number.
+    `projection_status` says exactly why a row has no projection:
+      - "ok": confident match, valid salary, real player average - the only
+        status eligible for value rankings/plays
+      - "review_required": no confident player match (unmatched or a fuzzy
+        candidate below FUZZY_MATCH_THRESHOLD) - projected_points/value are
+        null regardless of salary
+      - "no_player_average": matched, but no player average is available
       - "no_salary": missing/zero/negative salary - no projection is made
     """
     df = matched_df.copy()
@@ -201,21 +222,19 @@ def compute_projections(matched_df: pd.DataFrame, defense_matchups: pd.DataFrame
         try:
             return float(delta_lookup.loc[(row["opponent"], row["Position"])])
         except KeyError:
-            return 0.0  # no matchup data available - neutral, not a guess
+            return float("nan")  # not independently resolvable - null, not a neutral guess
 
     df["matchup_delta"] = df.apply(_delta, axis=1)
 
     is_matched = df["match_method"] != "unmatched"
-    dk_avg = pd.to_numeric(df.get("AvgPointsPerGame"), errors="coerce")
 
     stat_player_avg = df["stat_avg_fantasy_points"] if "stat_avg_fantasy_points" in df.columns else pd.Series(pd.NA, index=df.index)
     stat_momentum = df["stat_momentum_score"] if "stat_momentum_score" in df.columns else pd.Series(pd.NA, index=df.index)
 
-    # Unmatched/low-confidence rows fall back to DK's own average for both
-    # inputs (momentum term becomes 0) - clearly labeled via projection_status,
-    # never presented as an equally confident projection.
-    player_avg = stat_player_avg.where(is_matched, dk_avg)
-    momentum = stat_momentum.where(is_matched, dk_avg)
+    # No fallback: an unmatched/low-confidence row's player_avg and momentum
+    # are null, full stop - never DK's own average standing in for ours.
+    player_avg = stat_player_avg.where(is_matched)
+    momentum = stat_momentum.where(is_matched)
 
     salary = pd.to_numeric(df["Salary"], errors="coerce")
     no_salary = salary.isna() | (salary <= 0)
@@ -224,14 +243,18 @@ def compute_projections(matched_df: pd.DataFrame, defense_matchups: pd.DataFrame
     projected_points = (
         player_avg
         + (momentum - player_avg) * MOMENTUM_ADJUSTMENT_WEIGHT
-        + df["matchup_delta"] * MATCHUP_ADJUSTMENT_WEIGHT
+        + df["matchup_delta"].fillna(0) * MATCHUP_ADJUSTMENT_WEIGHT
     )
-    projected_points = projected_points.mask(no_salary | no_avg)
+    projected_points = projected_points.mask(~is_matched | no_salary | no_avg)
 
+    # Priority, highest last (later .mask calls win): ok < no_salary <
+    # no_player_average < review_required. An unmatched row is always
+    # "review_required" regardless of whether it also happens to have a
+    # salary or an average from some other source.
     status = pd.Series("ok", index=df.index)
-    status = status.mask(~is_matched, "unmatched_fallback")
+    status = status.mask(no_salary, "no_salary")
     status = status.mask(no_avg, "no_player_average")
-    status = status.mask(no_salary, "no_salary")  # missing salary takes priority for display
+    status = status.mask(~is_matched, "review_required")
 
     df["player_avg"] = player_avg.round(2)
     df["momentum_score"] = momentum.round(2)
@@ -243,14 +266,23 @@ def compute_projections(matched_df: pd.DataFrame, defense_matchups: pd.DataFrame
     return df
 
 
+def needs_review(df: pd.DataFrame) -> pd.DataFrame:
+    """Rows that must never be treated as a ranked/valued play: unresolved
+    match, missing average, or unusable salary. The single source of truth
+    for what belongs in the "Needs Review" table (and, by exclusion, what's
+    allowed in value tables/plots and best-value cards)."""
+    return df[df["projection_status"] != "ok"]
+
+
 def best_value_by_position(df: pd.DataFrame, positions=POSITIONS, top_n: int = BEST_VALUE_TOP_N) -> dict:
     """
     Top-N projected-value plays per position. Filters to the position FIRST,
-    then ranks within that subset - and excludes rows with no salary or an
-    unresolved player match, so a "best value" is never a labeled fallback
-    or a $0-salary row sorting to the top by accident.
+    then ranks within that subset - and excludes anything `needs_review`
+    (no salary, no average, or an unresolved/low-confidence match), so a
+    "best value" is never a review-required row sorting to the top by
+    accident.
     """
-    eligible = df[(df["projection_status"] == "ok") & df["projected_value"].notna()]
+    eligible = df[df["projection_status"] == "ok"]
     return {
         pos: eligible[eligible["Position"] == pos].sort_values("projected_value", ascending=False).head(top_n)
         for pos in positions

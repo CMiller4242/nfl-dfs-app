@@ -10,6 +10,16 @@ on:
 permissions:
   contents: write
 
+# Only one refresh runs at a time. If a scheduled and a manual run (or two
+# manual runs) overlap, the second one queues behind the first instead of
+# racing it - two concurrent `git push`es here could otherwise conflict or,
+# worse, interleave a partial commit of the generated Parquet files.
+# cancel-in-progress is deliberately false: a run already mid-commit should
+# finish, not be killed partway through.
+concurrency:
+  group: refresh-dfs-data
+  cancel-in-progress: false
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
@@ -25,10 +35,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # No error suppression anywhere in this workflow: a non-zero exit from
+      # the pipeline (or from git below) fails this step and the whole run
+      # shows red in the Actions tab - nothing here is allowed to fail silently.
       - name: Run data pipeline
         run: python dfs_data_pipeline.py
 
       - name: Commit and push refreshed data
+        shell: bash -euo pipefail {0}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
