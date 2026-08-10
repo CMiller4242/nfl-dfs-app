@@ -1,0 +1,74 @@
+name: Refresh Depth Chart & Injury Role Context
+
+# Separate schedule from "Refresh DFS Data" (weekly player stats, Tuesdays):
+# depth charts and ESPN injury reports change on their own, faster cadence,
+# especially close to the Sunday main slate (1pm-4pm ET). This workflow is
+# intentionally lightweight - it does NOT re-pull the season's player stats.
+#
+# Cron is UTC and does not shift for daylight saving time, so these times
+# are anchored to EST (UTC-5); during EDT portions of the season (early/
+# late season) each run lands about an hour earlier in local ET than
+# intended. This is a known GitHub Actions limitation - see README. The app
+# never claims this is real-time regardless: it always displays the actual
+# source timestamps and a staleness warning (see lib/role_config.py's
+# freshness limits and the Lineup Helper page's freshness banner).
+on:
+  schedule:
+    # Friday ~4pm EST, after the week's final injury report typically posts.
+    - cron: "0 21 * * 5"
+    # Sunday morning through early afternoon EST, ahead of the 1pm-4pm main
+    # slate: 8:00am, 10:00am, 11:30am, 12:45pm.
+    - cron: "0 13 * * 0"
+    - cron: "0 15 * * 0"
+    - cron: "30 16 * * 0"
+    - cron: "45 17 * * 0"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# Its own concurrency group, independent of the weekly stats refresh - the
+# two workflows touch different files and are safe to run at the same time,
+# but two runs of THIS workflow should still queue rather than race.
+concurrency:
+  group: refresh-role-context
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # No error suppression: a pipeline or git failure fails this step and
+      # the run shows red in the Actions tab. A failed ESPN/depth-chart
+      # fetch does NOT fail this step by itself (see
+      # dfs_data_pipeline.write_snapshot_with_fallback) - it's logged and
+      # the last known good Parquet file is preserved instead of being
+      # overwritten with nothing.
+      - name: Refresh depth chart + injury role context
+        run: python refresh_role_context.py
+
+      - name: Commit and push refreshed role context
+        shell: bash -euo pipefail {0}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/depth_charts_current.parquet data/injuries_current.parquet \
+                  data/player_role_context.parquet data/depth_chart_metadata.json \
+                  data/injury_metadata.json
+          if git diff --cached --quiet; then
+            echo "No role-context changes to commit."
+          else
+            git commit -m "Automated depth chart / injury role-context refresh"
+            git push
+          fi

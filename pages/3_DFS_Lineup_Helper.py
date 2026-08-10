@@ -1,4 +1,5 @@
 import io
+import os
 
 import pandas as pd
 import streamlit as st
@@ -7,7 +8,10 @@ from lib.data import (
     POSITIONS,
     data_freshness_caption,
     load_defense_matchups,
+    load_depth_chart_metadata,
+    load_injury_metadata,
     load_metadata,
+    load_player_role_context,
     load_players_current,
     load_players_prior_season_baseline,
 )
@@ -23,8 +27,12 @@ from lib.dk_helper import (
     needs_review,
     validate_dk_columns,
 )
+from lib.eligibility import attach_role_context_to_dk_rows
+from lib.role_config import DEPTH_CHART_FRESHNESS_HOURS, INJURY_FRESHNESS_HOURS
 
 st.set_page_config(page_title="DFS Lineup Helper | NFL DFS", page_icon="💰", layout="wide")
+
+DK_AUTO_LOAD_PATH = os.path.join("data", "dk_salaries", "current.csv")
 
 st.title("💰 DFS Lineup Helper")
 st.caption(data_freshness_caption())
@@ -48,17 +56,81 @@ if is_preseason:
         f"in-season projections using {active_season} data."
     )
 
+# ---------------------------------------------------------------------------
+# Depth chart / injury freshness banner
+# ---------------------------------------------------------------------------
+depth_meta = load_depth_chart_metadata()
+injury_meta = load_injury_metadata()
+
+
+def _age_hours(timestamp_str):
+    if not timestamp_str:
+        return None
+    try:
+        ts = pd.to_datetime(timestamp_str, utc=True)
+    except (ValueError, TypeError):
+        return None
+    return (pd.Timestamp.now(tz="UTC") - ts).total_seconds() / 3600.0
+
+
+def _freshness_label(age_hours, limit_hours):
+    if age_hours is None:
+        return "unavailable"
+    return "fresh" if age_hours <= limit_hours else f"stale ({age_hours:.0f}h old)"
+
+
+depth_age = _age_hours(depth_meta.get("source_timestamp"))
+injury_age = _age_hours(injury_meta.get("retrieved_at"))
+depth_freshness = _freshness_label(depth_age, DEPTH_CHART_FRESHNESS_HOURS)
+injury_source_ok = bool(injury_meta.get("source_success"))
+injury_freshness = _freshness_label(injury_age, INJURY_FRESHNESS_HOURS) if injury_source_ok else "unavailable (last fetch failed)"
+
+freshness_cols = st.columns(2)
+with freshness_cols[0]:
+    st.metric("Depth chart data", depth_freshness, help=f"Source timestamp: {depth_meta.get('source_timestamp', 'unknown')}")
+with freshness_cols[1]:
+    st.metric("ESPN injury data", injury_freshness, help=f"Last fetch: {injury_meta.get('retrieved_at', 'unknown')}")
+
+if depth_freshness != "fresh" or not injury_source_ok or (injury_source_ok and injury_freshness != "fresh"):
+    st.warning(
+        "Role/eligibility data (depth chart and/or ESPN injuries) is stale or unavailable. This is "
+        "never treated as real-time - a scheduled refresh is a best-effort snapshot, not a live feed. "
+        "Players whose role depends on unresolvable data are automatically routed to Needs Review "
+        "rather than guessed at. Check the GitHub Actions tab if this persists."
+    )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# DK salary CSV source: auto-load a committed local file if present, with
+# the uploader always available as a session-only override (never written
+# back to disk).
+# ---------------------------------------------------------------------------
 st.markdown(
-    "Upload this week's DraftKings salary CSV (Position, Name, Salary, Game Info, "
+    "Reads this week's DraftKings salary CSV (Position, Name, Salary, Game Info, "
     "TeamAbbrev, AvgPointsPerGame) to get "
     + ("prior-season-baseline projections and value plays. " if is_preseason else "matchup-adjusted projections and value plays. ")
-    + "**A DK CSV you upload here is used only for this session and is never committed to the repo.**"
+    + "**A CSV used here - auto-loaded or uploaded - is never committed to the repo.**"
 )
 
-uploaded = st.file_uploader("DraftKings salary CSV", type="csv")
+auto_loaded_bytes = None
+if os.path.exists(DK_AUTO_LOAD_PATH):
+    with open(DK_AUTO_LOAD_PATH, "rb") as f:
+        auto_loaded_bytes = f.read()
 
-if not uploaded:
-    st.info("Waiting for a DraftKings salary CSV upload.")
+uploaded = st.file_uploader(
+    "DraftKings salary CSV (session-only override)", type="csv",
+    help=f"If present, `{DK_AUTO_LOAD_PATH}` auto-loads by default. Uploading here overrides it for this session only.",
+)
+
+if uploaded is not None:
+    file_bytes = uploaded.getvalue()
+    st.caption(f"Salary data source: session upload `{uploaded.name}` (overrides the auto-loaded file, if any, for this session).")
+elif auto_loaded_bytes is not None:
+    file_bytes = auto_loaded_bytes
+    st.caption(f"Salary data source: auto-loaded from `{DK_AUTO_LOAD_PATH}`.")
+else:
+    st.info(f"Waiting for a DraftKings salary CSV - place one at `{DK_AUTO_LOAD_PATH}` for auto-load, or upload one above.")
     st.stop()
 
 
@@ -85,7 +157,7 @@ def process_dk_csv(file_bytes: bytes, mode: str) -> pd.DataFrame:
 
 
 try:
-    result = process_dk_csv(uploaded.getvalue(), app_mode)
+    result = process_dk_csv(file_bytes, app_mode)
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
@@ -97,6 +169,16 @@ result["source_season"] = source_season
 result["data_basis"] = (
     f"{source_season} prior season" if is_preseason else f"{active_season} season to date"
 )
+
+# ---------------------------------------------------------------------------
+# Attach role/eligibility context (depth chart + ESPN injuries + overrides,
+# precomputed by the pipeline into player_role_context.parquet). Zero-fuzzy
+# identity match - see lib.player_identity.match_dk_row_to_role_context.
+# Every row defaults to role_unresolved/not-eligible until a confident match
+# is found.
+# ---------------------------------------------------------------------------
+role_context_df = load_player_role_context()
+result = attach_role_context_to_dk_rows(result, role_context_df)
 
 
 def _matchup_bucket(delta):
@@ -115,6 +197,8 @@ result["matchup_quality"] = result["matchup_delta"].apply(_matchup_bucket)
 def _describe_review_reason(row):
     method = row.get("match_method")
     status = row.get("projection_status")
+    if row.get("role_classification") == "role_unresolved" and status == "ok":
+        return f"Stats matched, but role/injury identity is unresolved: {row.get('eligibility_reason')}"
     if method == "ambiguous_prior_season_match":
         return f"Ambiguous: multiple prior-season players share this name + position ({row.get('best_candidate_name')})"
     if method == "unmatched":
@@ -132,7 +216,7 @@ def _describe_review_reason(row):
 
 
 # ---------------------------------------------------------------------------
-# Match summary
+# Match + role summary
 # ---------------------------------------------------------------------------
 if is_preseason:
     exact_n = (result["match_method"] == "exact_name_team_position").sum()
@@ -151,16 +235,19 @@ else:
         f"{(result['match_method'] == 'fuzzy_team_position').sum()} fuzzy)."
     )
 
-review_needed = needs_review(result)
+stats_review_needed = needs_review(result)
+role_unresolved_but_stats_ok = result[(result["projection_status"] == "ok") & (result["role_classification"] == "role_unresolved")]
+total_needs_review = len(stats_review_needed) + len(role_unresolved_but_stats_ok)
+
 st.success(
-    f"{match_summary} {len(review_needed)} row(s) need review (unresolved/ambiguous match, missing "
-    "average, or missing salary) and are excluded from value rankings below."
+    f"{match_summary} {total_needs_review} row(s) need review (unresolved/ambiguous stats or role/injury "
+    "identity, missing average, or missing salary) and are excluded from value rankings below."
 )
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Filters
+# Filters + toggle
 # ---------------------------------------------------------------------------
 f1, f2, f3, f4, f5 = st.columns([1.1, 1.5, 1.3, 1.1, 1.3])
 with f1:
@@ -185,21 +272,54 @@ with f5:
         if is_preseason else None,
     )
 
-# Position/team/salary scope the whole page (pool + review). Value and
-# matchup-quality filters only make sense for rows with a real projection,
-# so they're applied after splitting off the review-required rows below.
+include_conditional = st.checkbox(
+    "Include conditional injury replacements",
+    value=False,
+    help="OFF by default. When ON, contingent_backup players (eligible only if a Questionable/Doubtful "
+    "player ahead of them sits out) appear in the Player Pool table with a clear conditional label. "
+    "They are NEVER included in Top Value Plays, on or off.",
+)
+
+# Position/team/salary scope the whole page. Value and matchup-quality
+# filters only make sense for rows with a real projection.
 base_filtered = result[result["Position"].isin(pos_filter)] if pos_filter else result
 base_filtered = base_filtered[base_filtered["Salary"] >= min_salary_filter]
 if team_filter:
     base_filtered = base_filtered[base_filtered["TeamAbbrev"].isin(team_filter)]
 
-pool_rows = base_filtered[base_filtered["projection_status"] == "ok"]
+ok_rows = base_filtered[base_filtered["projection_status"] == "ok"]
 if min_value_filter > 0:
-    pool_rows = pool_rows[pool_rows["projected_value"] >= min_value_filter]
+    ok_rows = ok_rows[ok_rows["projected_value"] >= min_value_filter]
 if matchup_quality:
-    pool_rows = pool_rows[pool_rows["matchup_quality"].isin(matchup_quality)]
+    ok_rows = ok_rows[ok_rows["matchup_quality"].isin(matchup_quality)]
 
-review_rows = needs_review(base_filtered)
+# --- Bucket by role classification (only meaningful once stats matched "ok") ---
+inactive_rows = ok_rows[ok_rows["role_classification"] == "inactive"]
+excluded_rows = ok_rows[ok_rows["role_classification"] == "bench_no_clear_path"]
+monitor_rows = ok_rows[ok_rows["role_classification"] == "contingent_backup"]
+top_values_rows = ok_rows[ok_rows["role_eligible_for_top_values"] == True]  # noqa: E712
+
+pool_base_rows = ok_rows[ok_rows["role_eligible_for_pool"] == True]  # noqa: E712
+pool_rows = pool_base_rows if include_conditional else pool_base_rows[pool_base_rows["role_classification"] != "contingent_backup"]
+
+stats_review_rows_filtered = needs_review(base_filtered)
+role_unresolved_rows_filtered = base_filtered[
+    (base_filtered["projection_status"] == "ok") & (base_filtered["role_classification"] == "role_unresolved")
+]
+review_rows = pd.concat([stats_review_rows_filtered, role_unresolved_rows_filtered])
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Summary counts
+# ---------------------------------------------------------------------------
+st.subheader("Summary")
+s1, s2, s3, s4, s5 = st.columns(5)
+s1.metric("Eligible players", len(top_values_rows))
+s2.metric("Monitored / conditional", len(monitor_rows))
+s3.metric("Excluded by role", len(excluded_rows))
+s4.metric("Inactive", len(inactive_rows))
+s5.metric("Unresolved role data", len(review_rows[review_rows.get("role_classification", "") == "role_unresolved"]) if "role_classification" in review_rows.columns else 0)
 
 st.divider()
 
@@ -208,14 +328,14 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.subheader("💎 Top Value Plays by Position")
 st.caption(
-    "Filtered to each position first, then ranked by projected value. Only rows with a "
-    "confident player match, a real average, and a usable salary are eligible - "
-    "review-required, unmatched/ambiguous, and $0/missing-salary rows never appear here."
+    "Filtered to each position first, then ranked by projected value. Requires a confident stats "
+    "match, a real projection, a usable salary, AND role_eligible_for_top_values - bench, inactive, "
+    "unresolved, and contingent (conditional) players never appear here, regardless of the toggle above."
 )
-best_value = best_value_by_position(pool_rows)
+best_value = best_value_by_position(top_values_rows)
 value_cols = st.columns(len(POSITIONS))
 for col, pos in zip(value_cols, POSITIONS):
-    pos_df = best_value.get(pos, pool_rows.iloc[0:0])
+    pos_df = best_value.get(pos, top_values_rows.iloc[0:0])
     with col:
         st.markdown(f"**{pos}**")
         if pos_df.empty:
@@ -223,61 +343,81 @@ for col, pos in zip(value_cols, POSITIONS):
         for _, row in pos_df.iterrows():
             st.markdown(
                 f"- **{row['Name']}** ({row['TeamAbbrev']})  \n"
-                f"  ${row['Salary']:,.0f} · {row['projected_value']:.2f} pts/$1k"
+                f"  ${row['Salary']:,.0f} · {row['projected_value']:.2f} pts/$1k  \n"
+                f"  _{row.get('role_classification', 'n/a')}_"
             )
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Player pool - only rows with a real, confident projection (projection_status == "ok")
+# Shared role/eligibility display columns, appended to whichever mode-
+# specific projection columns are already defined below.
+# ---------------------------------------------------------------------------
+ROLE_DISPLAY_RENAME = {
+    "role_classification": "Role / Availability",
+    "depth_rank": "Depth Rank",
+    "eligibility_reason": "Opportunity Context",
+    "blocking_player_names": "Blocking Players",
+    "injury_designation": "Injury Status",
+    "role_data_freshness": "Role Data Freshness",
+}
+ROLE_DISPLAY_COLS = list(ROLE_DISPLAY_RENAME.keys())
+
+
+def _with_role_display(df, base_cols, base_rename):
+    """Append the standard role/eligibility columns (renamed for display) to a mode-specific column set."""
+    rename = {**base_rename, **ROLE_DISPLAY_RENAME}
+    cols = base_cols + [c for c in ROLE_DISPLAY_COLS if c in df.columns]
+    out = df.rename(columns=rename)[[rename.get(c, c) for c in cols]]
+    if "Depth Rank" in out.columns:
+        out["Depth Rank"] = out["Depth Rank"].apply(lambda v: f"{v:g}" if pd.notna(v) else "—")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Player pool - confident stats match + role-eligible for the pool
 # ---------------------------------------------------------------------------
 st.subheader("Player Pool")
-st.caption("Only players with a confident match and a computable projection. See \"Needs Review\" below for everything else.")
+st.caption(
+    "Valid, role-eligible plays only. "
+    + ("Includes contingent (conditional) players, clearly labeled, since the toggle above is ON."
+       if include_conditional else
+       "Toggle \"Include conditional injury replacements\" above to also show contingent players here.")
+)
 
 if is_preseason:
     pool_source = pool_rows.copy()
     pool_source["Prior Season Games"] = pool_source.get("stat_games_played")
     pool_source["Prior Season Consistency"] = pool_source.get("stat_consistency_score")
-    pool = pool_source.rename(
-        columns={
-            "current_team": "Current Team",
-            "historical_team": "Historical Team",
-            "opponent": "Opponent",
-            "player_avg": "Prior Season FPPG",
-            "projected_points": "Baseline Projected Points",
-            "projected_value": "Projected Value",
-            "match_method": "Match Method",
-            "data_basis": "Projection Basis",
-        }
-    )[
-        ["Name", "Position", "Current Team", "Historical Team", "Opponent", "Salary",
-         "Prior Season FPPG", "Prior Season Games", "Prior Season Consistency",
-         "Baseline Projected Points", "Projected Value", "Projection Basis", "Match Method"]
-    ].sort_values("Projected Value", ascending=False, na_position="last")
+    base_cols = ["Name", "Position", "current_team", "historical_team", "opponent", "Salary",
+                 "player_avg", "Prior Season Games", "Prior Season Consistency",
+                 "projected_points", "projected_value", "data_basis", "match_method"]
+    base_rename = {
+        "current_team": "Current Team", "historical_team": "Historical Team", "opponent": "Opponent",
+        "player_avg": "Prior Season FPPG", "projected_points": "Baseline Projected Points",
+        "projected_value": "Projected Value", "match_method": "Match Method", "data_basis": "Projection Basis",
+    }
+    pool = _with_role_display(pool_source, base_cols, base_rename).sort_values(
+        "Projected Value", ascending=False, na_position="last"
+    )
     value_col_label = "Baseline Projected Points"
 else:
-    pool = pool_rows.rename(
-        columns={
-            "TeamAbbrev": "Team",
-            "opponent": "Opponent",
-            "player_avg": "Season Avg",
-            "momentum_score": "Momentum",
-            "matchup_delta": "Matchup Delta",
-            "projected_points": "Projected Points",
-            "projected_value": "Projected Value",
-            "match_method": "Match Method",
-            "match_score": "Match Score",
-            "matchup_quality": "Matchup Quality",
-            "data_basis": "Projection Basis",
-        }
-    )[
-        ["Name", "Position", "Team", "Opponent", "Salary", "Season Avg", "Momentum", "Matchup Delta",
-         "Projected Points", "Projected Value", "Matchup Quality", "Projection Basis", "Match Method", "Match Score"]
-    ].sort_values("Projected Value", ascending=False, na_position="last")
+    base_cols = ["Name", "Position", "TeamAbbrev", "opponent", "Salary", "player_avg", "momentum_score",
+                 "matchup_delta", "projected_points", "projected_value", "matchup_quality", "data_basis",
+                 "match_method", "match_score"]
+    base_rename = {
+        "TeamAbbrev": "Team", "opponent": "Opponent", "player_avg": "Season Avg", "momentum_score": "Momentum",
+        "matchup_delta": "Matchup Delta", "projected_points": "Projected Points", "projected_value": "Projected Value",
+        "match_method": "Match Method", "match_score": "Match Score", "matchup_quality": "Matchup Quality",
+        "data_basis": "Projection Basis",
+    }
+    pool = _with_role_display(pool_rows, base_cols, base_rename).sort_values(
+        "Projected Value", ascending=False, na_position="last"
+    )
     value_col_label = "Projected Points"
 
 if pool.empty:
-    st.info("No players with a confident, computable projection in the current filter.")
+    st.info("No players with a confident, role-eligible, computable projection in the current filter.")
 else:
     st.dataframe(
         pool,
@@ -302,23 +442,58 @@ else:
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Needs Review: everything projection_status != "ok" - unmatched, ambiguous,
-# low-confidence, missing average, or missing/zero salary. Never ranked,
-# never in value plays.
+# Plays to Monitor - contingent_backup (Questionable/Doubtful blocker ahead)
+# ---------------------------------------------------------------------------
+st.subheader("👀 Plays to Monitor")
+st.caption(
+    "Contingent scenarios: eligibility here depends on a Questionable/Doubtful player ahead of them "
+    "on the depth chart actually sitting out. Never in Top Value Plays. Shown here regardless of the "
+    "toggle above (the toggle only controls whether they ALSO appear in Player Pool)."
+)
+if monitor_rows.empty:
+    st.caption("No conditional/contingent scenarios in the current filter.")
+else:
+    if is_preseason:
+        monitor_cols = ["Name", "Position", "current_team", "Salary"]
+        monitor_rename = {"current_team": "Team"}
+    else:
+        monitor_cols = ["Name", "Position", "TeamAbbrev", "Salary"]
+        monitor_rename = {"TeamAbbrev": "Team"}
+    monitor_display = _with_role_display(monitor_rows, monitor_cols, monitor_rename)
+    st.dataframe(monitor_display, width="stretch", hide_index=True)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Excluded by Role Context - bench_no_clear_path
+# ---------------------------------------------------------------------------
+st.subheader("🚫 Excluded by Role Context")
+st.caption(
+    "Bench players ranked below the standard eligible depth tier with no injury path opened up ahead "
+    "of them - a healthy or unconfirmed player still blocks the way."
+)
+if excluded_rows.empty:
+    st.caption("No bench/no-clear-path players in the current filter.")
+else:
+    if is_preseason:
+        excl_cols = ["Name", "Position", "current_team", "Salary"]
+        excl_rename = {"current_team": "Team"}
+    else:
+        excl_cols = ["Name", "Position", "TeamAbbrev", "Salary"]
+        excl_rename = {"TeamAbbrev": "Team"}
+    st.dataframe(_with_role_display(excluded_rows, excl_cols, excl_rename), width="stretch", hide_index=True)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Needs Review: unmatched, ambiguous, missing average/salary, or role-unresolved
 # ---------------------------------------------------------------------------
 st.subheader("⚠️ Needs Review")
-if is_preseason:
-    st.caption(
-        "No projections are computed for these rows. A row lands here if the player has no prior-season "
-        "history (e.g. a rookie), their name + position matches multiple prior-season players ambiguously, "
-        "or they have a missing/zero salary."
-    )
-else:
-    st.caption(
-        f"No fallback projections are ever computed for these rows. A row lands here if the player "
-        f"couldn't be confidently matched (fuzzy candidates below {FUZZY_MATCH_THRESHOLD}/100 are never "
-        "auto-accepted), has no usable season average, or has a missing/zero salary."
-    )
+st.caption(
+    "No projection or role determination is guessed at for these rows. Lands here if the player "
+    "couldn't be confidently matched to stats, has no usable average or salary, or their role/injury "
+    "identity couldn't be resolved (stale/missing/failed depth-chart or ESPN data)."
+)
 
 review_display = review_rows.copy()
 review_display["Matched / Best Candidate"] = review_display["matched_player_name"].fillna(
@@ -326,25 +501,19 @@ review_display["Matched / Best Candidate"] = review_display["matched_player_name
 )
 review_display["Reason"] = review_display.apply(_describe_review_reason, axis=1)
 
-if is_preseason:
-    review_display = review_display.rename(columns={
-        "Name": "DK Name",
-        "current_team": "Current Team",
-        "historical_team": "Historical Team",
-        "opponent": "Opponent",
-    })[
-        ["DK Name", "Position", "Current Team", "Historical Team", "Opponent", "Salary",
-         "match_method", "match_score", "Matched / Best Candidate", "projection_status", "Reason"]
-    ]
-else:
-    review_display = review_display.rename(columns={
-        "Name": "DK Name",
-        "TeamAbbrev": "Team",
-        "opponent": "Opponent",
-    })[
-        ["DK Name", "Position", "Team", "Opponent", "Salary", "match_method", "match_score",
-         "Matched / Best Candidate", "projection_status", "Reason"]
-    ]
+review_id_cols = (
+    ["Name", "Position", "current_team", "historical_team", "opponent", "Salary"] if is_preseason
+    else ["Name", "Position", "TeamAbbrev", "opponent", "Salary"]
+)
+review_id_rename = {"current_team": "Current Team", "historical_team": "Historical Team", "opponent": "Opponent"} if is_preseason else {"TeamAbbrev": "Team", "opponent": "Opponent"}
+review_display = review_display.rename(columns={"Name": "DK Name", **review_id_rename})
+review_id_cols_out = ["DK Name" if c == "Name" else review_id_rename.get(c, c) for c in review_id_cols]
+
+review_cols_final = review_id_cols_out + [
+    "match_method", "match_score", "Matched / Best Candidate", "projection_status",
+    "role_classification", "Reason",
+]
+review_display = review_display[[c for c in review_cols_final if c in review_display.columns]]
 
 if review_display.empty:
     st.success("No players need review in the current filter.")
@@ -359,7 +528,25 @@ else:
 
 st.divider()
 
-with st.expander("How projections are calculated", expanded=is_preseason):
+# ---------------------------------------------------------------------------
+# Inactive - collapsed by default
+# ---------------------------------------------------------------------------
+with st.expander(f"⛔ Inactive ({len(inactive_rows)})", expanded=False):
+    st.caption("Confirmed unavailable (Out, IR, Suspended, or officially inactive). Excluded from the pool and top values entirely.")
+    if inactive_rows.empty:
+        st.caption("No inactive players in the current filter.")
+    else:
+        if is_preseason:
+            inactive_cols = ["Name", "Position", "current_team", "Salary"]
+            inactive_rename = {"current_team": "Team"}
+        else:
+            inactive_cols = ["Name", "Position", "TeamAbbrev", "Salary"]
+            inactive_rename = {"TeamAbbrev": "Team"}
+        st.dataframe(_with_role_display(inactive_rows, inactive_cols, inactive_rename), width="stretch", hide_index=True)
+
+st.divider()
+
+with st.expander("How projections and role/eligibility are calculated"):
     if is_preseason:
         st.markdown(
             f"""
@@ -371,20 +558,10 @@ adjustment - neither exists yet this season)
 
 `Projected Value = Baseline Projected Points / (Salary / 1000)`
 
-**What this does NOT model:** player role changes, new team/scheme fit, coaching staff
-changes, injuries, suspensions, depth chart battles, rookies, and any other offseason
-change. A prior-season average is a *starting point*, not a full projection - treat it
-with real caution, especially for players who changed teams or situations.
-
 **Player matching** tries, in order: (1) normalized name + current DK team + position,
 exact match; (2) if that fails (e.g. the player changed teams), normalized name + position
 only, matched against {source_season} history - accepted **only** when it uniquely
-identifies exactly one player. Two or more same-name/position players from
-{source_season} is left `ambiguous_prior_season_match`; a name with no {source_season}
-history at all (rookies) is left `unmatched`. There is no fuzzy name matching in this mode.
-
-"Historical Team" (from {source_season}) and "Current Team" (from this week's DK file) are
-both shown so a team change is never hidden by a single ambiguous "Team" column.
+identifies exactly one player. There is no fuzzy name matching in this mode.
             """
         )
     else:
@@ -395,24 +572,37 @@ both shown so a team change is never hidden by a single ambiguous "Team" column.
 
 `projected_value = projected_points / (Salary / 1000)`
 
-- **player_avg**: season-to-date average fantasy points (PPR) from completed games.
-- **momentum_score**: weighted average of the player's most recent played games
-  (50% / 30% / 20%, most recent first; renormalized if fewer than 3 games are available).
-- **matchup_delta**: the upcoming opponent's average fantasy points allowed to this
-  position, minus the position's league average - looked up from DK's own Position
-  and the opponent parsed from `Game Info`, independent of player matching. It's left
-  blank/null unless that lookup actually resolves (a real opponent + matchup history for
-  that position) - never defaulted to a "neutral" guess.
-
 **Player matching** tries, in order: (1) normalized name + team + position exact match,
 (2) normalized name + team exact match, (3) a fuzzy name match restricted to the same
-team and position, accepted only above a score of {FUZZY_MATCH_THRESHOLD}/100. There is no
-unrestricted, name-only fuzzy fallback.
-
-**No fallback projections.** A row that doesn't clear one of those match bars gets
-`projected_points = null` and `projected_value = null` - it is never assigned DK's own
-AvgPointsPerGame or any other stand-in average. Only `projection_status == "ok"` rows
-(confident match + real average + usable salary) ever appear in the Player Pool, value
-plots, or Top Value Plays cards; everything else lands in "Needs Review" above.
+team and position, accepted only above a score of {FUZZY_MATCH_THRESHOLD}/100.
             """
         )
+    st.markdown(
+        """
+**Role/eligibility** is computed entirely separately from projections, from the current
+depth chart (`nflreadpy`) and ESPN injury reports - never from salary or projected value.
+A player is only ever evaluated against higher-ranked players on their OWN team and
+position group; an injury elsewhere can never affect their eligibility. Role classifications:
+
+- `confirmed_starter` / `standard_eligible_rotation`: within the configured standard
+  eligible depth tier (QB1; RB1-2; WR1-3; TE1-2) - eligible regardless of anyone's injury
+  status, never mislabeled as an injury replacement.
+- `injury_elevated_backup`: below the standard tier, but every player ahead of them on the
+  depth chart is confirmed unavailable (Out/IR/Suspended) - eligible, with the specific
+  blocker(s) named in "Opportunity Context."
+- `contingent_backup`: below the standard tier, and at least one player ahead is merely
+  Questionable/Doubtful (not confirmed out) - a monitor-only scenario, never in Top Value
+  Plays, and only in Player Pool if you toggle "Include conditional injury replacements" on.
+- `bench_no_clear_path`: below the standard tier with a healthy or unconfirmed player still
+  ahead of them - excluded.
+- `inactive`: the player is themselves confirmed unavailable - excluded entirely.
+- `role_unresolved`: depth-chart or injury data is missing/stale/failed for this player -
+  fails closed to "needs review," never silently treated as available.
+
+Manual corrections (e.g. a late beat-writer report) can be added to
+`data/manual/eligibility_overrides.csv` - each override requires a `player_id`, a `reason`,
+and an `expires_at`, and can only affect that exact player's own team + position, never
+cross-team. An applied override always shows "Manual override: <reason>" in Opportunity
+Context.
+        """
+    )
