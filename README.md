@@ -11,8 +11,10 @@ Power BI refresh required.
 ```
 dfs_data_pipeline.py   Pure-function pipeline: nflreadpy -> Parquet in /data
 refresh_role_context.py  Standalone CLI: depth chart + injury role/eligibility refresh
-lib/data.py             Cached Parquet loaders shared by every page
+load_dk_salaries.py     Standalone CLI: validate + load a DK salary CSV as the committed backend slate
+lib/data.py             Cached Parquet/JSON loaders shared by every page
 lib/dk_helper.py        DraftKings CSV parsing, player matching, projections
+lib/dk_salary_loader.py Shared DK salary CSV validation + slate metadata I/O (app + CLI use the same code)
 lib/player_identity.py  Canonical player identity, team-code aliasing, strict DK<->role matching
 lib/role_config.py      Single config module for eligibility tiers, injury vocabulary, freshness limits
 lib/espn_injuries.py    ESPN roster/injury ingestion (HTTP retries, schema validation, status classification)
@@ -22,9 +24,12 @@ app.py                  Home page (multi-page Streamlit entry point)
 pages/
   1_Position_Explorer.py   Per-position efficiency, volume/efficiency, trend
   2_Defense_Matchups.py    Defense-vs-position heatmap + detail
-  3_DFS_Lineup_Helper.py   DK salary upload -> matched, projected, role-filtered player pool
-tests/                  pytest suite for the pipeline, matching/projection, and role/eligibility logic
+  3_DFS_Lineup_Helper.py   Committed/uploaded DK salary CSV -> matched, projected, role-filtered player pool
+tests/                  pytest suite for the pipeline, matching/projection, salary loading, and role/eligibility logic
 data/manual/eligibility_overrides.csv   Manually-maintained, validated, expiring eligibility overrides
+data/dk_salaries/current.csv            Committed backend salary slate (default active slate on startup)
+data/dk_salaries/archive/               Past current.csv snapshots, one per reload
+data/dk_slate_metadata.json             season/week/source/updated_at_utc/row_count/filename for current.csv
 .github/workflows/refresh_data.yml           Weekly (+ manual) player/team stat refresh
 .github/workflows/refresh_role_context.yml   Separate, faster-cadence depth-chart/injury refresh
 ```
@@ -104,7 +109,7 @@ Parquet files live under `/data` and are read via `st.cache_data`-wrapped
 loaders in `lib/data.py`, so they're only re-read from disk once per
 process (not on every widget interaction).
 
-## DraftKings salary CSV upload (Lineup Helper page)
+## DraftKings salary data (Lineup Helper page)
 
 Required columns (DraftKings' standard salary export):
 
@@ -112,8 +117,81 @@ Required columns (DraftKings' standard salary export):
 Position, Name, Salary, Game Info, TeamAbbrev, AvgPointsPerGame
 ```
 
-An uploaded file is used only for that browser session - it's read into
-memory and is never written to disk or committed to the repo.
+The Lineup Helper page has **two** salary data sources, and always makes
+clear which one is active:
+
+- **Committed backend salary file** - `data/dk_salaries/current.csv`. This
+  is the **default active slate on startup**, loaded automatically whenever
+  it exists, with no upload needed. It's a real file in the repo (not
+  gitignored), so it works on any deployment - including Streamlit Community
+  Cloud, which has no writable/persistent filesystem for the running app
+  itself to save an upload to.
+- **Session upload override** - the page's file uploader always remains
+  available. Uploading a CSV there overrides the committed file for **that
+  browser session only** - it's read into memory and is **never** written
+  back to disk or committed, on any deployment.
+
+The page shows a small status row - **Salary data source**, **Slate
+season**, **Slate week**, **File last updated** - so it's always obvious
+which file is active and how stale it is. Session uploads don't carry
+season/week metadata (there's nothing to read it from), so those show as
+`—` for an active upload; the committed file's season/week/timestamp come
+from `data/dk_slate_metadata.json` (see below).
+
+If neither a committed file nor a session upload is present, the page shows
+a clear empty-state prompt instead of an error - `data/dk_salaries/` and
+`data/dk_slate_metadata.json` don't exist in this repo until you load a
+real slate (see below); no placeholder/fake salary data is ever checked in.
+
+### Manually updating the committed salary slate
+
+There is no automated fetch of DraftKings' salary data (DK has no public
+API for it) - loading a new slate is a manual, local, one-command step:
+
+```bash
+# 1. Download the current week's salary CSV from draftkings.com yourself.
+
+# 2. Validate it and load it as the committed backend slate:
+python load_dk_salaries.py path/to/DKSalaries.csv --season 2026 --week 1
+
+# 3. Review what changed, then commit it:
+git status
+git add data/dk_salaries/ data/dk_slate_metadata.json
+git commit -m "Load Week 1 DK salary slate"
+git push
+```
+
+What `load_dk_salaries.py` does (`lib/dk_salary_loader.py` holds the actual
+validation/metadata logic, shared with the app so both apply identical
+rules):
+
+1. **Validates** the source CSV - all six required columns present, and at
+   least one player row (a header-only or fully-blank export is rejected
+   with a specific error, nothing is written).
+2. **Archives** the existing `data/dk_salaries/current.csv`, if any, to
+   `data/dk_salaries/archive/<old-season>-wk<old-week>-<timestamp>.csv` -
+   past slates are preserved, not overwritten silently.
+3. **Copies** the validated CSV to `data/dk_salaries/current.csv`.
+4. **Writes** `data/dk_slate_metadata.json`: `season`, `week`, `source`
+   (`manual_copy` by default, overridable with `--source`), `updated_at_utc`,
+   `row_count`, `filename`.
+
+`--season` and `--week` are required arguments - a DK salary CSV doesn't
+self-describe which slate it's for, so this is never guessed at.
+
+**Safety notes:**
+
+- The script **only** ever touches `data/dk_salaries/` and
+  `data/dk_slate_metadata.json` - nothing else in the repo.
+- It never runs automatically (no scheduled workflow calls it) and never
+  touches an in-session upload - those two paths are completely independent.
+- **Never place personal lineups, exposure/ownership data, contest
+  entries/standings, or bankroll figures anywhere under `data/dk_salaries/`**
+  - only the public DraftKings salary export belongs there, and this
+  directory is committed to the repo. `.gitignore` includes filename guards
+  (`*lineup*.csv`, `*exposure*.csv`, `*entries*.csv`, `*contest-standings*.csv`,
+  `*bankroll*.csv`) as a backstop, but the real safeguard is simply not
+  putting that data in this folder.
 
 ### How player matching works
 
@@ -471,6 +549,27 @@ The role/eligibility engine has its own dedicated test files:
   columns, missing fields, unrecognized/`role_unresolved` status, unparseable
   or expired timestamps, season/week scoping) with a trace line for every row.
 
+The persistent backend salary loading feature has its own dedicated test
+files too:
+
+- `tests/test_dk_salary_loader.py` - CSV validation (valid file accepted,
+  every missing required column named, header-only/blank CSV rejected,
+  unparseable bytes rejected), slate metadata read/write round-tripping, and
+  `load_dk_salaries.py` exercised as a real subprocess against a scratch
+  directory (successful load + metadata, archiving the previous
+  `current.csv` on reload, rejecting an invalid CSV without writing
+  anything, rejecting a missing source file).
+- `tests/test_lineup_helper_salary_source.py` - `AppTest`-driven page tests:
+  the committed `current.csv` loads with zero uploader interaction; a
+  session upload overrides it (source label flips, season/week show `—`)
+  while the committed file on disk is provably untouched; a CSV missing
+  required columns shows a specific error naming them; a header-only CSV
+  shows a specific "no player rows" error; and the true empty state (neither
+  file present) shows the empty-state prompt rather than crashing. This
+  suite backs up and restores whatever is really at `data/dk_salaries/` and
+  `data/dk_slate_metadata.json` around every test, so running it never
+  affects your actual committed slate.
+
 ## Known limitations
 
 - **Early-season small samples.** With 1-2 games played, `consistency_score`
@@ -508,3 +607,11 @@ The role/eligibility engine has its own dedicated test files:
 - **Main-slate scope.** The role/eligibility engine is built around the
   Sunday 1pm-4pm ET main slate; it does not special-case Thursday/Monday
   night or international games.
+- **DK salary data requires a manual step, on purpose.** DraftKings has no
+  public API for salary exports, so there's no automated fetch - `python
+  load_dk_salaries.py` (see "Manually updating the committed salary slate"
+  above) is a deliberate manual, local, one-command step, not a gap to
+  eventually automate away. `--season`/`--week` are required arguments for
+  the same reason `data/manual/eligibility_overrides.csv` requires a human:
+  a DK CSV doesn't self-describe which slate it's for, and guessing would
+  violate the same fail-closed principle as everything else in this app.

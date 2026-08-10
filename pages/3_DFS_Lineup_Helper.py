@@ -9,6 +9,7 @@ from lib.data import (
     data_freshness_caption,
     load_defense_matchups,
     load_depth_chart_metadata,
+    load_dk_slate_metadata,
     load_injury_metadata,
     load_metadata,
     load_player_role_context,
@@ -27,12 +28,11 @@ from lib.dk_helper import (
     needs_review,
     validate_dk_columns,
 )
+from lib.dk_salary_loader import CURRENT_CSV_PATH, SalaryCsvValidationError, validate_salary_csv_bytes
 from lib.eligibility import attach_role_context_to_dk_rows
 from lib.role_config import DEPTH_CHART_FRESHNESS_HOURS, INJURY_FRESHNESS_HOURS
 
 st.set_page_config(page_title="DFS Lineup Helper | NFL DFS", page_icon="💰", layout="wide")
-
-DK_AUTO_LOAD_PATH = os.path.join("data", "dk_salaries", "current.csv")
 
 st.title("💰 DFS Lineup Helper")
 st.caption(data_freshness_caption())
@@ -102,36 +102,75 @@ if depth_freshness != "fresh" or not injury_source_ok or (injury_source_ok and i
 st.divider()
 
 # ---------------------------------------------------------------------------
-# DK salary CSV source: auto-load a committed local file if present, with
-# the uploader always available as a session-only override (never written
-# back to disk).
+# DK salary CSV source: the committed backend slate (data/dk_salaries/
+# current.csv, loaded via `python load_dk_salaries.py` - see README) is the
+# default active slate on startup. The uploader is always available as a
+# session-only override - never written back to disk, so it's safe to use
+# on a read-only deployment (e.g. Streamlit Community Cloud) too.
 # ---------------------------------------------------------------------------
 st.markdown(
     "Reads this week's DraftKings salary CSV (Position, Name, Salary, Game Info, "
     "TeamAbbrev, AvgPointsPerGame) to get "
     + ("prior-season-baseline projections and value plays. " if is_preseason else "matchup-adjusted projections and value plays. ")
-    + "**A CSV used here - auto-loaded or uploaded - is never committed to the repo.**"
+    + "**The committed backend file is the default active slate; a session upload overrides it "
+    "for your own session only and is never written back to disk or committed.**"
 )
 
+slate_meta = load_dk_slate_metadata()
+
 auto_loaded_bytes = None
-if os.path.exists(DK_AUTO_LOAD_PATH):
-    with open(DK_AUTO_LOAD_PATH, "rb") as f:
+if os.path.exists(CURRENT_CSV_PATH):
+    with open(CURRENT_CSV_PATH, "rb") as f:
         auto_loaded_bytes = f.read()
 
 uploaded = st.file_uploader(
     "DraftKings salary CSV (session-only override)", type="csv",
-    help=f"If present, `{DK_AUTO_LOAD_PATH}` auto-loads by default. Uploading here overrides it for this session only.",
+    help=(
+        f"`{CURRENT_CSV_PATH}` is the committed backend slate and auto-loads by default when present. "
+        "Uploading here overrides it for this browser session only."
+    ),
 )
 
 if uploaded is not None:
     file_bytes = uploaded.getvalue()
-    st.caption(f"Salary data source: session upload `{uploaded.name}` (overrides the auto-loaded file, if any, for this session).")
+    active_source = "Session upload override"
+    active_filename = uploaded.name
+    slate_season, slate_week, slate_updated_at = None, None, None
 elif auto_loaded_bytes is not None:
     file_bytes = auto_loaded_bytes
-    st.caption(f"Salary data source: auto-loaded from `{DK_AUTO_LOAD_PATH}`.")
+    active_source = "Committed backend salary file"
+    active_filename = slate_meta.get("filename") or os.path.basename(CURRENT_CSV_PATH)
+    slate_season = slate_meta.get("season")
+    slate_week = slate_meta.get("week")
+    slate_updated_at = slate_meta.get("updated_at_utc")
 else:
-    st.info(f"Waiting for a DraftKings salary CSV - place one at `{DK_AUTO_LOAD_PATH}` for auto-load, or upload one above.")
+    st.info(
+        f"No salary data available yet. Load this week's DraftKings export as the committed backend "
+        f"slate with `python load_dk_salaries.py path/to/DKSalaries.csv --season <season> --week <week>` "
+        f"(see README), or upload a CSV above for this session only."
+    )
     st.stop()
+
+try:
+    validate_salary_csv_bytes(file_bytes)
+except SalaryCsvValidationError as exc:
+    st.error(f"'{active_filename}': {exc}")
+    st.stop()
+
+if slate_updated_at:
+    try:
+        slate_updated_display = pd.to_datetime(slate_updated_at, utc=True).strftime("%b %d, %Y %I:%M %p UTC")
+    except (ValueError, TypeError):
+        slate_updated_display = str(slate_updated_at)
+else:
+    slate_updated_display = "not tracked for session uploads" if active_source == "Session upload override" else "unknown"
+
+source_cols = st.columns(4)
+source_cols[0].metric("Salary data source", active_source)
+source_cols[1].metric("Slate season", slate_season if slate_season is not None else "—")
+source_cols[2].metric("Slate week", slate_week if slate_week is not None else "—")
+source_cols[3].metric("File last updated", slate_updated_display)
+st.caption(f"Active file: `{active_filename}`")
 
 
 @st.cache_data(show_spinner="Matching players and computing projections...")
