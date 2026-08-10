@@ -67,6 +67,19 @@ def load_team_summary() -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+@st.cache_data(show_spinner=False)
+def load_players_prior_season_baseline() -> pd.DataFrame:
+    path = os.path.join(DATA_DIR, "players_prior_season_baseline.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+def get_app_mode() -> str:
+    """"in_season" or "preseason_week_1_baseline" - see dfs_data_pipeline.determine_app_mode."""
+    return load_metadata().get("app_mode", "in_season")
+
+
 def data_freshness_caption() -> str:
     meta = load_metadata()
     if not meta:
@@ -79,6 +92,12 @@ def data_freshness_caption() -> str:
         pass
 
     season = meta.get("season", "?")
+    if meta.get("app_mode") == "preseason_week_1_baseline":
+        source_season = meta.get("source_season", "?")
+        return (
+            f"{season} season - no completed week yet. Week 1 Baseline Mode is active on the "
+            f"Lineup Helper page, using {source_season} prior-season production. Last checked {updated}."
+        )
     if meta.get("status") != "ok" or meta.get("latest_completed_week") is None:
         return (
             f"{season} season - no completed week yet (data pulls run but no games have "

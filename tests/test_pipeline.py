@@ -2,13 +2,18 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from datetime import datetime
+
 from dfs_data_pipeline import (
     _classify_opportunity_trend,
     _player_recent_form,
     build_defense_matchups,
     build_players_current,
     build_players_weekly,
+    build_prior_season_baseline,
     build_team_summary,
+    determine_active_season,
+    determine_app_mode,
     determine_week_status,
     safe_divide,
 )
@@ -367,3 +372,59 @@ def test_team_summary_excludes_future_weeks():
     raw = pd.DataFrame([_raw_team_row("KC", 1), _raw_team_row("KC", 2)])
     summary = build_team_summary(raw, 2025, latest_completed_week=1)
     assert summary[summary.team == "KC"].iloc[0]["games_played"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Week 1 / preseason baseline mode: active season, app_mode selection
+# ---------------------------------------------------------------------------
+def test_determine_active_season_before_march_is_prior_calendar_year():
+    assert determine_active_season(datetime(2026, 1, 15)) == 2025
+
+
+def test_determine_active_season_march_or_later_is_current_calendar_year():
+    assert determine_active_season(datetime(2026, 8, 10)) == 2026
+    assert determine_active_season(datetime(2026, 3, 1)) == 2026
+
+
+def test_app_mode_before_week1_is_preseason_baseline():
+    app_mode, source_season = determine_app_mode(active_season=2026, latest_completed_week=None)
+    assert app_mode == "preseason_week_1_baseline"
+    assert source_season == 2025  # immediately preceding season
+
+
+def test_app_mode_after_week1_completes_is_in_season():
+    app_mode, source_season = determine_app_mode(active_season=2026, latest_completed_week=1)
+    assert app_mode == "in_season"
+    assert source_season == 2026  # same season, not prior
+
+
+def test_app_mode_mid_season_stays_in_season():
+    app_mode, source_season = determine_app_mode(active_season=2026, latest_completed_week=9)
+    assert app_mode == "in_season"
+    assert source_season == 2026
+
+
+# ---------------------------------------------------------------------------
+# build_prior_season_baseline
+# ---------------------------------------------------------------------------
+def test_prior_season_baseline_has_no_momentum_or_wow_fields():
+    raw = pd.DataFrame([_raw_player_row(1, "BUF", 10), _raw_player_row(2, "DEN", 20)])
+    weekly = build_players_weekly(raw, 2025, latest_completed_week=2)
+    baseline = build_prior_season_baseline(weekly)
+
+    for forbidden in ["momentum_score", "momentum_games_used", "touches_wow_change",
+                       "opportunity_trend", "latest_game_touches", "prior_game_touches"]:
+        assert forbidden not in baseline.columns
+
+    row = baseline.iloc[0]
+    assert row["historical_team"] == "KC"
+    assert row["games_played"] == 2
+    assert row["avg_fantasy_points"] == pytest.approx(15.0)
+
+
+def test_prior_season_baseline_empty_input_has_schema():
+    baseline = build_prior_season_baseline(pd.DataFrame())
+    assert baseline.empty
+    assert "historical_team" in baseline.columns
+    assert "avg_fantasy_points" in baseline.columns
+    assert "momentum_score" not in baseline.columns

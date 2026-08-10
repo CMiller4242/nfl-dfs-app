@@ -15,11 +15,20 @@ The pipeline is a pure function of nflreadpy's source data: every run
 recomputes all outputs from scratch and overwrites the Parquet files, so
 re-running it never produces duplicate rows (idempotent by construction).
 
-Season, the latest fully-completed week, and the next DFS slate week are
-all auto-detected from the schedule (using final scores, not just whether
-nflreadpy has *any* rows for a week) so nobody has to hand-edit a week
-number, and a week with any game still in progress is never treated as
+The active season, its latest fully-completed week, and the next DFS slate
+week are all auto-detected from the schedule (using final scores, not just
+whether nflreadpy has *any* rows for a week) so nobody has to hand-edit a
+week number, and a week with any game still in progress is never treated as
 complete.
+
+If the active season (as the calendar says "now") has no completed week yet
+- before Week 1, or Week 1 itself still in progress - the pipeline switches
+to `app_mode = "preseason_week_1_baseline"`: `players_weekly`/
+`players_current`/`defense_matchups`/`team_summary` are written empty (there
+is no current-season data), and `players_prior_season_baseline.parquet` is
+populated instead, from the immediately preceding (fully-completed) season.
+This is a clearly-labeled, separate output - never silently blended into
+current-season numbers. See `determine_app_mode`.
 """
 
 import json
@@ -82,6 +91,18 @@ PLAYERS_CURRENT_EMPTY_COLUMNS = [
     "latest_game_touches", "prior_game_touches", "touches_wow_change", "opportunity_trend",
 ]
 
+PRIOR_SEASON_BASELINE_EMPTY_COLUMNS = [
+    "player_id", "player_display_name", "position", "historical_team", "season",
+    "games_played", "avg_fantasy_points", "total_touches",
+    "total_targets", "total_carries", "total_receptions",
+    "total_passing_yards", "total_rushing_yards", "total_receiving_yards",
+    "total_passing_tds", "total_rushing_tds", "total_receiving_tds",
+    "completion_pct", "passing_yards_per_attempt",
+    "yards_per_target", "yards_per_carry",
+    "catch_rate", "yac_per_reception", "target_share_pct", "air_yards_share_pct",
+    "yards_per_touch", "points_per_touch", "consistency_score",
+]
+
 DEFENSE_MATCHUPS_EMPTY_COLUMNS = [
     "defense_team", "position", "fantasy_points_allowed", "games",
     "position_league_average", "matchup_delta", "matchup_rating_percentile", "matchup_rank",
@@ -107,33 +128,51 @@ def safe_divide(numerator, denominator):
     return result.iloc[0] if is_scalar else result.reset_index(drop=True)
 
 
-def detect_season(max_lookback=3, now=None):
+def determine_active_season(now=None):
     """
-    Find the most recent season with usable player-stats + schedule data.
-    Returns (season, raw_player_stats_df, schedule_df).
+    The season the calendar says is "current" - NFL seasons span Sep-Feb, so
+    before March, "this year" still means last year's season (e.g. Jan 2026
+    games belong to the 2025 season). This is independent of whether that
+    season actually HAS any data yet from nflreadpy (see `determine_app_mode`).
     """
     now = now or datetime.now()
-    # NFL seasons span Sep-Feb; before March, "this year" still means last
-    # year's season (e.g. Jan 2026 games belong to the 2025 season).
-    year = now.year if now.month >= 3 else now.year - 1
+    return now.year if now.month >= 3 else now.year - 1
 
-    for candidate in range(year, year - max_lookback - 1, -1):
-        try:
-            player_df = nfl.load_player_stats([candidate]).to_pandas()
-            schedule_df = nfl.load_schedules([candidate]).to_pandas()
-        except Exception as exc:
-            print(f"Season {candidate}: unavailable ({exc})")
-            continue
 
-        if player_df.empty or "week" not in player_df.columns:
-            continue
-        if player_df[player_df["season_type"] == "REG"].empty:
-            continue
+def determine_app_mode(active_season, latest_completed_week):
+    """
+    Decide whether the app has real current-season data to work with.
 
-        print(f"Using season {candidate}")
-        return candidate, player_df, schedule_df
+      - `latest_completed_week` is not None -> "in_season": the active
+        season has at least one fully-completed week; source_season ==
+        active_season.
+      - `latest_completed_week` is None -> "preseason_week_1_baseline": no
+        completed week exists yet for the active season (before Week 1, or
+        Week 1 itself still in progress); source_season == the immediately
+        preceding season, used as a historical baseline.
 
-    raise RuntimeError("No NFL season data available from nflreadpy")
+    Pure decision function - no I/O - so mode selection is directly testable
+    without mocking nflreadpy.
+    """
+    if latest_completed_week is not None:
+        return "in_season", active_season
+    return "preseason_week_1_baseline", active_season - 1
+
+
+def _try_load_player_stats(season):
+    try:
+        return nfl.load_player_stats([season]).to_pandas()
+    except Exception as exc:
+        print(f"Season {season}: player stats unavailable ({exc})")
+        return pd.DataFrame()
+
+
+def _try_load_schedule(season):
+    try:
+        return nfl.load_schedules([season]).to_pandas()
+    except Exception as exc:
+        print(f"Season {season}: schedule unavailable ({exc})")
+        return pd.DataFrame()
 
 
 def determine_week_status(schedule_df, season):
@@ -259,11 +298,19 @@ def _classify_opportunity_trend(change):
     return "stable"
 
 
-def build_players_current(weekly_df):
-    """One row per player: season-to-date aggregates + derived analytics."""
-    if weekly_df.empty:
-        return pd.DataFrame(columns=PLAYERS_CURRENT_EMPTY_COLUMNS)
-
+def _season_aggregates(weekly_df):
+    """
+    Shared season-long aggregation: one row per player with totals,
+    efficiency rates, and consistency_score from a set of weekly rows. Used
+    for BOTH the current-season snapshot (`build_players_current`, which
+    adds recency/momentum on top) and the prior-season baseline
+    (`build_prior_season_baseline`, which deliberately does not - a stale
+    season's "momentum" and "week-over-week trend" aren't meaningful framed
+    as if they were current). Returns identity columns (player_id,
+    player_display_name, position, team = the team on their most recent row
+    in `weekly_df`, last_opponent, season, latest_game_week) plus every
+    season-aggregate metric.
+    """
     weekly_df = weekly_df.sort_values(["player_id", "week"])
 
     latest_idx = weekly_df.groupby("player_id")["week"].idxmax()
@@ -330,19 +377,50 @@ def build_players_current(weekly_df):
     agg["consistency_score"] = safe_divide(agg["avg_fantasy_points"], agg["std_fantasy_points"])
     agg.loc[agg["games_played"] < 2, "consistency_score"] = pd.NA
 
+    result = identity.merge(agg, on="player_id")
+    result["season"] = weekly_df["season"].iloc[0]
+    return result
+
+
+def build_players_current(weekly_df):
+    """One row per player: season-to-date aggregates + recency/momentum analytics."""
+    if weekly_df.empty:
+        return pd.DataFrame(columns=PLAYERS_CURRENT_EMPTY_COLUMNS)
+
+    base = _season_aggregates(weekly_df)
+
     recent_form = (
         weekly_df.groupby("player_id", group_keys=True)
         .apply(_player_recent_form, include_groups=False)
         .reset_index()
     )
 
-    current = identity.merge(agg, on="player_id").merge(recent_form, on="player_id")
-    current["season"] = weekly_df["season"].iloc[0]
+    current = base.merge(recent_form, on="player_id")
     current["opportunity_trend"] = current["touches_wow_change"].apply(_classify_opportunity_trend)
 
     keep_cols = PLAYERS_CURRENT_EMPTY_COLUMNS
     current = current[[c for c in keep_cols if c in current.columns]]
     return current.sort_values("momentum_score", ascending=False, na_position="last").reset_index(drop=True)
+
+
+def build_prior_season_baseline(weekly_df):
+    """
+    One row per player: season-long aggregates from a PRIOR, fully-completed
+    season, for use as a Week 1 baseline before any current-season games
+    exist. Deliberately excludes momentum, week-over-week touches, and
+    opportunity_trend - those are recency concepts that don't apply to a
+    season that's a year stale, and displaying them would imply a
+    current-season signal that doesn't exist. `team` is renamed
+    `historical_team` so it's never confused with a player's current team
+    (which comes from the uploaded DK salary CSV, not this table).
+    """
+    if weekly_df.empty:
+        return pd.DataFrame(columns=PRIOR_SEASON_BASELINE_EMPTY_COLUMNS)
+
+    base = _season_aggregates(weekly_df).rename(columns={"team": "historical_team"})
+    keep_cols = PRIOR_SEASON_BASELINE_EMPTY_COLUMNS
+    base = base[[c for c in keep_cols if c in base.columns]]
+    return base.sort_values("avg_fantasy_points", ascending=False, na_position="last").reset_index(drop=True)
 
 
 def build_defense_matchups(weekly_df):
@@ -434,28 +512,67 @@ def build_team_summary(raw_team_df, season, latest_completed_week):
 def run_pipeline():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    season, raw_player_df, schedule_df = detect_season()
-    latest_completed_week, next_slate_week = determine_week_status(schedule_df, season)
+    active_season = determine_active_season()
+    active_player_df = _try_load_player_stats(active_season)
+    active_schedule_df = _try_load_schedule(active_season)
 
+    if not active_schedule_df.empty:
+        latest_completed_week, next_slate_week = determine_week_status(active_schedule_df, active_season)
+    else:
+        # No schedule published/available yet for the active season at all -
+        # treat it the same as "before Week 1."
+        latest_completed_week, next_slate_week = None, 1
+
+    app_mode, source_season = determine_app_mode(active_season, latest_completed_week)
     status = "ok" if latest_completed_week is not None else "no_completed_weeks_yet"
-    print(f"Season {season}: latest_completed_week={latest_completed_week}, next_slate_week={next_slate_week}")
 
-    weekly_df = build_players_weekly(raw_player_df, season, latest_completed_week)
-    current_df = build_players_current(weekly_df)
-    defense_matchups_df = build_defense_matchups(weekly_df)
+    print(
+        f"Active season {active_season}: app_mode={app_mode}, "
+        f"latest_completed_week={latest_completed_week}, next_slate_week={next_slate_week}"
+    )
 
-    raw_team_df = load_raw_team_stats(season)
-    team_summary_df = build_team_summary(raw_team_df, season, latest_completed_week)
+    if app_mode == "in_season":
+        weekly_df = build_players_weekly(active_player_df, active_season, latest_completed_week)
+        current_df = build_players_current(weekly_df)
+        defense_matchups_df = build_defense_matchups(weekly_df)
+        raw_team_df = load_raw_team_stats(active_season)
+        team_summary_df = build_team_summary(raw_team_df, active_season, latest_completed_week)
+        baseline_df = pd.DataFrame(columns=PRIOR_SEASON_BASELINE_EMPTY_COLUMNS)
+    else:
+        print(f"No completed week for {active_season} yet - building {source_season} baseline for Week 1")
+        weekly_df = pd.DataFrame(columns=PLAYER_STAT_COLUMNS + ["touches"])
+        current_df = pd.DataFrame(columns=PLAYERS_CURRENT_EMPTY_COLUMNS)
+        defense_matchups_df = pd.DataFrame(columns=DEFENSE_MATCHUPS_EMPTY_COLUMNS)
+        team_summary_df = pd.DataFrame(columns=TEAM_SUMMARY_EMPTY_COLUMNS)
+        raw_team_df = pd.DataFrame()
+
+        prior_player_df = _try_load_player_stats(source_season)
+        prior_reg = (
+            prior_player_df[prior_player_df["season_type"] == "REG"]
+            if not prior_player_df.empty else prior_player_df
+        )
+        if prior_reg.empty:
+            raise RuntimeError(
+                f"No usable prior-season ({source_season}) data available to build a "
+                f"Week 1 baseline for {active_season}"
+            )
+        prior_max_week = int(prior_reg["week"].max())
+        prior_weekly_df = build_players_weekly(prior_player_df, source_season, prior_max_week)
+        baseline_df = build_prior_season_baseline(prior_weekly_df)
 
     weekly_df.to_parquet(os.path.join(DATA_DIR, "players_weekly.parquet"), index=False)
     current_df.to_parquet(os.path.join(DATA_DIR, "players_current.parquet"), index=False)
     defense_matchups_df.to_parquet(os.path.join(DATA_DIR, "defense_matchups.parquet"), index=False)
     team_summary_df.to_parquet(os.path.join(DATA_DIR, "team_summary.parquet"), index=False)
+    baseline_df.to_parquet(os.path.join(DATA_DIR, "players_prior_season_baseline.parquet"), index=False)
     if not raw_team_df.empty:
         raw_team_df.to_parquet(os.path.join(DATA_DIR, "team_stats.parquet"), index=False)
 
     metadata = {
-        "season": season,
+        "season": active_season,
+        "active_season": active_season,
+        "source_season": source_season,
+        "app_mode": app_mode,
         "latest_completed_week": latest_completed_week,
         "next_slate_week": next_slate_week,
         "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -463,6 +580,7 @@ def run_pipeline():
         "player_rows": int(len(weekly_df)),
         "player_count": int(weekly_df["player_id"].nunique()) if not weekly_df.empty else 0,
         "teams": sorted(weekly_df["team"].dropna().unique().tolist()) if not weekly_df.empty else [],
+        "prior_season_baseline_rows": int(len(baseline_df)),
     }
     with open(os.path.join(DATA_DIR, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
@@ -471,11 +589,12 @@ def run_pipeline():
     print(json.dumps(metadata, indent=2))
 
     print("\nRecord counts:")
-    print(f"  players_weekly.parquet:     {len(weekly_df):>6} rows")
-    print(f"  players_current.parquet:    {len(current_df):>6} rows")
-    print(f"  defense_matchups.parquet:   {len(defense_matchups_df):>6} rows")
-    print(f"  team_summary.parquet:       {len(team_summary_df):>6} rows")
-    print(f"  team_stats.parquet (raw):   {len(raw_team_df):>6} rows")
+    print(f"  players_weekly.parquet:              {len(weekly_df):>6} rows")
+    print(f"  players_current.parquet:             {len(current_df):>6} rows")
+    print(f"  defense_matchups.parquet:            {len(defense_matchups_df):>6} rows")
+    print(f"  team_summary.parquet:                {len(team_summary_df):>6} rows")
+    print(f"  team_stats.parquet (raw):            {len(raw_team_df):>6} rows")
+    print(f"  players_prior_season_baseline.parquet: {len(baseline_df):>4} rows")
 
     return metadata
 
