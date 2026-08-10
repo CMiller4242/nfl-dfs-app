@@ -17,10 +17,11 @@ st.caption(data_freshness_caption())
 meta = load_metadata()
 current = load_players_current()
 
-if current.empty:
+if not meta or meta.get("status") != "ok" or current.empty:
     st.warning(
-        "No data found in `/data` yet. Run `python dfs_data_pipeline.py` locally, "
-        "or wait for the weekly GitHub Actions refresh to populate it."
+        "No completed-week data found yet. Run `python dfs_data_pipeline.py` locally, "
+        "or wait for the weekly GitHub Actions refresh - it only publishes a week once "
+        "every game in it has a final score."
     )
     st.stop()
 
@@ -28,8 +29,8 @@ if current.empty:
 # Quick summary stats
 # ---------------------------------------------------------------------------
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Current Week", meta.get("current_week", "?"))
-col2.metric("Season", meta.get("season", "?"))
+col1.metric("Latest Completed Week", meta.get("latest_completed_week", "?"))
+col2.metric("Next Slate Week", meta.get("next_slate_week") or "Season complete")
 col3.metric("Players Tracked", f"{meta.get('player_count', len(current)):,}")
 col4.metric("Teams", len(meta.get("teams", [])))
 
@@ -40,8 +41,10 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.subheader("🔥 Top Momentum Players")
 st.caption(
-    "Momentum score blends the last three games (50% most recent, 30% two weeks ago, "
-    "20% three weeks ago) into a single trending-hot indicator."
+    "Momentum score uses each player's most recent PLAYED games (byes are skipped, not "
+    "zeroed), weighted 50% most recent / 30% second-most-recent / 20% third-most-recent. "
+    "Players with fewer than 3 games have those weights renormalized to sum to 1.0 - see "
+    "the Games Used column."
 )
 
 filter_col, count_col = st.columns([3, 1])
@@ -51,7 +54,7 @@ with count_col:
     top_n = st.number_input("Show top", min_value=5, max_value=50, value=15, step=5)
 
 filtered = current[current["position"].isin(selected_positions)] if selected_positions else current
-top_momentum = filtered.sort_values("momentum_score", ascending=False).head(int(top_n))
+top_momentum = filtered.sort_values("momentum_score", ascending=False, na_position="last").head(int(top_n))
 
 chart = px.bar(
     top_momentum.sort_values("momentum_score"),
@@ -61,29 +64,31 @@ chart = px.bar(
     color_discrete_map=POSITION_COLORS,
     orientation="h",
     labels={"momentum_score": "Momentum Score", "player_display_name": ""},
-    hover_data={"team": True, "opponent_team": True, "week": True},
+    hover_data={"team": True, "last_opponent": True, "momentum_games_used": True, "games_played": True},
 )
 chart.update_layout(height=max(400, 24 * len(top_momentum)), showlegend=True)
-st.plotly_chart(chart, width='stretch')
+st.plotly_chart(chart, width="stretch")
 
 with st.expander("View as table"):
     display_cols = [
-        "player_display_name", "position", "team", "opponent_team", "week",
-        "fantasy_points_ppr", "fantasy_points_ppr_3wk_avg", "momentum_score", "touches_wow_change",
+        "player_display_name", "position", "team", "last_opponent",
+        "avg_fantasy_points", "momentum_score", "momentum_games_used", "games_played",
+        "touches_wow_change", "opportunity_trend",
     ]
     st.dataframe(
         top_momentum[display_cols].rename(columns={
             "player_display_name": "Player",
             "position": "Pos",
             "team": "Team",
-            "opponent_team": "Last Opp",
-            "week": "Last Wk",
-            "fantasy_points_ppr": "Last Wk Pts",
-            "fantasy_points_ppr_3wk_avg": "3-Wk Avg",
+            "last_opponent": "Last Opp",
+            "avg_fantasy_points": "Season Avg",
             "momentum_score": "Momentum",
+            "momentum_games_used": "Games Used",
+            "games_played": "GP",
             "touches_wow_change": "Touches WoW",
+            "opportunity_trend": "Trend",
         }),
-        width='stretch',
+        width="stretch",
         hide_index=True,
     )
 

@@ -59,13 +59,34 @@ def load_team_stats() -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+@st.cache_data(show_spinner=False)
+def load_team_summary() -> pd.DataFrame:
+    path = os.path.join(DATA_DIR, "team_summary.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
 def data_freshness_caption() -> str:
     meta = load_metadata()
     if not meta:
         return "No data found yet - run `python dfs_data_pipeline.py` to generate it."
+
     updated = meta.get("last_updated", "unknown")
     try:
         updated = pd.to_datetime(updated).strftime("%b %d, %Y %I:%M %p UTC")
     except Exception:
         pass
-    return f"Data as of Week {meta.get('current_week', '?')}, {meta.get('season', '?')} season · last refreshed {updated}"
+
+    season = meta.get("season", "?")
+    if meta.get("status") != "ok" or meta.get("latest_completed_week") is None:
+        return (
+            f"{season} season - no completed week yet (data pulls run but no games have "
+            f"finished). Last checked {updated}."
+        )
+
+    week_line = f"Data as of Week {meta['latest_completed_week']}, {season} season"
+    next_week = meta.get("next_slate_week")
+    if next_week is not None:
+        week_line += f" · next slate: Week {next_week}"
+    return f"{week_line} · last refreshed {updated}"

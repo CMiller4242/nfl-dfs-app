@@ -1,5 +1,29 @@
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Old pipeline output no longer produced (kept out even if it reappears locally)
 data/consolidated/
+
+# Live/manual DraftKings salary uploads - never commit real slate data.
+# The app reads uploads in-memory only and never writes them to disk itself;
+# this just guards against someone dropping an export in the repo by hand.
+DKSalaries*.csv
+dk_salaries*.csv
+*.dksalaries.csv
+/uploads/
+
+# NOTE: data/*.parquet and data/metadata.json are intentionally NOT ignored -
+# GitHub Actions commits the pipeline's refreshed output there every week.

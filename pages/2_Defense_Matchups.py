@@ -11,41 +11,38 @@ st.caption(data_freshness_caption())
 
 dm = load_defense_matchups()
 if dm.empty:
-    st.warning("No data found in `/data` yet. Run `python dfs_data_pipeline.py` first.")
+    st.warning("No completed-week data found yet. Run `python dfs_data_pipeline.py` first.")
     st.stop()
 
 st.markdown(
-    "Average fantasy points (PPR) allowed by each defense, per position. "
-    "**Each position column is color-scaled independently** — QB, RB, WR, and TE "
-    "score on very different ranges, so comparing raw color intensity across "
-    "positions would be misleading. Green = tougher matchup for that defense "
-    "(allows more points); red = stingier defense against that position."
+    "Fantasy points (PPR) allowed by each defense, per position, from completed games only. "
+    "**Each position is colored by its own percentile rank (0-100)** — QB, RB, WR, and TE "
+    "score on very different raw ranges, so a shared color scale would be misleading. "
+    "A higher percentile always means a more favorable matchup for the offensive player, "
+    "regardless of position. Cell text shows the raw average fantasy points allowed."
 )
 
-pivot_raw = dm.pivot(index="defense_team", columns="position", values="avg_points_allowed").reindex(columns=POSITIONS)
+pivot_percentile = dm.pivot(index="defense_team", columns="position", values="matchup_rating_percentile").reindex(columns=POSITIONS)
+pivot_raw = dm.pivot(index="defense_team", columns="position", values="fantasy_points_allowed").reindex(columns=POSITIONS)
 
 sort_by = st.selectbox("Sort defenses by", ["Alphabetical"] + POSITIONS, index=0)
 if sort_by == "Alphabetical":
-    pivot_raw = pivot_raw.sort_index()
+    pivot_percentile = pivot_percentile.sort_index()
 else:
-    pivot_raw = pivot_raw.sort_values(sort_by, ascending=False)
-
-# Min-max normalize each position column independently so color intensity is
-# fair within a position, while the raw (comparable-in-meaning) value still
-# shows in the cell text and hover.
-pivot_norm = pivot_raw.apply(
-    lambda col: (col - col.min()) / (col.max() - col.min()) if col.max() != col.min() else col * 0 + 0.5,
-    axis=0,
-)
+    order = pivot_percentile[sort_by].sort_values(ascending=False).index
+    pivot_percentile = pivot_percentile.loc[order]
+pivot_raw = pivot_raw.loc[pivot_percentile.index]
 
 fig = go.Figure(
     data=go.Heatmap(
-        z=pivot_norm.values,
-        x=pivot_norm.columns,
-        y=pivot_norm.index,
+        z=pivot_percentile.values,
+        x=pivot_percentile.columns,
+        y=pivot_percentile.index,
+        zmin=0,
+        zmax=100,
         text=pivot_raw.round(1).values,
         texttemplate="%{text}",
-        hovertemplate="Defense: %{y}<br>Position: %{x}<br>Avg pts allowed: %{text}<extra></extra>",
+        hovertemplate="Defense: %{y}<br>Position: %{x}<br>Avg pts allowed: %{text}<br>Percentile: %{z:.0f}<extra></extra>",
         colorscale="RdYlGn",
         showscale=False,
         xgap=3,
@@ -58,37 +55,47 @@ fig.update_layout(
     yaxis_title="Defense",
     margin=dict(t=10),
 )
-st.plotly_chart(fig, width='stretch')
+st.plotly_chart(fig, width="stretch")
 
 st.divider()
 
 st.subheader("Position Detail")
 position = st.radio("Position", POSITIONS, horizontal=True, key="matchup_position")
-pos_dm = dm[dm["position"] == position].sort_values("avg_points_allowed", ascending=False)
+pos_dm = dm[dm["position"] == position].sort_values("fantasy_points_allowed", ascending=False)
+league_avg = pos_dm["position_league_average"].iloc[0] if not pos_dm.empty else None
+
+if league_avg is not None:
+    st.caption(f"League average for {position}: {league_avg:.2f} fantasy points per game (PPR).")
 
 bar = px.bar(
     pos_dm,
-    x="avg_points_allowed",
+    x="fantasy_points_allowed",
     y="defense_team",
     orientation="h",
-    color="avg_points_allowed",
+    color="matchup_rating_percentile",
     color_continuous_scale="RdYlGn",
-    labels={"avg_points_allowed": "Avg Fantasy Points Allowed (PPR)", "defense_team": "Defense"},
+    range_color=(0, 100),
+    labels={"fantasy_points_allowed": "Avg Fantasy Points Allowed (PPR)", "defense_team": "Defense"},
 )
+if league_avg is not None:
+    bar.add_vline(x=league_avg, line_dash="dash", line_color="gray", annotation_text="League avg")
 bar.update_layout(height=800, coloraxis_showscale=False, yaxis=dict(categoryorder="total ascending"))
-st.plotly_chart(bar, width='stretch')
+st.plotly_chart(bar, width="stretch")
 
 with st.expander("View as table"):
     st.dataframe(
-        pos_dm[["defense_team", "avg_points_allowed", "games", "matchup_rank", "matchup_rating"]].rename(
-            columns={
-                "defense_team": "Defense",
-                "avg_points_allowed": "Avg Pts Allowed",
-                "games": "Games",
-                "matchup_rank": "Rank",
-                "matchup_rating": "Rating (1-5)",
-            }
-        ),
-        width='stretch',
+        pos_dm[
+            ["defense_team", "fantasy_points_allowed", "games", "position_league_average",
+             "matchup_delta", "matchup_rating_percentile", "matchup_rank"]
+        ].rename(columns={
+            "defense_team": "Defense",
+            "fantasy_points_allowed": "Avg Pts Allowed",
+            "games": "Games",
+            "position_league_average": "Position League Avg",
+            "matchup_delta": "Matchup Delta",
+            "matchup_rating_percentile": "Percentile (0-100)",
+            "matchup_rank": "Rank",
+        }),
+        width="stretch",
         hide_index=True,
     )

@@ -1,7 +1,9 @@
 {
   "season": 2025,
-  "current_week": 18,
-  "last_updated": "2026-08-10T15:06:11.483901+00:00",
+  "latest_completed_week": 18,
+  "next_slate_week": null,
+  "last_updated": "2026-08-10T15:40:43.132132+00:00",
+  "status": "ok",
   "player_rows": 6020,
   "player_count": 608,
   "teams": [
