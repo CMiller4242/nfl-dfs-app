@@ -17,18 +17,28 @@ venv/
 # Old pipeline output no longer produced (kept out even if it reappears locally)
 data/consolidated/
 
-# Live/manual DraftKings salary uploads - never commit real slate data.
-# The app reads uploads in-memory only and never writes them to disk itself;
-# this just guards against someone dropping an export in the repo by hand.
-# data/dk_salaries/current.csv is a LOCAL convenience auto-load path (see
-# the Lineup Helper page) - place your current week's export there so you
-# don't have to re-upload every session; it's never committed.
+# Salary exports dropped anywhere OTHER than the persistent backend path
+# below (data/dk_salaries/current.csv + archive/) - e.g. a raw DraftKings
+# download left at the repo root. The app's session upload is read
+# in-memory only and is never written to disk by the app itself either way.
 DKSalaries*.csv
-dk_salaries*.csv
 *.dksalaries.csv
-data/dk_salaries/*.csv
 /uploads/
 
-# NOTE: data/*.parquet, data/metadata.json, data/*_metadata.json, and
-# data/manual/eligibility_overrides.csv ARE intentionally NOT ignored -
-# GitHub Actions commits the pipeline's refreshed output there on schedule.
+# Personal DFS data - never belongs in this repo regardless of location:
+# lineups, ownership/exposure exports, contest entries/standings, bankroll
+# tracking. Only public DraftKings salary exports live under data/dk_salaries/.
+*lineup*.csv
+*lineups*.csv
+*exposure*.csv
+*entries*.csv
+*contest-standings*.csv
+*bankroll*.csv
+
+# NOTE: data/*.parquet, data/metadata.json, data/*_metadata.json,
+# data/manual/eligibility_overrides.csv, data/dk_salaries/current.csv,
+# data/dk_salaries/archive/*.csv, and data/dk_slate_metadata.json ARE
+# intentionally NOT ignored - they're the app's committed backend data.
+# data/dk_salaries/current.csv is loaded via `python load_dk_salaries.py`
+# (see README), never written by the running app - a session upload in the
+# Lineup Helper page is always a session-only override, never persisted.

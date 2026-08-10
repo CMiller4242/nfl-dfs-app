@@ -117,6 +117,18 @@ def load_injury_metadata() -> dict:
         return json.load(f)
 
 
+@st.cache_data(show_spinner=False)
+def load_dk_slate_metadata() -> dict:
+    """season/week/source/updated_at_utc/row_count/filename for the committed
+    data/dk_salaries/current.csv - written by load_dk_salaries.py, never by
+    the app itself. See lib/dk_salary_loader.py."""
+    path = os.path.join(DATA_DIR, "dk_slate_metadata.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
 def get_app_mode() -> str:
     """"in_season" or "preseason_week_1_baseline" - see dfs_data_pipeline.determine_app_mode."""
     return load_metadata().get("app_mode", "in_season")
