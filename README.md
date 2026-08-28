@@ -667,6 +667,33 @@ injury Parquet file (`dfs_data_pipeline.write_snapshot_with_fallback`)
 since it's a pure recomputation of whatever source data (fresh or preserved)
 is currently on disk.
 
+**A failed ESPN fetch reuses the preserved snapshot for role context, not an
+empty one.** `write_snapshot_with_fallback` keeps `injuries_current.parquet`
+on disk untouched when a fetch fails, but `player_role_context.parquet` is
+always recomputed fresh every run - so it must be built from whatever is
+actually ON DISK, never from the empty in-memory result of the failed fetch
+itself. `dfs_data_pipeline._resolve_role_injury_snapshot` is the single place
+that reconciles the two, with three outcomes recorded in
+`injury_metadata.json`:
+
+| `role_context_source` | When | Role classifications |
+|---|---|---|
+| `fresh_fetch` | Latest ESPN fetch succeeded | Built from the fresh data, as normal |
+| `fallback_snapshot` | Fetch failed, a preserved snapshot exists | Built from the preserved snapshot - a starter who was `Out` in that snapshot still elevates their backup, exactly as if the fetch had succeeded |
+| `unavailable` | Fetch failed, no snapshot ever existed | Fails closed to `role_unresolved`, as before |
+
+The preserved snapshot's own real retrieval timestamp (from its
+`source_retrieved_at` column, never "now") feeds the same staleness check
+described above - a fallback that's past `INJURY_FRESHNESS_HOURS` still
+degrades to `role_unresolved` exactly like a stale fresh fetch would, so a
+stale fallback can never grant eligibility on its own. `injury_metadata.json`
+additionally records `used_fallback_snapshot`, `fallback_snapshot_retrieved_at`,
+`fallback_snapshot_age_hours`, and `fallback_snapshot_is_stale` so this is
+auditable without recomputing anything, and the Lineup Helper's freshness
+banner reads these same fields - a failed fetch with a good fallback shows
+*"fresh (fallback, Xh old)"*, not a blanket "unavailable," so one transient
+ESPN outage can never make a previously-usable Player Pool look broken.
+
 **On the Lineup Helper page:** the player pool is split into **Player Pool**
 (eligible plays), **Plays to Monitor** (`contingent_backup` - conditional
 injury paths), **Excluded by Role Context** (`inactive` / `bench_no_clear_path`,
@@ -811,6 +838,15 @@ The role/eligibility engine has its own dedicated test files:
 - `tests/test_manual_overrides.py` - override-file validation (missing
   columns, missing fields, unrecognized/`role_unresolved` status, unparseable
   or expired timestamps, season/week scoping) with a trace line for every row.
+- `tests/test_role_refresh.py` - the ESPN-fetch-fallback reconciliation
+  (`_resolve_role_injury_snapshot`): a successful fetch, a failed fetch with
+  a valid preserved snapshot (role classifications - including an
+  `injury_elevated_backup` - survive unchanged, the on-disk file stays
+  untouched), a failed fetch with no snapshot at all (fails closed), a
+  failed fetch with a stale preserved snapshot (labeled stale, still fails
+  closed, never grants eligibility), and a full `run_role_refresh`
+  integration test proving one failed refresh cannot turn a populated Player
+  Pool into an all-`role_unresolved` one.
 
 The persistent backend salary loading feature has its own dedicated test
 files too:

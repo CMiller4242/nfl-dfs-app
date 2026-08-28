@@ -1082,6 +1082,95 @@ def build_team_reporting(raw_team_df, season, latest_completed_week, reporting_m
     return result
 
 
+def _resolve_role_injury_snapshot(injuries_df, injury_run_metadata, injuries_path, injuries_written_fresh, now=None):
+    """
+    Decide which injury DataFrame + metadata is authoritative for
+    `compute_role_context`, and produce the audit fields describing that
+    decision. This is the single place that reconciles a fresh ESPN fetch
+    against `write_snapshot_with_fallback`'s on-disk fallback decision, so
+    `player_role_context.parquet`, role classifications, freshness fields,
+    and the `injury_metadata.json` audit trail can never disagree about
+    which injury data was actually used.
+
+    Three outcomes, distinguished exactly like `depth_status` already does
+    in `run_role_refresh`:
+      - Fresh fetch succeeded (`injuries_written_fresh` and the fetched data
+        is non-empty): use the freshly fetched DataFrame/metadata as-is.
+        `role_context_source = "fresh_fetch"`.
+      - Fetch failed but a valid preserved snapshot exists on disk
+        (`write_snapshot_with_fallback` returned `injuries_written_fresh =
+        False`, which only happens when a prior valid file was kept): RELOAD
+        that snapshot from disk - never trust the empty in-memory fetch
+        result - and build injury metadata whose `retrieved_at` reflects the
+        PRESERVED snapshot's own real retrieval time (from its
+        `source_retrieved_at` column), never "now". This is what makes
+        `compute_role_context`'s own staleness math (see
+        `INJURY_FRESHNESS_HOURS`) evaluate the data actually being used
+        rather than the failed attempt's timestamp - a stale preserved
+        snapshot still correctly fails closed to `role_unresolved`, exactly
+        as if it had just been fetched stale.
+        `role_context_source = "fallback_snapshot"`.
+      - Fetch failed and no usable snapshot ever existed (`injuries_df` is
+        empty AND `injuries_written_fresh` is True, meaning
+        `write_snapshot_with_fallback` had nothing to fall back to and wrote
+        the empty frame): pass the empty DataFrame through unchanged -
+        `compute_role_context` already fails closed to `role_unresolved` for
+        this case, nothing new needed here.
+        `role_context_source = "unavailable"`.
+
+    Returns `(role_injury_df, role_injury_metadata, audit_fields)` where
+    `audit_fields` is merged into `injury_metadata.json`: `used_fallback_snapshot`,
+    `fallback_snapshot_retrieved_at`, `fallback_snapshot_age_hours`,
+    `fallback_snapshot_is_stale`, `role_context_source`.
+    """
+    from lib.eligibility import _as_aware_utc, _hours_since
+    from lib.role_config import INJURY_FRESHNESS_HOURS
+
+    now = _as_aware_utc(now or datetime.now(timezone.utc))
+    fresh_fetch_ok = injuries_written_fresh and injuries_df is not None and not injuries_df.empty
+
+    if fresh_fetch_ok:
+        audit_fields = {
+            "used_fallback_snapshot": False,
+            "fallback_snapshot_retrieved_at": None,
+            "fallback_snapshot_age_hours": None,
+            "fallback_snapshot_is_stale": None,
+            "role_context_source": "fresh_fetch",
+        }
+        return injuries_df, injury_run_metadata, audit_fields
+
+    if not injuries_written_fresh:
+        preserved_df = pd.read_parquet(injuries_path) if os.path.exists(injuries_path) else pd.DataFrame()
+        preserved_retrieved_at = (
+            preserved_df["source_retrieved_at"].iloc[0]
+            if not preserved_df.empty and "source_retrieved_at" in preserved_df.columns
+            else None
+        )
+        age_hours = _hours_since(preserved_retrieved_at, now) if preserved_retrieved_at is not None else None
+        is_stale = age_hours is None or age_hours > INJURY_FRESHNESS_HOURS
+
+        role_injury_metadata = {**injury_run_metadata, "retrieved_at": preserved_retrieved_at}
+        audit_fields = {
+            "used_fallback_snapshot": True,
+            "fallback_snapshot_retrieved_at": preserved_retrieved_at,
+            "fallback_snapshot_age_hours": age_hours,
+            "fallback_snapshot_is_stale": is_stale,
+            "role_context_source": "fallback_snapshot",
+        }
+        return preserved_df, role_injury_metadata, audit_fields
+
+    # injuries_written_fresh is True but injuries_df is empty: nothing valid
+    # was ever written here before either, so there's no fallback to use.
+    audit_fields = {
+        "used_fallback_snapshot": False,
+        "fallback_snapshot_retrieved_at": None,
+        "fallback_snapshot_age_hours": None,
+        "fallback_snapshot_is_stale": None,
+        "role_context_source": "unavailable",
+    }
+    return injuries_df, injury_run_metadata, audit_fields
+
+
 def run_role_refresh(season, week, data_dir=None):
     """
     Refresh depth-chart + ESPN injury + role/eligibility outputs. Deliberately
@@ -1103,7 +1192,8 @@ def run_role_refresh(season, week, data_dir=None):
 
     data_dir = data_dir or DATA_DIR
     os.makedirs(data_dir, exist_ok=True)
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
 
     raw_depth = load_raw_depth_charts(season)
     depth_df = build_depth_chart_snapshot(raw_depth, season, week)
@@ -1117,14 +1207,23 @@ def run_role_refresh(season, week, data_dir=None):
     for line in override_log:
         print(f"[manual override] {line}")
 
-    role_context_df = compute_role_context(depth_df, injuries_df, injury_run_metadata, overrides_df)
-
     depth_path = os.path.join(data_dir, "depth_charts_current.parquet")
     injuries_path = os.path.join(data_dir, "injuries_current.parquet")
     role_path = os.path.join(data_dir, "player_role_context.parquet")
 
     depth_written_fresh = write_snapshot_with_fallback(depth_df, depth_path, "depth chart")
     injuries_written_fresh = write_snapshot_with_fallback(injuries_df, injuries_path, "ESPN injury")
+
+    # The DataFrame actually written to disk above (fresh fetch, or a
+    # preserved prior snapshot) is what role context MUST be built from -
+    # never the raw in-memory fetch result on its own, which is empty on a
+    # failed fetch even when good data was just preserved to injuries_path.
+    # See _resolve_role_injury_snapshot's docstring for the three outcomes.
+    role_injury_df, role_injury_metadata, injury_fallback_audit = _resolve_role_injury_snapshot(
+        injuries_df, injury_run_metadata, injuries_path, injuries_written_fresh, now=now
+    )
+
+    role_context_df = compute_role_context(depth_df, role_injury_df, role_injury_metadata, overrides_df, now=now)
     role_context_df.to_parquet(role_path, index=False)
 
     if depth_written_fresh and not depth_df.empty:
@@ -1146,7 +1245,19 @@ def run_role_refresh(season, week, data_dir=None):
     with open(os.path.join(data_dir, "depth_chart_metadata.json"), "w") as f:
         json.dump(depth_chart_metadata, f, indent=2)
 
-    injury_metadata = {**injury_run_metadata, "season": season, "week": week, "written_fresh": injuries_written_fresh}
+    # `source_success`/`retrieved_at`/etc. describe the LATEST fetch attempt
+    # exactly as before (unchanged meaning); the new `fallback_snapshot_*`/
+    # `used_fallback_snapshot`/`role_context_source` fields describe what
+    # player_role_context.parquet was actually built from - which can differ
+    # from the latest attempt whenever that attempt failed but a preserved
+    # snapshot was usable. See _resolve_role_injury_snapshot.
+    injury_metadata = {
+        **injury_run_metadata,
+        "season": season,
+        "week": week,
+        "written_fresh": injuries_written_fresh,
+        **injury_fallback_audit,
+    }
     with open(os.path.join(data_dir, "injury_metadata.json"), "w") as f:
         json.dump(injury_metadata, f, indent=2)
 
@@ -1154,8 +1265,15 @@ def run_role_refresh(season, week, data_dir=None):
     print(
         f"ESPN injuries: {injury_run_metadata.get('teams_succeeded')}/"
         f"{injury_run_metadata.get('teams_attempted')} teams succeeded, "
-        f"source_success={injury_run_metadata.get('source_success')}"
+        f"source_success={injury_run_metadata.get('source_success')}, "
+        f"role_context_source={injury_fallback_audit['role_context_source']}"
     )
+    if injury_fallback_audit["used_fallback_snapshot"]:
+        print(
+            f"  Using preserved injury snapshot from {injury_fallback_audit['fallback_snapshot_retrieved_at']} "
+            f"({injury_fallback_audit['fallback_snapshot_age_hours']:.1f}h old, "
+            f"stale={injury_fallback_audit['fallback_snapshot_is_stale']}) for role context."
+        )
     print(f"Role context: {len(role_context_df)} players classified")
     if not role_context_df.empty:
         print(role_context_df["role_classification"].value_counts().to_string())

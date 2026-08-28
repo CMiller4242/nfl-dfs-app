@@ -1,5 +1,5 @@
 {
-  "retrieved_at": "2026-08-28T16:06:04.329480+00:00",
+  "retrieved_at": "2026-08-28T17:07:04.481254+00:00",
   "source_success": false,
   "teams_attempted": 0,
   "teams_succeeded": 0,
@@ -9,5 +9,10 @@
   "error": "Could not fetch ESPN teams list: ProxyError: HTTPSConnectionPool(host='site.api.espn.com', port=443): Max retries exceeded with url: /apis/site/v2/sports/football/nfl/teams (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))",
   "season": 2026,
   "week": 1,
-  "written_fresh": false
+  "written_fresh": false,
+  "used_fallback_snapshot": true,
+  "fallback_snapshot_retrieved_at": "2026-08-25T11:24:14.334448+00:00",
+  "fallback_snapshot_age_hours": 77.71362221694444,
+  "fallback_snapshot_is_stale": true,
+  "role_context_source": "fallback_snapshot"
 }
