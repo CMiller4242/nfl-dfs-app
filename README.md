@@ -20,12 +20,14 @@ lib/role_config.py      Single config module for eligibility tiers, injury vocab
 lib/espn_injuries.py    ESPN roster/injury ingestion (HTTP retries, schema validation, status classification)
 lib/eligibility.py      Role/eligibility engine (depth-chart + injury -> role_classification)
 lib/manual_overrides.py Loader/validator for the manually-maintained eligibility override CSV
+lib/team_trends.py      Reusable, non-UI filter/sort/KPI/formatting transforms for Team Trends
 app.py                  Home page (multi-page Streamlit entry point)
 pages/
   1_Position_Explorer.py   Per-position efficiency, volume/efficiency, trend
   2_Defense_Matchups.py    Defense-vs-position heatmap + detail
   3_DFS_Lineup_Helper.py   Committed/uploaded DK salary CSV -> matched, projected, role-filtered player pool
-tests/                  pytest suite for the pipeline, matching/projection, salary loading, and role/eligibility logic
+  4_Team_Trends.py         Team offensive trends/rankings - yards, pass rate, momentum, WoW change
+tests/                  pytest suite for the pipeline, matching/projection, salary loading, team trends, and role/eligibility logic
 data/manual/eligibility_overrides.csv   Manually-maintained, validated, expiring eligibility overrides
 data/dk_salaries/current.csv            Committed backend salary slate (default active slate on startup)
 data/dk_salaries/archive/               Past current.csv snapshots, one per reload
@@ -43,6 +45,7 @@ data/dk_slate_metadata.json             season/week/source/updated_at_utc/row_co
 | `data/defense_matchups.parquet` | one row per defense x position | fantasy points allowed, league average, matchup delta/percentile |
 | `data/team_summary.parquet` | one row per team | pass/rush volume, pass rate, sacks & turnovers forced per game |
 | `data/team_stats.parquet` | one row per team per completed week | raw team-week stats from nflreadpy |
+| `data/team_reporting.parquet` | one row per team | offensive trends/rankings mart - see "Team Trends" below |
 | `data/metadata.json` | - | season, latest completed week, next slate week, refresh status/timestamp |
 | `data/depth_charts_current.parquet` | one row per (player, position group) | canonical identity crosswalk + depth rank, from nflreadpy's `load_depth_charts()` |
 | `data/injuries_current.parquet` | one row per rostered ESPN athlete | ESPN roster/injury status, classified into the role-engine's availability vocabulary |
@@ -292,6 +295,123 @@ is **never** read by the projection formula above. Matchup quality in
 projections comes exclusively from `defense_matchups.parquet`
 (`matchup_delta`), which is computed only from fantasy points an opposing
 defense has allowed to a position - a completely separate calculation.
+
+## Team Trends (`data/team_reporting.parquet`, `pages/4_Team_Trends.py`)
+
+A modern, testable replacement for the old Power BI "Team Offense Rankings"
+report's research workflow - team-level yardage, pass rate, recent form,
+and week-over-week change, computed once in the pipeline
+(`dfs_data_pipeline.build_team_reporting`) and only filtered/sorted/
+formatted in the page (`lib/team_trends.py`, a non-UI module so none of that
+formatting logic re-runs a groupby on every widget click). This is a
+**trend-signal report for research**, not a DFS projection, matchup rating,
+or composite score - it never feeds the Lineup Helper's projections and
+isn't intended to replace them.
+
+### Definitions
+
+All season-aggregate metrics use completed regular-season games only
+(`season_type == "REG"`, `week <= latest_completed_week`), from
+`nfl.load_team_stats()`'s actual columns - `attempts`, `passing_yards`,
+`carries`, `rushing_yards`, `passing_epa`, and `sacks_suffered` were all
+confirmed present in the real source before use; nothing here is guessed.
+
+- **Total/Pass/Rush Yards per Game** = season sum of the respective yardage
+  column / games played.
+- **Pass Rate** = `attempts / (attempts + carries) * 100`.
+- **Offensive Momentum** = `last_3_total_yards_per_game - season_total_yards_per_game`
+  (also expressed as `offensive_momentum_pct`, that difference as a fraction
+  of the season average). "Last 3" always means the team's last 3 **PLAYED**
+  completed games - see "How byes are handled" below.
+- **WoW (week-over-week) change** = the most recent played game's value
+  minus the previous played game's value, for passing yards, rushing yards,
+  total yards, and pass rate.
+
+### Passing EPA rate - the corrected metric
+
+The old Power BI "Offensive EPA Per Play" measure was actually
+`AVERAGE(passing_epa)` across weekly rows - an average of **weekly totals**,
+which is not a per-play rate at all (a week with more dropbacks contributes
+the same weight to that average as a week with far fewer). This app rebuilds
+it honestly:
+
+```
+season_passing_epa_per_dropback_or_attempt =
+    SUM(passing_epa) / SUM(dropbacks)
+
+dropbacks = attempts + sacks_suffered
+```
+
+`sacks_suffered` (sacks taken BY this team's offense - distinct from
+`def_sacks`, that team's own defensive sack production) was confirmed
+present in the source and used as the honest denominator; a `last_3_`
+version of the same rate is computed the same way over the last 3 played
+games. `season_passing_epa_denominator` is stored as an explicit text label
+(`"dropbacks (attempts + sacks_suffered)"`) right alongside the rate, so the
+denominator is never left implicit - and if `passing_epa`/`sacks_suffered`
+were ever unavailable from the source, these fields are left **null**, never
+silently computed from something else.
+
+`season_points_per_game` was considered and **intentionally omitted** -
+nflreadpy's team-stats source has no scoring column (the same reason
+`team_summary.parquet` omits a points-allowed metric), and fabricating one
+from other fields would be misleading.
+
+### How byes are handled
+
+A bye week is simply an absent row in `team_stats` - it is never treated as
+zero yards, zero plays, or counted as a "drop" in a trend. "Last 3 played
+games" and "the previous played game" (for WoW) always mean the last rows
+actually present, skipping any bye naturally, not a strict calendar-week
+lookback.
+
+### Sample-size and low-sample handling
+
+- `sample_size_label`: `insufficient_sample` (< 3 games), `limited_sample`
+  (3-5 games), `full_sample` (6+ games) - tunable in
+  `dfs_data_pipeline.py`'s `SAMPLE_SIZE_LIMITED_MIN_GAMES` /
+  `SAMPLE_SIZE_FULL_MIN_GAMES`.
+- With fewer than 3 played games, `last_3_*` fields are computed from
+  whatever games exist (never padded/fabricated), `last_3_games_count`
+  says exactly how many, and `recent_form_label` reads
+  `insufficient_sample` rather than a confident trend label.
+- With fewer than 2 played games, every WoW field is **null** (not zero -
+  there is no "previous game" to compare against) and `wow_change_label`
+  reads `insufficient_sample`.
+- `recent_form_label` (`heating_up` / `stable` / `cooling_off` /
+  `insufficient_sample`) and `wow_change_label` (`increasing` / `steady` /
+  `decreasing` / `insufficient_sample`) are both driven by named, documented
+  threshold constants in `dfs_data_pipeline.py`
+  (`RECENT_FORM_HEATING_UP_PCT`/`RECENT_FORM_COOLING_OFF_PCT` = ±7% of
+  season total yards/game; `WOW_INCREASING_YARDS`/`WOW_DECREASING_YARDS` =
+  ±20 total yards) - a documented design choice (the old Power BI report had
+  no such labels), tunable in one place.
+
+### Preseason baseline mode
+
+Before the active season has any completed games, `team_reporting.parquet`
+is built from the immediately prior season's **full** completed regular
+season (mirroring `players_prior_season_baseline.parquet`'s behavior) -
+`reporting_mode = "preseason_baseline"`. Season-aggregate fields (yards/game,
+pass rate, EPA rate) stay populated, since a real completed season's rates
+are still useful research context, but every recency/momentum/WoW field is
+**nulled** and `recent_form_label`/`wow_change_label` both read
+`"not_applicable_preseason"` - last season's Week 18 is never presented as
+this season's momentum. The Team Trends page shows a prominent warning
+banner in this mode. If neither current-season nor prior-season team stats
+are available at all, `team_reporting.parquet` is empty and
+`metadata.json["team_reporting_mode"] = "no_current_season_data"`.
+
+### Trend signals vs. DFS projections
+
+Team Trends is deliberately separate from player-level DFS work: it never
+reads from or writes to `players_current.parquet`, `defense_matchups.parquet`,
+or any DK-salary/eligibility file, and nothing in the Lineup Helper's
+projection formula reads `team_reporting.parquet`. A team "heating up" here
+describes recent yardage volume - it says nothing about which player benefits,
+whether that player is actually startable this week (see the role/eligibility
+engine below), or DK pricing/value. Use it to build research context, not as
+a standalone lineup decision.
 
 ## Player identity & the DK / nflreadpy / ESPN crosswalk
 
@@ -570,6 +690,25 @@ files too:
   `data/dk_slate_metadata.json` around every test, so running it never
   affects your actual committed slate.
 
+Team Trends has its own dedicated test files too:
+
+- `tests/test_team_reporting.py` - season totals/rates, safe division for
+  zero attempts/carries and zero dropbacks, last-3-played-games and WoW
+  change across a bye week, null WoW with fewer than 2 games, insufficient-
+  sample labeling with 1-2 games, the exact offensive-momentum calculation
+  and its documented heating-up/cooling-off thresholds, exclusion of
+  in-progress/future weeks and non-REG/other-season rows, preseason-baseline
+  mode (season aggregates kept, recency/WoW nulled and relabeled), the
+  honest EPA-per-dropback calculation (proven distinct from the old wrong
+  "average weekly EPA" approach) with graceful nulling when source columns
+  are missing, and output schema/no-duplicate-team-row checks.
+- `tests/test_team_trends.py` - the non-UI filter/sort/KPI/display module:
+  team/min-games/sample-size filtering, sort direction (and a safe no-op on
+  an unknown column), KPI standout-team selection (and safe empty/all-null
+  input), display formatting (null as `"—"`, signed `+`/`-` for change
+  metrics), and the weekly-trend chart's data prep (bye/future-week
+  exclusion).
+
 ## Known limitations
 
 - **Early-season small samples.** With 1-2 games played, `consistency_score`
@@ -615,3 +754,14 @@ files too:
   the same reason `data/manual/eligibility_overrides.csv` requires a human:
   a DK CSV doesn't self-describe which slate it's for, and guessing would
   violate the same fail-closed principle as everything else in this app.
+- **Team Trends is a research/trend-signal report, not a projection.** It
+  intentionally has no read or write path to player-level projections,
+  matchup ratings, or DK salary/eligibility data - see "Trend signals vs.
+  DFS projections" above. It also doesn't build the full "Matchup Analyzer
+  Expanded" report or a composite DFS score from the old Power BI workbook -
+  those are explicitly out of scope for this pass.
+- **`recent_form_label`/`wow_change_label` thresholds are a documented
+  design choice**, not sourced from the old Power BI report (which had no
+  such labels) - see `RECENT_FORM_HEATING_UP_PCT`/`RECENT_FORM_COOLING_OFF_PCT`/
+  `WOW_INCREASING_YARDS`/`WOW_DECREASING_YARDS` in `dfs_data_pipeline.py` if
+  you want to tune them.

@@ -8,8 +8,11 @@ kinds of output to /data:
     player/team per COMPLETED week, straight from the source with minimal
     shaping.
   - "derived" tables (players_current.parquet, defense_matchups.parquet,
-    team_summary.parquet): season-to-date aggregates and analytics computed
-    from the raw tables (rolling form, momentum, matchup quality, etc).
+    team_summary.parquet, team_reporting.parquet): season-to-date aggregates
+    and analytics computed from the raw tables (rolling form, momentum,
+    matchup quality, team offensive trends, etc). team_reporting.parquet is
+    the team-level reporting mart behind the Team Trends page - see
+    `build_team_reporting`.
 
 The pipeline is a pure function of nflreadpy's source data: every run
 recomputes all outputs from scratch and overwrites the Parquet files, so
@@ -65,9 +68,16 @@ PLAYER_STAT_COLUMNS = [
 # opponent's), so sacks_per_game / turnovers_forced_per_game below are real
 # source fields, not derived guesses. nflreadpy's team_stats has no
 # points-allowed column, so we deliberately don't compute one.
+# passing_epa (total EPA on the team's passing plays, per game) and
+# sacks_suffered (sacks taken BY this team's offense - distinct from
+# def_sacks, which is sacks that team's defense recorded) were both confirmed
+# present in the real nflreadpy source before use - see build_team_reporting,
+# which uses sacks_suffered as part of an honest "dropbacks" denominator
+# rather than averaging passing_epa across weeks (see its docstring for why
+# that old approach was wrong).
 TEAM_STAT_COLUMNS = [
     "season", "week", "team", "season_type", "opponent_team",
-    "attempts", "passing_yards", "carries", "rushing_yards",
+    "attempts", "passing_yards", "carries", "rushing_yards", "passing_epa", "sacks_suffered",
     "def_sacks", "def_interceptions", "def_fumbles_forced",
 ]
 
@@ -111,6 +121,51 @@ DEFENSE_MATCHUPS_EMPTY_COLUMNS = [
 TEAM_SUMMARY_EMPTY_COLUMNS = [
     "team", "games_played", "pass_yards_per_game", "rush_yards_per_game",
     "pass_rate_pct", "sacks_per_game", "turnovers_forced_per_game",
+]
+
+# --- Team reporting mart (build_team_reporting) -----------------------------
+# "Last N played games" for recent-form/momentum; bye weeks are simply
+# missing rows in team_stats, so they're skipped naturally rather than
+# needing special-casing (same convention as MOMENTUM_WEIGHTS above).
+TEAM_RECENT_FORM_GAMES = 3
+
+# offensive_momentum_pct thresholds for recent_form_label - a team's last-3
+# total-yards/game vs its season total-yards/game, as a fraction of the
+# season average. These bucket boundaries are a documented design choice
+# (not sourced from the old Power BI report, which had no such labels),
+# tunable in this one place. See build_team_reporting / README.
+RECENT_FORM_HEATING_UP_PCT = 0.07
+RECENT_FORM_COOLING_OFF_PCT = -0.07
+
+# wow_total_yards_change thresholds (raw yards, most-recent vs previous
+# played game) for wow_change_label. Also a documented design choice.
+WOW_INCREASING_YARDS = 20
+WOW_DECREASING_YARDS = -20
+
+# games_played thresholds for sample_size_label - keeps low-sample teams
+# from being read with the same confidence as a mature sample.
+SAMPLE_SIZE_LIMITED_MIN_GAMES = 3
+SAMPLE_SIZE_FULL_MIN_GAMES = 6
+
+TEAM_REPORTING_COLUMNS = [
+    # Identity / sample context
+    "season", "team", "games_played", "latest_played_week", "last_updated_utc",
+    "sample_size_label", "reporting_mode",
+    # Season aggregates (completed regular-season games only)
+    "season_passing_yards", "season_rushing_yards", "season_total_yards",
+    "season_passing_yards_per_game", "season_rushing_yards_per_game", "season_total_yards_per_game",
+    "season_pass_attempts", "season_carries", "season_offensive_plays", "season_pass_rate_pct",
+    "season_passing_epa", "season_passing_dropbacks", "season_passing_epa_denominator",
+    "season_passing_epa_per_dropback_or_attempt",
+    # Recent-form metrics (last TEAM_RECENT_FORM_GAMES played games)
+    "last_3_games_count", "last_3_passing_yards_per_game", "last_3_rushing_yards_per_game",
+    "last_3_total_yards_per_game", "last_3_pass_rate_pct", "last_3_passing_epa_per_dropback_or_attempt",
+    "offensive_momentum_yards", "offensive_momentum_pct", "recent_form_label",
+    # Recent-game (week-over-week) change metrics - most recent vs previous played game
+    "latest_game_week", "previous_game_week",
+    "latest_game_passing_yards", "latest_game_rushing_yards", "latest_game_total_yards",
+    "wow_passing_yards_change", "wow_rushing_yards_change", "wow_total_yards_change",
+    "wow_pass_rate_change", "wow_change_label",
 ]
 
 
@@ -580,6 +635,243 @@ def build_team_summary(raw_team_df, season, latest_completed_week):
     return agg[[c for c in TEAM_SUMMARY_EMPTY_COLUMNS if c in agg.columns]]
 
 
+def _sample_size_label(games_played):
+    if games_played < SAMPLE_SIZE_LIMITED_MIN_GAMES:
+        return "insufficient_sample"
+    if games_played < SAMPLE_SIZE_FULL_MIN_GAMES:
+        return "limited_sample"
+    return "full_sample"
+
+
+def _team_report_row(g):
+    """
+    One team's full reporting row (season aggregates + recent-form/momentum +
+    week-over-week change) from that team's own sorted-by-week completed-game
+    rows. Pure function of `g` - no I/O, directly testable - and mode-agnostic:
+    `build_team_reporting` decides afterward whether recency/WoW fields get
+    nulled out for preseason_baseline mode, not this function.
+
+    "Last N played games" and "previous played game" always mean the last
+    rows actually present, never a strict calendar week - bye weeks are
+    simply absent rows in team_stats (see TEAM_RECENT_FORM_GAMES above), so
+    they're skipped naturally rather than counted as zero yards or a drop.
+    """
+    g = g.sort_values("week").reset_index(drop=True)
+    games_played = len(g)
+
+    has_epa = "passing_epa" in g.columns
+    has_sacks_suffered = "sacks_suffered" in g.columns
+
+    sum_pass_yds = float(g["passing_yards"].sum())
+    sum_rush_yds = float(g["rushing_yards"].sum())
+    sum_total_yds = sum_pass_yds + sum_rush_yds
+    sum_attempts = float(g["attempts"].sum())
+    sum_carries = float(g["carries"].sum())
+    sum_plays = sum_attempts + sum_carries
+
+    season_passing_epa = float(g["passing_epa"].sum()) if has_epa else None
+    season_dropbacks = (sum_attempts + float(g["sacks_suffered"].sum())) if has_sacks_suffered else None
+    epa_denominator_label = "dropbacks (attempts + sacks_suffered)" if has_sacks_suffered else None
+    season_epa_per_dropback = (
+        safe_divide(season_passing_epa, season_dropbacks) if has_epa and has_sacks_suffered else None
+    )
+
+    # --- Season aggregates -------------------------------------------------
+    season_fields = {
+        "games_played": games_played,
+        "latest_played_week": int(g["week"].iloc[-1]),
+        "sample_size_label": _sample_size_label(games_played),
+        "season_passing_yards": sum_pass_yds,
+        "season_rushing_yards": sum_rush_yds,
+        "season_total_yards": sum_total_yds,
+        "season_passing_yards_per_game": safe_divide(sum_pass_yds, games_played),
+        "season_rushing_yards_per_game": safe_divide(sum_rush_yds, games_played),
+        "season_total_yards_per_game": safe_divide(sum_total_yds, games_played),
+        "season_pass_attempts": sum_attempts,
+        "season_carries": sum_carries,
+        "season_offensive_plays": sum_plays,
+        "season_pass_rate_pct": safe_divide(sum_attempts, sum_plays) * 100,
+        "season_passing_epa": season_passing_epa,
+        "season_passing_dropbacks": season_dropbacks,
+        "season_passing_epa_denominator": epa_denominator_label,
+        "season_passing_epa_per_dropback_or_attempt": season_epa_per_dropback,
+    }
+    season_total_ypg = season_fields["season_total_yards_per_game"]
+
+    # --- Recent-form (last TEAM_RECENT_FORM_GAMES played games) ------------
+    recent = g.tail(TEAM_RECENT_FORM_GAMES)
+    n = len(recent)
+    if n:
+        last_3_pass_ypg = float(recent["passing_yards"].mean())
+        last_3_rush_ypg = float(recent["rushing_yards"].mean())
+        last_3_total_ypg = last_3_pass_ypg + last_3_rush_ypg
+        r_attempts = float(recent["attempts"].sum())
+        r_carries = float(recent["carries"].sum())
+        last_3_pass_rate = safe_divide(r_attempts, r_attempts + r_carries) * 100
+        last_3_epa_per_dropback = (
+            safe_divide(float(recent["passing_epa"].sum()), r_attempts + float(recent["sacks_suffered"].sum()))
+            if has_epa and has_sacks_suffered else None
+        )
+    else:
+        last_3_pass_ypg = last_3_rush_ypg = last_3_total_ypg = None
+        last_3_pass_rate = last_3_epa_per_dropback = None
+
+    if n >= TEAM_RECENT_FORM_GAMES and pd.notna(season_total_ypg):
+        offensive_momentum_yards = last_3_total_ypg - season_total_ypg
+        offensive_momentum_pct = safe_divide(offensive_momentum_yards, season_total_ypg)
+    else:
+        offensive_momentum_yards = None
+        offensive_momentum_pct = None
+
+    if n < TEAM_RECENT_FORM_GAMES or offensive_momentum_pct is None or pd.isna(offensive_momentum_pct):
+        recent_form_label = "insufficient_sample"
+    elif offensive_momentum_pct >= RECENT_FORM_HEATING_UP_PCT:
+        recent_form_label = "heating_up"
+    elif offensive_momentum_pct <= RECENT_FORM_COOLING_OFF_PCT:
+        recent_form_label = "cooling_off"
+    else:
+        recent_form_label = "stable"
+
+    recent_form_fields = {
+        "last_3_games_count": n,
+        "last_3_passing_yards_per_game": last_3_pass_ypg,
+        "last_3_rushing_yards_per_game": last_3_rush_ypg,
+        "last_3_total_yards_per_game": last_3_total_ypg,
+        "last_3_pass_rate_pct": last_3_pass_rate,
+        "last_3_passing_epa_per_dropback_or_attempt": last_3_epa_per_dropback,
+        "offensive_momentum_yards": offensive_momentum_yards,
+        "offensive_momentum_pct": offensive_momentum_pct,
+        "recent_form_label": recent_form_label,
+    }
+
+    # --- Week-over-week change (most recent vs previous PLAYED game) -------
+    latest = g.iloc[-1]
+    latest_total = float(latest["passing_yards"]) + float(latest["rushing_yards"])
+    latest_pass_rate = safe_divide(float(latest["attempts"]), float(latest["attempts"]) + float(latest["carries"])) * 100
+
+    if games_played >= 2:
+        previous = g.iloc[-2]
+        previous_total = float(previous["passing_yards"]) + float(previous["rushing_yards"])
+        previous_pass_rate = safe_divide(
+            float(previous["attempts"]), float(previous["attempts"]) + float(previous["carries"])
+        ) * 100
+
+        wow_passing_yards_change = float(latest["passing_yards"]) - float(previous["passing_yards"])
+        wow_rushing_yards_change = float(latest["rushing_yards"]) - float(previous["rushing_yards"])
+        wow_total_yards_change = latest_total - previous_total
+        wow_pass_rate_change = (
+            latest_pass_rate - previous_pass_rate
+            if pd.notna(latest_pass_rate) and pd.notna(previous_pass_rate) else None
+        )
+
+        if wow_total_yards_change >= WOW_INCREASING_YARDS:
+            wow_change_label = "increasing"
+        elif wow_total_yards_change <= WOW_DECREASING_YARDS:
+            wow_change_label = "decreasing"
+        else:
+            wow_change_label = "steady"
+
+        wow_fields = {
+            "previous_game_week": int(previous["week"]),
+            "wow_passing_yards_change": wow_passing_yards_change,
+            "wow_rushing_yards_change": wow_rushing_yards_change,
+            "wow_total_yards_change": wow_total_yards_change,
+            "wow_pass_rate_change": wow_pass_rate_change,
+            "wow_change_label": wow_change_label,
+        }
+    else:
+        # Fewer than 2 played games: WoW is genuinely undefined, not zero.
+        wow_fields = {
+            "previous_game_week": None,
+            "wow_passing_yards_change": None,
+            "wow_rushing_yards_change": None,
+            "wow_total_yards_change": None,
+            "wow_pass_rate_change": None,
+            "wow_change_label": "insufficient_sample",
+        }
+
+    wow_fields.update({
+        "latest_game_week": int(latest["week"]),
+        "latest_game_passing_yards": float(latest["passing_yards"]),
+        "latest_game_rushing_yards": float(latest["rushing_yards"]),
+        "latest_game_total_yards": latest_total,
+    })
+
+    return pd.Series({**season_fields, **recent_form_fields, **wow_fields})
+
+
+def build_team_reporting(raw_team_df, season, latest_completed_week, reporting_mode, now=None):
+    """
+    Team offensive trends/reporting mart - one row per team - recreating the
+    old Power BI "Team Offense Rankings" report's practical research workflow
+    (yards/game, pass rate, week-over-week change, momentum) as transparent,
+    testable metrics. Pure function of its inputs - no I/O.
+
+    `reporting_mode` is "in_season" (raw_team_df/season/latest_completed_week
+    describe the active season's own completed games) or "preseason_baseline"
+    (they describe last season's full completed regular season instead, used
+    as a Week 1 stand-in - see the module docstring's preseason mode). In
+    preseason_baseline mode, season-aggregate fields stay populated (a real,
+    completed season's per-game rates are still useful context) but every
+    recency/momentum/week-over-week field is nulled out and its label field
+    is set to "not_applicable_preseason" - last season's Week 18 is never
+    presented as this season's momentum.
+
+    EPA correction: the old Power BI "Offensive EPA Per Play" measure was
+    actually AVERAGE(passing_epa) across weekly rows - an average of weekly
+    TOTALS, not a per-play rate at all. This rebuilds it honestly as
+    SUM(passing_epa) / SUM(dropbacks), where dropbacks = attempts +
+    sacks_suffered (both confirmed present in nflreadpy's team-stats source -
+    see TEAM_STAT_COLUMNS). The denominator is named explicitly in
+    `season_passing_epa_denominator` / `last_3_passing_epa_per_dropback_or_attempt`
+    rather than left implicit.
+    """
+    if raw_team_df is None or raw_team_df.empty or latest_completed_week is None:
+        return pd.DataFrame(columns=TEAM_REPORTING_COLUMNS)
+
+    df = raw_team_df[
+        (raw_team_df["season"] == season)
+        & (raw_team_df["season_type"] == "REG")
+        & (raw_team_df["week"] <= latest_completed_week)
+    ].copy()
+    if df.empty:
+        return pd.DataFrame(columns=TEAM_REPORTING_COLUMNS)
+
+    df = df.sort_values(["team", "week"]).drop_duplicates(subset=["team", "week"], keep="last")
+
+    rows = df.groupby("team", group_keys=False).apply(_team_report_row, include_groups=False)
+    rows = rows.reset_index().rename(columns={"index": "team"})
+
+    rows["season"] = season
+    rows["reporting_mode"] = reporting_mode
+    rows["last_updated_utc"] = (now or datetime.now(timezone.utc)).isoformat()
+
+    if reporting_mode == "preseason_baseline":
+        recency_numeric_cols = [
+            "last_3_games_count", "last_3_passing_yards_per_game", "last_3_rushing_yards_per_game",
+            "last_3_total_yards_per_game", "last_3_pass_rate_pct", "last_3_passing_epa_per_dropback_or_attempt",
+            "offensive_momentum_yards", "offensive_momentum_pct",
+            "latest_game_week", "previous_game_week",
+            "latest_game_passing_yards", "latest_game_rushing_yards", "latest_game_total_yards",
+            "wow_passing_yards_change", "wow_rushing_yards_change", "wow_total_yards_change",
+            "wow_pass_rate_change",
+        ]
+        # float("nan"), not None/pd.NA - keeps these columns real numeric
+        # dtypes (consistent with every other nullable numeric field in this
+        # app, e.g. wow_total_yards_change when a team has <2 games) so
+        # downstream .abs()/.max()/arithmetic never chokes on a stray Python
+        # None mixed into a numeric column.
+        rows[recency_numeric_cols] = float("nan")
+        rows["recent_form_label"] = "not_applicable_preseason"
+        rows["wow_change_label"] = "not_applicable_preseason"
+
+    result = rows[TEAM_REPORTING_COLUMNS].sort_values("team").reset_index(drop=True)
+    assert not result.duplicated(subset=["team"]).any(), (
+        "duplicate team rows in team_reporting - this should be unreachable"
+    )
+    return result
+
+
 def run_role_refresh(season, week, data_dir=None):
     """
     Refresh depth-chart + ESPN injury + role/eligibility outputs. Deliberately
@@ -693,6 +985,7 @@ def run_pipeline():
         defense_matchups_df = build_defense_matchups(weekly_df)
         raw_team_df = load_raw_team_stats(active_season)
         team_summary_df = build_team_summary(raw_team_df, active_season, latest_completed_week)
+        team_reporting_df = build_team_reporting(raw_team_df, active_season, latest_completed_week, "in_season")
         baseline_df = pd.DataFrame(columns=PRIOR_SEASON_BASELINE_EMPTY_COLUMNS)
     else:
         print(f"No completed week for {active_season} yet - building {source_season} baseline for Week 1")
@@ -716,13 +1009,41 @@ def run_pipeline():
         prior_weekly_df = build_players_weekly(prior_player_df, source_season, prior_max_week)
         baseline_df = build_prior_season_baseline(prior_weekly_df)
 
+        # team_reporting gets its own prior-season fetch (never merged into
+        # team_stats.parquet, same separation as players_weekly vs
+        # players_prior_season_baseline above) so Team Trends has a real,
+        # clearly-labeled preseason_baseline mart instead of an empty one.
+        prior_raw_team_df = load_raw_team_stats(source_season)
+        prior_team_reg = (
+            prior_raw_team_df[prior_raw_team_df["season_type"] == "REG"]
+            if not prior_raw_team_df.empty else prior_raw_team_df
+        )
+        if prior_team_reg.empty:
+            print(f"Warning: no usable prior-season ({source_season}) team stats for team_reporting baseline")
+            team_reporting_df = pd.DataFrame(columns=TEAM_REPORTING_COLUMNS)
+        else:
+            prior_team_max_week = int(prior_team_reg["week"].max())
+            team_reporting_df = build_team_reporting(
+                prior_raw_team_df, source_season, prior_team_max_week, "preseason_baseline"
+            )
+
     weekly_df.to_parquet(os.path.join(DATA_DIR, "players_weekly.parquet"), index=False)
     current_df.to_parquet(os.path.join(DATA_DIR, "players_current.parquet"), index=False)
     defense_matchups_df.to_parquet(os.path.join(DATA_DIR, "defense_matchups.parquet"), index=False)
     team_summary_df.to_parquet(os.path.join(DATA_DIR, "team_summary.parquet"), index=False)
     baseline_df.to_parquet(os.path.join(DATA_DIR, "players_prior_season_baseline.parquet"), index=False)
+    # Always written fresh, like player_role_context.parquet - a pure
+    # recomputation from whichever raw team stats are currently in hand
+    # (current-season or prior-season baseline), never itself a "last known
+    # good source" that needs write-with-fallback protection.
+    team_reporting_df.to_parquet(os.path.join(DATA_DIR, "team_reporting.parquet"), index=False)
     if not raw_team_df.empty:
         raw_team_df.to_parquet(os.path.join(DATA_DIR, "team_stats.parquet"), index=False)
+
+    team_reporting_mode = (
+        "no_current_season_data" if team_reporting_df.empty
+        else ("in_season" if app_mode == "in_season" else "preseason_baseline")
+    )
 
     metadata = {
         "season": active_season,
@@ -737,6 +1058,11 @@ def run_pipeline():
         "player_count": int(weekly_df["player_id"].nunique()) if not weekly_df.empty else 0,
         "teams": sorted(weekly_df["team"].dropna().unique().tolist()) if not weekly_df.empty else [],
         "prior_season_baseline_rows": int(len(baseline_df)),
+        "team_reporting_mode": team_reporting_mode,
+        "team_reporting_rows": int(len(team_reporting_df)),
+        "team_reporting_season": (
+            int(team_reporting_df["season"].iloc[0]) if not team_reporting_df.empty else None
+        ),
     }
     with open(os.path.join(DATA_DIR, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
@@ -751,6 +1077,7 @@ def run_pipeline():
     print(f"  team_summary.parquet:                {len(team_summary_df):>6} rows")
     print(f"  team_stats.parquet (raw):            {len(raw_team_df):>6} rows")
     print(f"  players_prior_season_baseline.parquet: {len(baseline_df):>4} rows")
+    print(f"  team_reporting.parquet ({team_reporting_mode}): {len(team_reporting_df):>4} rows")
 
     print("\nRefreshing role/eligibility context (depth chart + ESPN injuries)...")
     role_week = next_slate_week if next_slate_week is not None else (latest_completed_week or 1)
