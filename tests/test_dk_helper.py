@@ -207,6 +207,54 @@ def test_projection_still_computed_for_matched_player_despite_unresolvable_match
     row = proj.iloc[0]
     assert pd.isna(row["matchup_delta"])
     assert row["projection_status"] == "ok"
+
+
+def test_projection_carries_defense_reporting_display_context_alongside_matchup_delta():
+    # Item F: matchup_index/rank/percentile/raw-points-allowed should be
+    # available alongside matchup_delta wherever the join resolves, purely
+    # for display - never fed into the projection formula itself.
+    defense = pd.DataFrame([{
+        "defense_team": "SF", "position": "WR", "matchup_delta": 1.5,
+        "matchup_index": 112.3, "position_rank_most_favorable": 4,
+        "position_percentile_most_favorable": 78.5, "fantasy_points_allowed_per_game": 16.2,
+    }])
+    proj = compute_projections(_matched_row(), defense)
+    row = proj.iloc[0]
+    assert row["matchup_index"] == pytest.approx(112.3)
+    assert row["position_rank_most_favorable"] == pytest.approx(4)
+    assert row["position_percentile_most_favorable"] == pytest.approx(78.5)
+    assert row["fantasy_points_allowed_per_game"] == pytest.approx(16.2)
+
+
+def test_projection_defense_context_null_when_unresolvable_never_zero():
+    # Same unresolvable-opponent scenario as matchup_delta above, but
+    # checking every carried display field is null too - never a fabricated
+    # 0/neutral value for any of them.
+    defense = pd.DataFrame([{
+        "defense_team": "SOME_OTHER_TEAM", "position": "WR", "matchup_delta": -3.0,
+        "matchup_index": 80.0, "position_rank_most_favorable": 20,
+        "position_percentile_most_favorable": 15.0, "fantasy_points_allowed_per_game": 9.0,
+    }])
+    proj = compute_projections(_matched_row(), defense)
+    row = proj.iloc[0]
+    for field in ["matchup_index", "position_rank_most_favorable", "position_percentile_most_favorable",
+                  "fantasy_points_allowed_per_game"]:
+        assert pd.isna(row[field]), f"{field} should be null, not a fabricated value"
+
+
+def test_projection_defense_context_wrong_position_never_matches():
+    # Same defense/opponent, but the wrong position - proves the join keys
+    # on (opponent, Position) together, never opponent alone.
+    defense = pd.DataFrame([{"defense_team": "SF", "position": "RB", "matchup_delta": 4.0}])
+    proj = compute_projections(_matched_row(Position="WR"), defense)
+    assert pd.isna(proj.iloc[0]["matchup_delta"])
+
+
+def test_projection_handles_empty_defense_reporting_without_crashing():
+    proj = compute_projections(_matched_row(), pd.DataFrame())
+    row = proj.iloc[0]
+    assert pd.isna(row["matchup_delta"])
+    assert row["projection_status"] == "ok"  # still projects; matchup term just contributes 0
     expected_points = 18.0 + (20.0 - 18.0) * MOMENTUM_ADJUSTMENT_WEIGHT  # matchup term = 0
     assert row["projected_points"] == pytest.approx(expected_points, abs=0.01)
 

@@ -9,7 +9,7 @@ from datetime import datetime
 from dfs_data_pipeline import (
     _classify_opportunity_trend,
     _player_recent_form,
-    build_defense_matchups,
+    build_defense_reporting,
     build_depth_chart_snapshot,
     build_players_current,
     build_players_weekly,
@@ -242,51 +242,15 @@ def test_build_players_current_empty_input_returns_empty_with_schema():
 
 
 # ---------------------------------------------------------------------------
-# Defense-vs-position + position-specific percentile
+# Defense-vs-position - see tests/test_defense_reporting.py for the full
+# suite (build_defense_reporting / build_defense_position_weekly). This
+# empty-input check stays here since it's exercised alongside the other
+# builders in the season-lifecycle tests below.
 # ---------------------------------------------------------------------------
-def test_defense_matchups_delta_and_rank():
-    rows = [{"opponent_team": "DEFA", "position": "WR", "fantasy_points_ppr": 20}] * 3
-    rows += [{"opponent_team": "DEFB", "position": "WR", "fantasy_points_ppr": 10}] * 3
-    dm = build_defense_matchups(pd.DataFrame(rows))
-
-    a = dm[dm.defense_team == "DEFA"].iloc[0]
-    b = dm[dm.defense_team == "DEFB"].iloc[0]
-
-    assert a["fantasy_points_allowed"] == pytest.approx(20)
-    assert b["fantasy_points_allowed"] == pytest.approx(10)
-    assert a["position_league_average"] == pytest.approx(15.0)
-    assert a["matchup_delta"] == pytest.approx(5.0)
-    assert b["matchup_delta"] == pytest.approx(-5.0)
-    # Higher points allowed must always mean a higher (more favorable) percentile.
-    assert a["matchup_rating_percentile"] > b["matchup_rating_percentile"]
-    assert a["matchup_rank"] == 1
-    assert b["matchup_rank"] == 2
-
-
-def test_defense_matchups_percentile_is_position_specific_not_global():
-    rows = [
-        {"opponent_team": "DEF1", "position": "QB", "fantasy_points_ppr": 30},
-        {"opponent_team": "DEF2", "position": "QB", "fantasy_points_ppr": 15},
-        {"opponent_team": "DEF1", "position": "RB", "fantasy_points_ppr": 5},
-        {"opponent_team": "DEF2", "position": "RB", "fantasy_points_ppr": 25},
-    ]
-    dm = build_defense_matchups(pd.DataFrame(rows))
-
-    qb1 = dm[(dm.defense_team == "DEF1") & (dm.position == "QB")].iloc[0]
-    qb2 = dm[(dm.defense_team == "DEF2") & (dm.position == "QB")].iloc[0]
-    rb1 = dm[(dm.defense_team == "DEF1") & (dm.position == "RB")].iloc[0]
-    rb2 = dm[(dm.defense_team == "DEF2") & (dm.position == "RB")].iloc[0]
-
-    # DEF1 allows the most to QB but the least to RB - rankings must flip
-    # independently per position, proving there's no shared/global scale.
-    assert qb1["matchup_rating_percentile"] > qb2["matchup_rating_percentile"]
-    assert rb2["matchup_rating_percentile"] > rb1["matchup_rating_percentile"]
-
-
-def test_defense_matchups_empty_input():
-    dm = build_defense_matchups(pd.DataFrame())
+def test_defense_reporting_empty_input():
+    dm = build_defense_reporting(pd.DataFrame(), 2025, "in_season")
     assert dm.empty
-    assert "matchup_rating_percentile" in dm.columns
+    assert "position_percentile_most_favorable" in dm.columns
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +265,7 @@ def test_before_week1_no_games_played_yet():
 
     weekly = build_players_weekly(pd.DataFrame([_raw_player_row(1, "BUF", 10)]), 2025, latest)
     current = build_players_current(weekly)
-    defense = build_defense_matchups(weekly)
+    defense = build_defense_reporting(weekly, 2025, "in_season")
     assert weekly.empty and current.empty and defense.empty
 
 
@@ -336,11 +300,12 @@ def test_players_weekly_duplicate_source_rows_collapse_to_one_and_assertion_hold
 # build_team_summary - completed weeks only, safe division, own-defense semantics
 # ---------------------------------------------------------------------------
 def _raw_team_row(team, week, passing_yards=200, rushing_yards=100, attempts=30, carries=25,
-                   def_sacks=2, def_interceptions=1, def_fumbles_forced=1, opponent="OPP"):
+                   def_sacks=2, def_interceptions=1, def_fumbles_forced=1, def_qb_hits=3, opponent="OPP"):
     return {
         "season": 2025, "week": week, "team": team, "season_type": "REG", "opponent_team": opponent,
         "attempts": attempts, "passing_yards": passing_yards, "carries": carries, "rushing_yards": rushing_yards,
         "def_sacks": def_sacks, "def_interceptions": def_interceptions, "def_fumbles_forced": def_fumbles_forced,
+        "def_qb_hits": def_qb_hits,
     }
 
 
@@ -376,6 +341,29 @@ def test_team_summary_excludes_future_weeks():
     raw = pd.DataFrame([_raw_team_row("KC", 1), _raw_team_row("KC", 2)])
     summary = build_team_summary(raw, 2025, latest_completed_week=1)
     assert summary[summary.team == "KC"].iloc[0]["games_played"] == 1
+
+
+def test_defensive_pressure_events_per_game_is_sacks_plus_qb_hits_over_games():
+    raw = pd.DataFrame([
+        _raw_team_row("KC", 1, def_sacks=3, def_qb_hits=5),
+        _raw_team_row("KC", 2, def_sacks=1, def_qb_hits=7),
+    ])
+    summary = build_team_summary(raw, 2025, latest_completed_week=2)
+    row = summary[summary.team == "KC"].iloc[0]
+    # Old Power BI measure called this a "rate"; it's an events-PER-GAME
+    # count (sacks + qb_hits, divided by games played), never a per-play rate.
+    assert row["defensive_pressure_events_per_game"] == pytest.approx((3 + 5 + 1 + 7) / 2)
+
+
+def test_defensive_pressure_events_per_game_omitted_gracefully_without_source_column():
+    raw = pd.DataFrame([
+        {"season": 2025, "week": 1, "team": "KC", "season_type": "REG", "opponent_team": "OPP",
+         "attempts": 30, "passing_yards": 200, "carries": 25, "rushing_yards": 100,
+         "def_sacks": 2, "def_interceptions": 1, "def_fumbles_forced": 1},  # no def_qb_hits
+    ])
+    summary = build_team_summary(raw, 2025, latest_completed_week=1)
+    row = summary[summary.team == "KC"].iloc[0]
+    assert pd.isna(row["defensive_pressure_events_per_game"])
 
 
 # ---------------------------------------------------------------------------

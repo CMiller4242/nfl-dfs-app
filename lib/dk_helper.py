@@ -156,22 +156,52 @@ def match_dk_players(dk_df: pd.DataFrame, stats_df: pd.DataFrame) -> pd.DataFram
 REVIEW_STATUSES = {"review_required", "no_player_average", "no_salary"}
 
 
-def compute_projections(matched_df: pd.DataFrame, defense_matchups: pd.DataFrame) -> pd.DataFrame:
+# Extra defense-reporting fields carried onto a DK row purely for display
+# (never fed into the projection formula itself - only matchup_delta is).
+# Missing gracefully when defense_reporting doesn't have a column (e.g. an
+# older/minimal test fixture that only supplies matchup_delta).
+DEFENSE_CONTEXT_DISPLAY_FIELDS = [
+    "matchup_index", "position_rank_most_favorable", "position_percentile_most_favorable",
+    "fantasy_points_allowed_per_game",
+]
+
+
+def _defense_context_lookup_row(row, indexed):
+    """One DK row's full defense-reporting context (matchup_delta + display
+    fields), looked up by (opponent, Position). Every field is null - never
+    a neutral 0/guess - when that (defense, position) pair isn't resolvable,
+    whether because the opponent didn't parse or defense_reporting simply
+    has no data for it."""
+    fields = ["matchup_delta"] + DEFENSE_CONTEXT_DISPLAY_FIELDS
+    key = (row["opponent"], row["Position"])
+    if key in indexed.index:
+        match = indexed.loc[key]
+        return pd.Series({f: match.get(f, float("nan")) for f in fields})
+    return pd.Series({f: float("nan") for f in fields})
+
+
+def compute_projections(matched_df: pd.DataFrame, defense_reporting: pd.DataFrame) -> pd.DataFrame:
     """
-    Adds `opponent`, `matchup_delta`, `player_avg`, `momentum_score`,
-    `projected_points`, `projected_value`, and `projection_status` to a
-    matched DK dataframe.
+    Adds `opponent`, `matchup_delta` (+ defense-reporting display context),
+    `player_avg`, `momentum_score`, `projected_points`, `projected_value`,
+    and `projection_status` to a matched DK dataframe.
 
     projected_points = player_avg
                         + (momentum_score - player_avg) * MOMENTUM_ADJUSTMENT_WEIGHT
                         + matchup_delta * MATCHUP_ADJUSTMENT_WEIGHT
     projected_value  = projected_points / (Salary / 1000)
 
-    `matchup_delta` is looked up from DK's own Position + parsed opponent,
+    `matchup_delta` (and the display-only `matchup_index` /
+    `position_rank_most_favorable` / `position_percentile_most_favorable` /
+    `fantasy_points_allowed_per_game`) are looked up from DK's own Position +
+    parsed opponent against `defense_reporting` (dfs_data_pipeline.build_defense_reporting),
     independent of whether the player matched - a bad player match doesn't
-    have to cost you matchup context. It's null unless it's independently
-    resolvable that way (opponent parses AND that defense/position pair has
-    matchup data), never defaulted to a "neutral" number.
+    have to cost you matchup context. Every one of these is null unless
+    independently resolvable that way (opponent parses AND that
+    defense/position pair has reporting data), never defaulted to a
+    "neutral" number - only `matchup_delta` itself feeds the projection
+    formula below, and even there it's treated as 0 ONLY inside that one
+    calculation (see `.fillna(0)`), never persisted as a fabricated value.
 
     Unmatched/low-confidence rows get NO projection - never a fallback to
     DK's own AvgPointsPerGame. A row that couldn't be confidently matched to
@@ -190,16 +220,15 @@ def compute_projections(matched_df: pd.DataFrame, defense_matchups: pd.DataFrame
 
     df["opponent"] = df.apply(lambda r: parse_opponent(r.get("Game Info"), r.get("TeamAbbrev")), axis=1)
 
-    delta_lookup = defense_matchups.set_index(["defense_team", "position"])["matchup_delta"] \
-        if not defense_matchups.empty else pd.Series(dtype=float)
+    if not defense_reporting.empty:
+        indexed = defense_reporting.drop_duplicates(subset=["defense_team", "position"]).set_index(
+            ["defense_team", "position"]
+        )
+    else:
+        indexed = pd.DataFrame(index=pd.MultiIndex.from_tuples([], names=["defense_team", "position"]))
 
-    def _delta(row):
-        try:
-            return float(delta_lookup.loc[(row["opponent"], row["Position"])])
-        except KeyError:
-            return float("nan")  # not independently resolvable - null, not a neutral guess
-
-    df["matchup_delta"] = df.apply(_delta, axis=1)
+    defense_context = df.apply(lambda r: _defense_context_lookup_row(r, indexed), axis=1)
+    df = pd.concat([df, defense_context], axis=1)
 
     is_matched = df["match_method"] != "unmatched"
 
@@ -234,6 +263,8 @@ def compute_projections(matched_df: pd.DataFrame, defense_matchups: pd.DataFrame
     df["player_avg"] = player_avg.round(2)
     df["momentum_score"] = momentum.round(2)
     df["matchup_delta"] = df["matchup_delta"].round(2)
+    for field in DEFENSE_CONTEXT_DISPLAY_FIELDS:
+        df[field] = df[field].round(2)
     df["projected_points"] = projected_points.round(2)
     df["projected_value"] = safe_divide(projected_points, salary / 1000).round(2)
     df["projection_status"] = status
