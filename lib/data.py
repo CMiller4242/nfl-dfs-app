@@ -44,8 +44,22 @@ def load_players_current() -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_defense_matchups() -> pd.DataFrame:
-    path = os.path.join(DATA_DIR, "defense_matchups.parquet")
+def load_defense_reporting() -> pd.DataFrame:
+    """Defense-vs-position reporting mart (pages/2_Defense_Matchups.py, and
+    the Lineup Helper's matchup_delta lookup) - see
+    dfs_data_pipeline.build_defense_reporting for the full field definitions."""
+    path = os.path.join(DATA_DIR, "defense_reporting.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_defense_position_weekly() -> pd.DataFrame:
+    """Week-by-week fantasy points allowed per (defense, position) - the
+    Defense vs Position page's recent-trend chart data. See
+    dfs_data_pipeline.build_defense_position_weekly."""
+    path = os.path.join(DATA_DIR, "defense_position_weekly.parquet")
     if not os.path.exists(path):
         return pd.DataFrame()
     return pd.read_parquet(path)

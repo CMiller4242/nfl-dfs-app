@@ -5,7 +5,7 @@
   "app_mode": "preseason_week_1_baseline",
   "latest_completed_week": null,
   "next_slate_week": 1,
-  "last_updated": "2026-08-28T15:39:37.781495+00:00",
+  "last_updated": "2026-08-28T16:06:03.218343+00:00",
   "status": "no_completed_weeks_yet",
   "player_rows": 0,
   "player_count": 0,
@@ -13,5 +13,8 @@
   "prior_season_baseline_rows": 610,
   "team_reporting_mode": "preseason_baseline",
   "team_reporting_rows": 32,
-  "team_reporting_season": 2025
+  "team_reporting_season": 2025,
+  "defense_reporting_mode": "preseason_baseline",
+  "defense_reporting_rows": 128,
+  "defense_reporting_season": 2025
 }

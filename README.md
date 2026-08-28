@@ -21,13 +21,14 @@ lib/espn_injuries.py    ESPN roster/injury ingestion (HTTP retries, schema valid
 lib/eligibility.py      Role/eligibility engine (depth-chart + injury -> role_classification)
 lib/manual_overrides.py Loader/validator for the manually-maintained eligibility override CSV
 lib/team_trends.py      Reusable, non-UI filter/sort/KPI/formatting transforms for Team Trends
+lib/defense_trends.py   Reusable, non-UI filter/pivot/sort/formatting transforms for Defense vs Position
 app.py                  Home page (multi-page Streamlit entry point)
 pages/
   1_Position_Explorer.py   Per-position efficiency, volume/efficiency, trend
-  2_Defense_Matchups.py    Defense-vs-position heatmap + detail
+  2_Defense_Matchups.py    Defense-vs-position DvP matrix, position detail, recent-trend chart
   3_DFS_Lineup_Helper.py   Committed/uploaded DK salary CSV -> matched, projected, role-filtered player pool
   4_Team_Trends.py         Team offensive trends/rankings - yards, pass rate, momentum, WoW change
-tests/                  pytest suite for the pipeline, matching/projection, salary loading, team trends, and role/eligibility logic
+tests/                  pytest suite for the pipeline, matching/projection, salary loading, team/defense trends, and role/eligibility logic
 data/manual/eligibility_overrides.csv   Manually-maintained, validated, expiring eligibility overrides
 data/dk_salaries/current.csv            Committed backend salary slate (default active slate on startup)
 data/dk_salaries/archive/               Past current.csv snapshots, one per reload
@@ -42,8 +43,9 @@ data/dk_slate_metadata.json             season/week/source/updated_at_utc/row_co
 |---|---|---|
 | `data/players_weekly.parquet` | one row per player per **completed** week | raw box-score stats + `touches` |
 | `data/players_current.parquet` | one row per player | season-to-date aggregates + analytics (momentum, consistency, etc.) |
-| `data/defense_matchups.parquet` | one row per defense x position | fantasy points allowed, league average, matchup delta/percentile |
-| `data/team_summary.parquet` | one row per team | pass/rush volume, pass rate, sacks & turnovers forced per game |
+| `data/defense_reporting.parquet` | one row per (season, defense, position) | DvP mart - points allowed, league average, matchup index/delta, rank/percentile, recent trend - see "Defense vs Position" below |
+| `data/defense_position_weekly.parquet` | one row per (season, defense, position, week) | week-by-week points allowed, feeds the recent-trend chart and DvP's recent-form window |
+| `data/team_summary.parquet` | one row per team | pass/rush volume, pass rate, sacks & turnovers forced per game, defensive pressure events/game |
 | `data/team_stats.parquet` | one row per team per completed week | raw team-week stats from nflreadpy |
 | `data/team_reporting.parquet` | one row per team | offensive trends/rankings mart - see "Team Trends" below |
 | `data/metadata.json` | - | season, latest completed week, next slate week, refresh status/timestamp |
@@ -242,15 +244,19 @@ projected_value = projected_points / (Salary / 1000)
   played, the leading weights are renormalized to sum to 1.0.
 - **matchup_delta**: the upcoming opponent's average fantasy points allowed
   to this position, minus that position's league average (from
-  `defense_matchups.parquet` - see "Team defense stats vs. matchup ratings"
-  below). Looked up from the DK row's own `Position` and the opponent parsed
-  out of `Game Info`, independent of whether the player itself matched, so a
-  bad name match doesn't also cost you matchup context. It's left **null**
-  unless that lookup actually resolves (a parseable opponent *and* matchup
-  history for that defense/position) - never defaulted to a "neutral" 0.0
-  guess. A confidently-matched player with an unresolvable matchup still gets
-  a projection (the matchup term just contributes 0 internally), but the
+  `defense_reporting.parquet` - see "Defense vs Position" below). Looked up
+  from the DK row's own `Position` and the opponent parsed out of `Game Info`,
+  independent of whether the player itself matched, so a bad name match
+  doesn't also cost you matchup context. It's left **null** unless that
+  lookup actually resolves (a parseable opponent *and* matchup history for
+  that defense/position) - never defaulted to a "neutral" 0.0 guess. A
+  confidently-matched player with an unresolvable matchup still gets a
+  projection (the matchup term just contributes 0 internally), but the
   displayed `matchup_delta` stays null so it's clear that piece is missing.
+  `matchup_index`, `position_rank_most_favorable`, and
+  `position_percentile_most_favorable` are carried onto the same row purely
+  for display (never fed into the formula) - the Player Pool table shows
+  them alongside `matchup_delta`.
 
 Weights are named constants in `lib/dk_helper.py`, tunable in one place:
 
@@ -287,14 +293,150 @@ match), and `projection_status` - and is downloadable as CSV.
 
 ### Team defense stats vs. matchup ratings
 
-`team_summary.parquet`'s `sacks_per_game` and `turnovers_forced_per_game`
-are a team's **own** defensive production (from that team's
-`def_sacks` / `def_interceptions` / `def_fumbles_forced` - what its defense
-did, not what was done to it). This table is informational context only and
-is **never** read by the projection formula above. Matchup quality in
-projections comes exclusively from `defense_matchups.parquet`
-(`matchup_delta`), which is computed only from fantasy points an opposing
-defense has allowed to a position - a completely separate calculation.
+`team_summary.parquet`'s `sacks_per_game`, `turnovers_forced_per_game`, and
+`defensive_pressure_events_per_game` are a team's **own** defensive
+production (from that team's `def_sacks` / `def_interceptions` /
+`def_fumbles_forced` / `def_qb_hits` - what its defense did, not what was
+done to it). This table is informational context only and is **never** read
+by the projection formula above. Matchup quality in projections comes
+exclusively from `defense_reporting.parquet` (`matchup_delta`), which is
+computed only from fantasy points an opposing defense has allowed to a
+position - a completely separate calculation. See "Defense vs Position"
+below for the full DvP mart, and its own section for why
+`defensive_pressure_events_per_game` is named an events-per-game count, not
+a "rate."
+
+## Defense vs Position (`data/defense_reporting.parquet`, `pages/2_Defense_Matchups.py`)
+
+A modern, testable replacement for the old Power BI "Defense vs Position"
+research workflow, computed once in the pipeline
+(`dfs_data_pipeline.build_defense_reporting` /
+`build_defense_position_weekly`) and only filtered/pivoted/formatted in the
+page (`lib/defense_trends.py`, a non-UI module - the page never re-runs a
+groupby on a widget interaction). "Defense" always means the offensive
+player's `opponent_team`. These are trend **signals** for research, not a
+DFS projection or composite score, even though `matchup_delta` also feeds
+the Lineup Helper's projection formula (see "Projection formula" above).
+
+### The core rule: everything is scoped within position, never globally
+
+QB, RB, WR, and TE score fantasy points on completely different scales, so
+**every** metric here - league average, matchup index, matchup delta, rank,
+percentile, and color - is computed independently within each position.
+A defense's QB numbers never influence, get compared to, or share a color
+scale with its RB/WR/TE numbers. This is enforced structurally (every
+`groupby` in `build_defense_reporting` includes `position`), not just by
+convention, and is directly covered by
+`tests/test_defense_reporting.py::test_no_global_ranking_or_color_normalization_across_positions`.
+
+### Definitions
+
+Season DvP (completed regular-season games only):
+
+```
+fantasy_points_allowed_per_game =
+    mean(fantasy_points_ppr) grouped by opponent_team + position
+
+league_avg_points_allowed_for_position =
+    mean(fantasy_points_ppr) grouped by position, across all defenses
+
+matchup_index =
+    fantasy_points_allowed_per_game / league_avg_points_allowed_for_position * 100
+
+matchup_delta =
+    fantasy_points_allowed_per_game - league_avg_points_allowed_for_position
+```
+
+This exactly preserves the original Power BI DAX's `AVERAGE(PlayerStats[fantasy_points_ppr])`
+semantics - a week where a defense faced 2 WRs contributes 2 rows to that
+average, so `games_in_sample` is a **raw row count**, not a distinct-week
+count (kept deliberately, per the original report's own behavior - see
+"How byes are handled" below for where this differs for recent-DvP).
+
+`position_rank_most_favorable` (dense rank, 1 = most favorable - allows the
+**most** to that position) and `position_percentile_most_favorable` (0-100,
+higher = more favorable) are both ranked **within position** by
+`fantasy_points_allowed_per_game`, descending. Higher fantasy points
+allowed, matchup index, matchup delta, and percentile **always** mean a more
+favorable matchup for the offensive DFS player - never the inverse.
+
+### Recent DvP - last 3 played weeks
+
+Recent-DvP fields (`last_3_games_*`, `dvp_recent_trend_delta`,
+`dvp_trend_label`) are computed from `data/defense_position_weekly.parquet`
+(one row per defense/position/**week**, source columns first averaged
+within a week - so a week where a defense faced 2 WRs counts as **one**
+game here, unlike the raw-row-count season number above) rather than from
+the raw per-player rows directly:
+
+- **Last 3** always means the defense's last 3 **PLAYED** completed weeks
+  against that position - bye weeks are simply absent rows, never treated
+  as zero or a drop.
+- `last_3_games_points_allowed_per_game` (and the index/delta built from it)
+  use whatever's available, even a single game.
+- `dvp_recent_trend_delta` (last-3 vs season) requires at least 2 games to
+  be a real number - "do not fabricate a trend with fewer than 2 relevant
+  games."
+- `dvp_trend_label` (`becoming_more_favorable` / `stable` / `becoming_tougher`
+  / `insufficient_sample`) is held to the stricter, full 3-game bar before
+  it will name a direction - even if the raw delta already exists at 2
+  games, the label still reads "Insufficient Sample" until the third game.
+  A positive trend means the matchup is **improving for the offense**
+  (allowing more), not that the defense is playing better. Threshold
+  constants (`DEFENSE_TREND_MORE_FAVORABLE_PCT` /
+  `DEFENSE_TREND_TOUGHER_PCT`, ±7% of the season average) are a documented
+  design choice in `dfs_data_pipeline.py`, mirroring - but independently
+  tunable from - Team Trends' equivalent constants.
+
+### How byes are handled
+
+A bye week is simply an absent row in `defense_position_weekly` - never
+zero points allowed, never connected across as if a game happened. The
+Defense vs Position page's recent-trend chart reindexes each series across
+the full completed-week range with an explicit null for any missing week
+(`lib.defense_trends.weekly_series_with_bye_gaps`) specifically so the line
+chart shows a genuine break at a bye instead of a misleading straight line
+through it.
+
+### Preseason / Week 1 baseline behavior
+
+Before the active season has any completed games, `defense_reporting.parquet`
+is built from the immediately prior season's full completed regular season
+(`reporting_mode = "preseason_baseline"`) - season DvP fields stay populated
+(a completed season's DvP is still useful research context), but every
+recent-DvP field is nulled and `dvp_trend_label` reads
+`"not_applicable_preseason"`. The page shows: *"Week 1 baseline: prior-season
+defensive matchup data. Personnel and scheme changes are not yet reflected."*
+- it never claims this is current-season defensive form. Once the active
+season has completed games, `defense_reporting.parquet` switches to
+current-season-only DvP automatically; seasons are never silently blended.
+
+### Defensive pressure - a corrected label, not a rate
+
+The old Power BI "Offensive EPA Per Play"-style measure for pressure was
+`(SUM(def_sacks) + SUM(def_qb_hits)) / DISTINCTCOUNT(week)` labeled a "rate" -
+but dividing by games is not a per-play rate. `team_summary.parquet`'s
+`defensive_pressure_events_per_game` preserves the exact same calculation
+(both `def_sacks` and `def_qb_hits` confirmed present in nflreadpy's source)
+but names it honestly as an **events-per-game count**. A true pressure
+*rate* would need a reliable opponent-dropbacks denominator, which isn't in
+the current source data, so it's intentionally not computed - see "Known
+limitations." This metric lives in `team_summary.parquet` (team-level, the
+table that already houses a team's own defensive production), never in
+`defense_reporting.parquet` (which is position-vs-defense DvP, a different
+grain) and never as an input to the DvP formulas above.
+
+### Integration with the Lineup Helper
+
+`compute_projections` (`lib/dk_helper.py`) joins each DK row's own
+`Position` + parsed opponent against `defense_reporting.parquet` by
+`(defense_team, position)`. Only `matchup_delta` feeds the projection
+formula; `matchup_index`, `position_rank_most_favorable`,
+`position_percentile_most_favorable`, and `fantasy_points_allowed_per_game`
+are carried onto the same row purely for display. Every one of these is
+**null**, never a fabricated 0, whenever the join can't resolve (unparseable
+opponent, or no reporting data for that defense/position) - see
+`tests/test_dk_helper.py`'s `test_projection_defense_context_null_when_unresolvable_never_zero`.
 
 ## Team Trends (`data/team_reporting.parquet`, `pages/4_Team_Trends.py`)
 
@@ -405,9 +547,10 @@ are available at all, `team_reporting.parquet` is empty and
 ### Trend signals vs. DFS projections
 
 Team Trends is deliberately separate from player-level DFS work: it never
-reads from or writes to `players_current.parquet`, `defense_matchups.parquet`,
+reads from or writes to `players_current.parquet`, `defense_reporting.parquet`,
 or any DK-salary/eligibility file, and nothing in the Lineup Helper's
-projection formula reads `team_reporting.parquet`. A team "heating up" here
+projection formula reads `team_reporting.parquet` (only `defense_reporting.parquet`'s
+`matchup_delta` feeds it - see "Defense vs Position" above). A team "heating up" here
 describes recent yardage volume - it says nothing about which player benefits,
 whether that player is actually startable this week (see the role/eligibility
 engine below), or DK pricing/value. Use it to build research context, not as
@@ -709,6 +852,39 @@ Team Trends has its own dedicated test files too:
   metrics), and the weekly-trend chart's data prep (bye/future-week
   exclusion).
 
+Defense vs Position has its own dedicated test files too:
+
+- `tests/test_defense_reporting.py` - the raw DvP formulas matching the
+  original Power BI DAX semantics exactly (including that a multi-player
+  week counts multiple rows in the season average, but only one game in the
+  recent-DvP window), position-scoped league averages (proven distinct
+  across positions, never one shared number), rank/percentile direction
+  (higher points allowed is always more favorable, dense-rank ties handled),
+  proof there is no global/shared ranking or color scale across positions,
+  last-3-played-weeks and its bye-skipping across `build_defense_position_weekly`,
+  the two-tier insufficient-sample rule (a real trend number at 2 games, but
+  a real trend *label* only at the full 3-game window), the documented
+  trend-label thresholds, current-season vs. preseason-baseline behavior,
+  exclusion of other-season/non-REG rows, and output schema/no-duplicate-row
+  checks.
+- `tests/test_defense_trends.py` - the non-UI filter/pivot/sort/display
+  module: position/team/min-games/sample-size filtering, matrix pivoting
+  (position-independent, null - not 0 - for a defense/position pair with no
+  data), sort direction, detail-table formatting (null as `"—"`, icon+text
+  trend labels), and the recent-trend chart's data prep - proving a bye week
+  produces a genuine `NaN` gap in the reindexed series, and that the
+  league-position-average reference line never leaks another position's data.
+- `tests/test_dk_helper.py` additions - the DK-row-to-defense-reporting join:
+  every carried display field (`matchup_index`, rank, percentile, raw points
+  allowed) resolves correctly alongside `matchup_delta`; every one of them is
+  null - never a fabricated 0 - when the join can't resolve; the join keys on
+  `(opponent, Position)` together (a matching opponent with the wrong
+  position never matches); and an empty `defense_reporting` doesn't crash the
+  projection formula.
+- `tests/test_pipeline.py` additions - `defensive_pressure_events_per_game`'s
+  exact calculation and its graceful, honest nulling (never a fabricated 0)
+  when `def_qb_hits` isn't present in the source.
+
 ## Known limitations
 
 - **Early-season small samples.** With 1-2 games played, `consistency_score`
@@ -765,3 +941,21 @@ Team Trends has its own dedicated test files too:
   such labels) - see `RECENT_FORM_HEATING_UP_PCT`/`RECENT_FORM_COOLING_OFF_PCT`/
   `WOW_INCREASING_YARDS`/`WOW_DECREASING_YARDS` in `dfs_data_pipeline.py` if
   you want to tune them.
+- **Defense vs Position is also a research/trend-signal report, not a
+  composite score.** It doesn't build the full "Matchup Analyzer Expanded"
+  report from the old Power BI workbook - explicitly out of scope for this
+  pass. `dvp_trend_label`'s thresholds
+  (`DEFENSE_TREND_MORE_FAVORABLE_PCT`/`DEFENSE_TREND_TOUGHER_PCT` in
+  `dfs_data_pipeline.py`) are the same kind of documented design choice as
+  Team Trends' thresholds above, independently tunable.
+- **No true defensive pressure rate.** `defensive_pressure_events_per_game`
+  is an honest events-per-game count (see "Defensive pressure - a corrected
+  label, not a rate" above), not a per-play/per-dropback rate - the current
+  nflreadpy team-stats source has no reliable opponent-dropbacks denominator
+  to compute one against. If that becomes available, a true rate could be
+  added as a separate, explicitly-denominated field without touching this one.
+- **`defense_matchups.parquet` (pre-existing before this pass) has been
+  fully replaced by `defense_reporting.parquet`** and is no longer produced
+  by the pipeline - `build_defense_matchups` no longer exists. If you have a
+  stale local copy of the old file from before this change, it's safe to
+  delete; nothing in the app reads it anymore.

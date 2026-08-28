@@ -7,12 +7,15 @@ kinds of output to /data:
   - "raw" tables (players_weekly.parquet, team_stats.parquet): one row per
     player/team per COMPLETED week, straight from the source with minimal
     shaping.
-  - "derived" tables (players_current.parquet, defense_matchups.parquet,
-    team_summary.parquet, team_reporting.parquet): season-to-date aggregates
-    and analytics computed from the raw tables (rolling form, momentum,
-    matchup quality, team offensive trends, etc). team_reporting.parquet is
-    the team-level reporting mart behind the Team Trends page - see
-    `build_team_reporting`.
+  - "derived" tables (players_current.parquet, defense_reporting.parquet,
+    defense_position_weekly.parquet, team_summary.parquet,
+    team_reporting.parquet): season-to-date aggregates and analytics
+    computed from the raw tables (rolling form, momentum, defense-vs-
+    position matchup quality, team offensive trends, etc). team_reporting.parquet
+    is the team-level reporting mart behind the Team Trends page - see
+    `build_team_reporting`. defense_reporting.parquet is the defense-vs-
+    position mart behind the Defense vs Position page (and the Lineup
+    Helper's matchup_delta) - see `build_defense_reporting`.
 
 The pipeline is a pure function of nflreadpy's source data: every run
 recomputes all outputs from scratch and overwrites the Parquet files, so
@@ -27,11 +30,14 @@ complete.
 If the active season (as the calendar says "now") has no completed week yet
 - before Week 1, or Week 1 itself still in progress - the pipeline switches
 to `app_mode = "preseason_week_1_baseline"`: `players_weekly`/
-`players_current`/`defense_matchups`/`team_summary` are written empty (there
-is no current-season data), and `players_prior_season_baseline.parquet` is
+`players_current`/`team_summary` are written empty (there is no
+current-season data), and `players_prior_season_baseline.parquet` is
 populated instead, from the immediately preceding (fully-completed) season.
 This is a clearly-labeled, separate output - never silently blended into
-current-season numbers. See `determine_app_mode`.
+current-season numbers. See `determine_app_mode`. `team_reporting.parquet`
+and `defense_reporting.parquet` follow their own, analogous
+`reporting_mode` ("in_season" / "preseason_baseline") rather than sharing
+`app_mode` - see `build_team_reporting` / `build_defense_reporting`.
 """
 
 import json
@@ -74,11 +80,14 @@ PLAYER_STAT_COLUMNS = [
 # present in the real nflreadpy source before use - see build_team_reporting,
 # which uses sacks_suffered as part of an honest "dropbacks" denominator
 # rather than averaging passing_epa across weeks (see its docstring for why
-# that old approach was wrong).
+# that old approach was wrong). def_qb_hits was also confirmed present -
+# used alongside def_sacks in build_team_summary's
+# defensive_pressure_events_per_game (an events-per-game COUNT, deliberately
+# never called a "rate" - see that function's docstring for why).
 TEAM_STAT_COLUMNS = [
     "season", "week", "team", "season_type", "opponent_team",
     "attempts", "passing_yards", "carries", "rushing_yards", "passing_epa", "sacks_suffered",
-    "def_sacks", "def_interceptions", "def_fumbles_forced",
+    "def_sacks", "def_qb_hits", "def_interceptions", "def_fumbles_forced",
 ]
 
 FANTASY_COLUMNS_TO_ZERO_FILL = [
@@ -113,14 +122,10 @@ PRIOR_SEASON_BASELINE_EMPTY_COLUMNS = [
     "yards_per_touch", "points_per_touch", "consistency_score",
 ]
 
-DEFENSE_MATCHUPS_EMPTY_COLUMNS = [
-    "defense_team", "position", "fantasy_points_allowed", "games",
-    "position_league_average", "matchup_delta", "matchup_rating_percentile", "matchup_rank",
-]
-
 TEAM_SUMMARY_EMPTY_COLUMNS = [
     "team", "games_played", "pass_yards_per_game", "rush_yards_per_game",
     "pass_rate_pct", "sacks_per_game", "turnovers_forced_per_game",
+    "defensive_pressure_events_per_game",
 ]
 
 # --- Team reporting mart (build_team_reporting) -----------------------------
@@ -166,6 +171,39 @@ TEAM_REPORTING_COLUMNS = [
     "latest_game_passing_yards", "latest_game_rushing_yards", "latest_game_total_yards",
     "wow_passing_yards_change", "wow_rushing_yards_change", "wow_total_yards_change",
     "wow_pass_rate_change", "wow_change_label",
+]
+
+# --- Defense-vs-position reporting (build_defense_reporting) ---------------
+DEFENSE_POSITION_WEEKLY_COLUMNS = ["season", "defense_team", "position", "week", "fantasy_points_allowed"]
+
+# "Last N played weeks" for recent DvP - same convention as
+# TEAM_RECENT_FORM_GAMES, kept as its own constant since offense and defense
+# recency windows may need independent tuning later even though both
+# currently default to 3.
+DEFENSE_RECENT_FORM_GAMES = 3
+
+# dvp_recent_trend_delta thresholds for dvp_trend_label - the last-N-weeks
+# points-allowed-to-position vs the season DvP average, as a fraction of the
+# season average. A documented design choice (the old Power BI report had no
+# such labels), mirroring RECENT_FORM_HEATING_UP_PCT/COOLING_OFF_PCT's
+# pattern but independently tunable. Higher points allowed = more favorable
+# for the offense, so a POSITIVE trend here means the matchup is IMPROVING
+# for offensive DFS players, not that the defense is playing better.
+DEFENSE_TREND_MORE_FAVORABLE_PCT = 0.07
+DEFENSE_TREND_TOUGHER_PCT = -0.07
+
+DEFENSE_REPORTING_COLUMNS = [
+    # Identity / context
+    "season", "defense_team", "position", "games_in_sample", "latest_completed_week",
+    "source_last_updated_utc", "reporting_mode", "sample_size_label",
+    # Season DvP (every completed player-row averaged directly - see docstring)
+    "fantasy_points_allowed_per_game", "league_avg_points_allowed_for_position",
+    "matchup_index", "matchup_delta",
+    "position_rank_most_favorable", "position_percentile_most_favorable",
+    # Recent DvP (last DEFENSE_RECENT_FORM_GAMES played weeks, from build_defense_position_weekly)
+    "last_3_games_count", "last_3_games_points_allowed_per_game",
+    "last_3_games_matchup_index", "last_3_games_matchup_delta",
+    "dvp_recent_trend_delta", "dvp_trend_label",
 ]
 
 
@@ -549,39 +587,194 @@ def build_prior_season_baseline(weekly_df):
     return base.sort_values("avg_fantasy_points", ascending=False, na_position="last").reset_index(drop=True)
 
 
-def build_defense_matchups(weekly_df):
+def build_defense_position_weekly(weekly_df, season):
     """
-    Average fantasy points allowed by each defense to each position, from
-    completed-week player games only. `matchup_rating_percentile` is ranked
-    separately within each position (0-100, higher is always a better
-    matchup for the offensive player) so QB/RB/WR/TE - which score on very
-    different scales - are never compared on one shared scale.
+    One row per (season, defense_team, position, week) - mean fantasy points
+    (PPR) allowed by that defense to that position that week, from completed
+    player-games only. "Defense" always means the offensive player's
+    `opponent_team`.
+
+    When multiple players of the same position faced a defense in the same
+    week (e.g. two starting WRs), this averages them into one week-level
+    value, so both `build_defense_reporting`'s recent-DvP fields and the
+    Defense vs Position page's weekly trend chart treat every week equally -
+    "games" means weeks played, not individual player performances. A bye
+    week is simply an absent row here, never a zero.
+
+    This is the shared building block behind the recent-DvP window below;
+    the SEASON-long DvP numbers in `build_defense_reporting` deliberately do
+    NOT go through this table - they average every player-row directly,
+    exactly preserving the original Power BI DAX's
+    `AVERAGE(PlayerStats[fantasy_points_ppr])` semantics (see that
+    function's docstring).
     """
     if weekly_df.empty:
-        return pd.DataFrame(columns=DEFENSE_MATCHUPS_EMPTY_COLUMNS)
+        return pd.DataFrame(columns=DEFENSE_POSITION_WEEKLY_COLUMNS)
 
     grouped = (
+        weekly_df.groupby(["opponent_team", "position", "week"])["fantasy_points_ppr"]
+        .mean()
+        .reset_index()
+        .rename(columns={"opponent_team": "defense_team", "fantasy_points_ppr": "fantasy_points_allowed"})
+    )
+    grouped["season"] = season
+    return grouped[DEFENSE_POSITION_WEEKLY_COLUMNS].sort_values(
+        ["position", "defense_team", "week"]
+    ).reset_index(drop=True)
+
+
+def _defense_recent_form(g, season_points_allowed, league_avg_for_position):
+    """
+    One (defense_team, position)'s recent-DvP fields from its own
+    `defense_position_weekly` rows (already sorted by week). "Last N" always
+    means the defense's last `DEFENSE_RECENT_FORM_GAMES` PLAYED weeks against
+    that position - bye weeks are simply absent rows, skipped naturally.
+
+    `last_3_games_*` values are computed from whatever's available (even a
+    single game) - "use available completed games" per the product spec.
+    `dvp_recent_trend_delta` (last-3 vs season) requires at least 2 games,
+    matching this app's established "don't fabricate a trend from 1 data
+    point" rule (see build_team_reporting's WoW fields). `dvp_trend_label`
+    is held to the stricter, full DEFENSE_RECENT_FORM_GAMES-game bar before
+    it will name a real direction - a low-sample trend is never labeled with
+    the same confidence as a mature one, even if the raw number already
+    exists at 2 games.
+    """
+    g = g.sort_values("week")
+    recent = g.tail(DEFENSE_RECENT_FORM_GAMES)
+    n = len(recent)
+
+    if n:
+        last_3_points_allowed = float(recent["fantasy_points_allowed"].mean())
+        last_3_matchup_index = safe_divide(last_3_points_allowed, league_avg_for_position) * 100
+        last_3_matchup_delta = last_3_points_allowed - league_avg_for_position if pd.notna(league_avg_for_position) else None
+    else:
+        last_3_points_allowed = last_3_matchup_index = last_3_matchup_delta = None
+
+    if n >= 2 and pd.notna(season_points_allowed):
+        trend_delta = last_3_points_allowed - season_points_allowed
+    else:
+        trend_delta = None
+
+    if n < DEFENSE_RECENT_FORM_GAMES or trend_delta is None:
+        trend_label = "insufficient_sample"
+    else:
+        trend_pct = safe_divide(trend_delta, season_points_allowed)
+        if pd.isna(trend_pct):
+            trend_label = "insufficient_sample"
+        elif trend_pct >= DEFENSE_TREND_MORE_FAVORABLE_PCT:
+            trend_label = "becoming_more_favorable"
+        elif trend_pct <= DEFENSE_TREND_TOUGHER_PCT:
+            trend_label = "becoming_tougher"
+        else:
+            trend_label = "stable"
+
+    return pd.Series({
+        "last_3_games_count": n,
+        "last_3_games_points_allowed_per_game": last_3_points_allowed,
+        "last_3_games_matchup_index": last_3_matchup_index,
+        "last_3_games_matchup_delta": last_3_matchup_delta,
+        "dvp_recent_trend_delta": trend_delta,
+        "dvp_trend_label": trend_label,
+    })
+
+
+def build_defense_reporting(weekly_df, season, reporting_mode, now=None):
+    """
+    Defense-vs-position report - one row per (season, defense_team,
+    position) - recreating the old Power BI "Opponent Defense Rank vs
+    Position" / "Fantasy Points Allowed to Position" measures as
+    transparent, testable metrics. "Defense" always means the offensive
+    player's `opponent_team`; every metric is computed INDEPENDENTLY within
+    each position (QB/RB/WR/TE never share a league average, color range, or
+    rank - see the position-scoped groupbys below), and higher
+    fantasy-points-allowed / matchup_index / matchup_delta / percentile
+    always means a MORE FAVORABLE matchup for the offensive DFS player.
+
+    Season DvP averages every completed player-row directly (not through
+    `build_defense_position_weekly`), exactly preserving the old DAX's
+    `AVERAGE(PlayerStats[fantasy_points_ppr])` - a week where a defense
+    faced 2 WRs contributes 2 rows to that average, matching the original
+    Power BI report's own behavior ("games_in_sample" is a raw row count for
+    the same reason). Recent DvP (last `DEFENSE_RECENT_FORM_GAMES` played
+    weeks), by contrast, is computed from `build_defense_position_weekly`
+    (one row per week) so every week counts equally there - see
+    `_defense_recent_form`.
+
+    `reporting_mode` is "in_season" or "preseason_baseline" (last season's
+    full completed season used as a Week 1 stand-in - see
+    `build_team_reporting`'s identical convention). In preseason_baseline
+    mode, season DvP fields stay populated (a completed season's DvP is
+    still useful research context) but every recent-DvP field is nulled and
+    `dvp_trend_label` reads "not_applicable_preseason" - last season's
+    Week 18 defensive form is never presented as this season's trend.
+    """
+    if weekly_df.empty:
+        return pd.DataFrame(columns=DEFENSE_REPORTING_COLUMNS)
+
+    season_grp = (
         weekly_df.groupby(["opponent_team", "position"])["fantasy_points_ppr"]
-        .agg(fantasy_points_allowed="mean", games="count")
+        .agg(fantasy_points_allowed_per_game="mean", games_in_sample="count")
         .reset_index()
         .rename(columns={"opponent_team": "defense_team"})
     )
 
-    position_avg = (
-        weekly_df.groupby("position")["fantasy_points_ppr"].mean().rename("position_league_average")
+    league_avg = (
+        weekly_df.groupby("position")["fantasy_points_ppr"].mean().rename("league_avg_points_allowed_for_position")
     )
-    grouped = grouped.merge(position_avg, on="position", how="left")
-    grouped["matchup_delta"] = grouped["fantasy_points_allowed"] - grouped["position_league_average"]
+    season_grp = season_grp.merge(league_avg, on="position", how="left")
 
-    # Higher raw points-allowed -> higher percentile -> better matchup for the offense.
-    grouped["matchup_rating_percentile"] = (
-        grouped.groupby("position")["fantasy_points_allowed"].rank(pct=True, ascending=True) * 100
+    season_grp["matchup_index"] = safe_divide(
+        season_grp["fantasy_points_allowed_per_game"], season_grp["league_avg_points_allowed_for_position"]
+    ) * 100
+    season_grp["matchup_delta"] = (
+        season_grp["fantasy_points_allowed_per_game"] - season_grp["league_avg_points_allowed_for_position"]
     )
-    grouped["matchup_rank"] = grouped.groupby("position")["fantasy_points_allowed"].rank(
-        ascending=False, method="min"
+    # Dense rank within position, descending by points allowed - 1 = most
+    # favorable matchup for the offense (allows the most to this position).
+    season_grp["position_rank_most_favorable"] = season_grp.groupby("position")[
+        "fantasy_points_allowed_per_game"
+    ].rank(method="dense", ascending=False)
+    # Percentile within position - higher points allowed -> higher
+    # percentile -> more favorable, same direction as the rank above.
+    season_grp["position_percentile_most_favorable"] = (
+        season_grp.groupby("position")["fantasy_points_allowed_per_game"].rank(pct=True, ascending=True) * 100
     )
 
-    return grouped.sort_values(["position", "matchup_rank"]).reset_index(drop=True)
+    weekly = build_defense_position_weekly(weekly_df, season)
+    league_avg_lookup = league_avg.to_dict()
+    season_points_lookup = season_grp.set_index(["defense_team", "position"])["fantasy_points_allowed_per_game"]
+
+    def _recent_for_group(g):
+        defense_team, position = g.name  # always a (defense_team, position) tuple - grouped on both
+        return _defense_recent_form(
+            g, season_points_lookup.get((defense_team, position), float("nan")),
+            league_avg_lookup.get(position, float("nan")),
+        )
+
+    recent = weekly.groupby(["defense_team", "position"], group_keys=True).apply(_recent_for_group, include_groups=False)
+    recent = recent.reset_index()
+
+    merged = season_grp.merge(recent, on=["defense_team", "position"], how="left")
+    merged["season"] = season
+    merged["reporting_mode"] = reporting_mode
+    merged["latest_completed_week"] = int(weekly_df["week"].max())
+    merged["source_last_updated_utc"] = (now or datetime.now(timezone.utc)).isoformat()
+    merged["sample_size_label"] = merged["games_in_sample"].apply(_sample_size_label)
+
+    if reporting_mode == "preseason_baseline":
+        recency_numeric_cols = [
+            "last_3_games_count", "last_3_games_points_allowed_per_game",
+            "last_3_games_matchup_index", "last_3_games_matchup_delta", "dvp_recent_trend_delta",
+        ]
+        merged[recency_numeric_cols] = float("nan")
+        merged["dvp_trend_label"] = "not_applicable_preseason"
+
+    result = merged[DEFENSE_REPORTING_COLUMNS].sort_values(["position", "defense_team"]).reset_index(drop=True)
+    assert not result.duplicated(subset=["defense_team", "position"]).any(), (
+        "duplicate defense-position rows in defense_reporting - this should be unreachable"
+    )
+    return result
 
 
 def build_team_summary(raw_team_df, season, latest_completed_week):
@@ -593,8 +786,16 @@ def build_team_summary(raw_team_df, season, latest_completed_week):
 
     This table is informational context only and is never read by the DK
     Lineup Helper's projection formula - matchup quality there comes
-    exclusively from `defense_matchups` (fantasy points a defense allows to
-    a position), computed in `build_defense_matchups` below.
+    exclusively from `defense_reporting` (fantasy points a defense allows to
+    a position), computed in `build_defense_reporting` below.
+
+    `defensive_pressure_events_per_game` = (def_sacks + def_qb_hits) /
+    games_played - a deliberately renamed correction of the old Power BI
+    measure, which labeled this exact calculation a "rate" even though its
+    denominator was games, not plays/dropbacks. It's an EVENTS-PER-GAME
+    count, never called a rate here. A true pressure RATE would need a
+    reliable opponent-dropbacks denominator, which isn't in the current
+    source data, so it's intentionally not computed - see the README.
 
     Intentionally does NOT include a points-allowed field: nflreadpy's
     team_stats has no scoring column, and fabricating one from other fields
@@ -613,7 +814,9 @@ def build_team_summary(raw_team_df, season, latest_completed_week):
 
     df = df.sort_values(["team", "week"]).drop_duplicates(subset=["team", "week"], keep="last")
 
-    agg = df.groupby("team").agg(
+    has_qb_hits = "def_qb_hits" in df.columns
+
+    agg_spec = dict(
         games_played=("week", "count"),
         sum_passing_yards=("passing_yards", "sum"),
         sum_rushing_yards=("rushing_yards", "sum"),
@@ -622,7 +825,10 @@ def build_team_summary(raw_team_df, season, latest_completed_week):
         sum_def_sacks=("def_sacks", "sum"),
         sum_def_interceptions=("def_interceptions", "sum"),
         sum_def_fumbles_forced=("def_fumbles_forced", "sum"),
-    ).reset_index()
+    )
+    if has_qb_hits:
+        agg_spec["sum_def_qb_hits"] = ("def_qb_hits", "sum")
+    agg = df.groupby("team").agg(**agg_spec).reset_index()
 
     agg["pass_yards_per_game"] = safe_divide(agg["sum_passing_yards"], agg["games_played"])
     agg["rush_yards_per_game"] = safe_divide(agg["sum_rushing_yards"], agg["games_played"])
@@ -630,6 +836,10 @@ def build_team_summary(raw_team_df, season, latest_completed_week):
     agg["sacks_per_game"] = safe_divide(agg["sum_def_sacks"], agg["games_played"])
     agg["turnovers_forced_per_game"] = safe_divide(
         agg["sum_def_interceptions"] + agg["sum_def_fumbles_forced"], agg["games_played"]
+    )
+    agg["defensive_pressure_events_per_game"] = (
+        safe_divide(agg["sum_def_sacks"] + agg["sum_def_qb_hits"], agg["games_played"])
+        if has_qb_hits else pd.Series(float("nan"), index=agg.index)
     )
 
     return agg[[c for c in TEAM_SUMMARY_EMPTY_COLUMNS if c in agg.columns]]
@@ -982,7 +1192,8 @@ def run_pipeline():
     if app_mode == "in_season":
         weekly_df = build_players_weekly(active_player_df, active_season, latest_completed_week)
         current_df = build_players_current(weekly_df)
-        defense_matchups_df = build_defense_matchups(weekly_df)
+        defense_reporting_df = build_defense_reporting(weekly_df, active_season, "in_season")
+        defense_position_weekly_df = build_defense_position_weekly(weekly_df, active_season)
         raw_team_df = load_raw_team_stats(active_season)
         team_summary_df = build_team_summary(raw_team_df, active_season, latest_completed_week)
         team_reporting_df = build_team_reporting(raw_team_df, active_season, latest_completed_week, "in_season")
@@ -991,7 +1202,6 @@ def run_pipeline():
         print(f"No completed week for {active_season} yet - building {source_season} baseline for Week 1")
         weekly_df = pd.DataFrame(columns=PLAYER_STAT_COLUMNS + ["touches"])
         current_df = pd.DataFrame(columns=PLAYERS_CURRENT_EMPTY_COLUMNS)
-        defense_matchups_df = pd.DataFrame(columns=DEFENSE_MATCHUPS_EMPTY_COLUMNS)
         team_summary_df = pd.DataFrame(columns=TEAM_SUMMARY_EMPTY_COLUMNS)
         raw_team_df = pd.DataFrame()
 
@@ -1008,6 +1218,13 @@ def run_pipeline():
         prior_max_week = int(prior_reg["week"].max())
         prior_weekly_df = build_players_weekly(prior_player_df, source_season, prior_max_week)
         baseline_df = build_prior_season_baseline(prior_weekly_df)
+
+        # defense_reporting reuses this same prior-season weekly frame - it's
+        # already player-stat grain (position/opponent_team/fantasy points),
+        # exactly what defense DvP needs, so no separate fetch like
+        # team_reporting's (team-level stats aren't in player-week data).
+        defense_reporting_df = build_defense_reporting(prior_weekly_df, source_season, "preseason_baseline")
+        defense_position_weekly_df = build_defense_position_weekly(prior_weekly_df, source_season)
 
         # team_reporting gets its own prior-season fetch (never merged into
         # team_stats.parquet, same separation as players_weekly vs
@@ -1029,19 +1246,25 @@ def run_pipeline():
 
     weekly_df.to_parquet(os.path.join(DATA_DIR, "players_weekly.parquet"), index=False)
     current_df.to_parquet(os.path.join(DATA_DIR, "players_current.parquet"), index=False)
-    defense_matchups_df.to_parquet(os.path.join(DATA_DIR, "defense_matchups.parquet"), index=False)
     team_summary_df.to_parquet(os.path.join(DATA_DIR, "team_summary.parquet"), index=False)
     baseline_df.to_parquet(os.path.join(DATA_DIR, "players_prior_season_baseline.parquet"), index=False)
     # Always written fresh, like player_role_context.parquet - a pure
-    # recomputation from whichever raw team stats are currently in hand
-    # (current-season or prior-season baseline), never itself a "last known
-    # good source" that needs write-with-fallback protection.
+    # recomputation from whichever raw team stats/weekly player rows are
+    # currently in hand (current-season or prior-season baseline), never
+    # itself a "last known good source" that needs write-with-fallback
+    # protection.
     team_reporting_df.to_parquet(os.path.join(DATA_DIR, "team_reporting.parquet"), index=False)
+    defense_reporting_df.to_parquet(os.path.join(DATA_DIR, "defense_reporting.parquet"), index=False)
+    defense_position_weekly_df.to_parquet(os.path.join(DATA_DIR, "defense_position_weekly.parquet"), index=False)
     if not raw_team_df.empty:
         raw_team_df.to_parquet(os.path.join(DATA_DIR, "team_stats.parquet"), index=False)
 
     team_reporting_mode = (
         "no_current_season_data" if team_reporting_df.empty
+        else ("in_season" if app_mode == "in_season" else "preseason_baseline")
+    )
+    defense_reporting_mode = (
+        "no_current_season_data" if defense_reporting_df.empty
         else ("in_season" if app_mode == "in_season" else "preseason_baseline")
     )
 
@@ -1063,6 +1286,11 @@ def run_pipeline():
         "team_reporting_season": (
             int(team_reporting_df["season"].iloc[0]) if not team_reporting_df.empty else None
         ),
+        "defense_reporting_mode": defense_reporting_mode,
+        "defense_reporting_rows": int(len(defense_reporting_df)),
+        "defense_reporting_season": (
+            int(defense_reporting_df["season"].iloc[0]) if not defense_reporting_df.empty else None
+        ),
     }
     with open(os.path.join(DATA_DIR, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
@@ -1073,11 +1301,12 @@ def run_pipeline():
     print("\nRecord counts:")
     print(f"  players_weekly.parquet:              {len(weekly_df):>6} rows")
     print(f"  players_current.parquet:             {len(current_df):>6} rows")
-    print(f"  defense_matchups.parquet:            {len(defense_matchups_df):>6} rows")
     print(f"  team_summary.parquet:                {len(team_summary_df):>6} rows")
     print(f"  team_stats.parquet (raw):            {len(raw_team_df):>6} rows")
     print(f"  players_prior_season_baseline.parquet: {len(baseline_df):>4} rows")
     print(f"  team_reporting.parquet ({team_reporting_mode}): {len(team_reporting_df):>4} rows")
+    print(f"  defense_reporting.parquet ({defense_reporting_mode}): {len(defense_reporting_df):>4} rows")
+    print(f"  defense_position_weekly.parquet:     {len(defense_position_weekly_df):>6} rows")
 
     print("\nRefreshing role/eligibility context (depth chart + ESPN injuries)...")
     role_week = next_slate_week if next_slate_week is not None else (latest_completed_week or 1)

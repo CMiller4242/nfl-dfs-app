@@ -7,7 +7,7 @@ import streamlit as st
 from lib.data import (
     POSITIONS,
     data_freshness_caption,
-    load_defense_matchups,
+    load_defense_reporting,
     load_depth_chart_metadata,
     load_dk_slate_metadata,
     load_injury_metadata,
@@ -190,7 +190,7 @@ def process_dk_csv(file_bytes: bytes, mode: str) -> pd.DataFrame:
         return compute_prior_season_projections(matched)
 
     current = load_players_current()
-    defense = load_defense_matchups()
+    defense = load_defense_reporting()
     matched = match_dk_players(dk_df, current)
     return compute_projections(matched, defense)
 
@@ -442,11 +442,14 @@ if is_preseason:
     value_col_label = "Baseline Projected Points"
 else:
     base_cols = ["Name", "Position", "TeamAbbrev", "opponent", "Salary", "player_avg", "momentum_score",
-                 "matchup_delta", "projected_points", "projected_value", "matchup_quality", "data_basis",
-                 "match_method", "match_score"]
+                 "matchup_delta", "fantasy_points_allowed_per_game", "matchup_index",
+                 "position_percentile_most_favorable", "projected_points", "projected_value",
+                 "matchup_quality", "data_basis", "match_method", "match_score"]
     base_rename = {
         "TeamAbbrev": "Team", "opponent": "Opponent", "player_avg": "Season Avg", "momentum_score": "Momentum",
-        "matchup_delta": "Matchup Delta", "projected_points": "Projected Points", "projected_value": "Projected Value",
+        "matchup_delta": "Matchup Delta", "fantasy_points_allowed_per_game": "Opp Pts Allowed to Pos",
+        "matchup_index": "Matchup Index", "position_percentile_most_favorable": "Matchup Percentile",
+        "projected_points": "Projected Points", "projected_value": "Projected Value",
         "match_method": "Match Method", "match_score": "Match Score", "matchup_quality": "Matchup Quality",
         "data_basis": "Projection Basis",
     }
