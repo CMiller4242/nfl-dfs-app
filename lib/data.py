@@ -68,6 +68,16 @@ def load_team_summary() -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def load_team_reporting() -> pd.DataFrame:
+    """Team offensive trends/reporting mart (pages/4_Team_Trends.py) - see
+    dfs_data_pipeline.build_team_reporting for the full field definitions."""
+    path = os.path.join(DATA_DIR, "team_reporting.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data(show_spinner=False)
 def load_players_prior_season_baseline() -> pd.DataFrame:
     path = os.path.join(DATA_DIR, "players_prior_season_baseline.parquet")
     if not os.path.exists(path):
