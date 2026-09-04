@@ -1,12 +1,19 @@
 {
-  "retrieved_at": "2026-08-30T20:04:54.451018+00:00",
-  "source_success": true,
+  "retrieved_at": "2026-09-04T22:57:39.806415+00:00",
+  "source_success": false,
   "teams_attempted": 32,
-  "teams_succeeded": 32,
-  "teams_failed": [],
-  "failed_team_abbrevs": [],
+  "teams_succeeded": 31,
+  "teams_failed": [
+    {
+      "team_abbrev": "ARI",
+      "error": "HTTP 404"
+    }
+  ],
+  "failed_team_abbrevs": [
+    "ARI"
+  ],
   "skipped_player_rows": 0,
-  "player_rows": 2916,
+  "player_rows": 2413,
   "season": 2026,
   "week": 1,
   "written_fresh": true
