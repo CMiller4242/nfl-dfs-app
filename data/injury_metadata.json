@@ -1,5 +1,5 @@
 {
-  "retrieved_at": "2026-09-04T22:57:39.806415+00:00",
+  "retrieved_at": "2026-09-06T16:08:35.021769+00:00",
   "source_success": false,
   "teams_attempted": 32,
   "teams_succeeded": 31,
@@ -13,7 +13,7 @@
     "ARI"
   ],
   "skipped_player_rows": 0,
-  "player_rows": 2413,
+  "player_rows": 2411,
   "season": 2026,
   "week": 1,
   "written_fresh": true
