@@ -556,6 +556,116 @@ whether that player is actually startable this week (see the role/eligibility
 engine below), or DK pricing/value. Use it to build research context, not as
 a standalone lineup decision.
 
+## Position Explorer (`data/players_current.parquet`, `pages/1_Position_Explorer.py`)
+
+RB, WR, and TE reporting shows workload/opportunity **before** efficiency -
+raw carries/targets/receptions/yardage sit alongside the rate stats
+(YPC, catch rate, yards/target, etc.) that only make sense once you can see
+the volume behind them. All of this is computed once in the pipeline
+(`dfs_data_pipeline._season_aggregates` / `_player_recent_form`) and only
+filtered/sorted/formatted in the page (`lib/position_explorer.py`, a non-UI
+module so none of it re-runs an aggregation on a widget click). QB reporting
+and the underlying DFS eligibility/role engine, injury/depth-chart logic, DK
+salary loading, Team Trends, Defense vs Position, and player projection
+logic are all unchanged by this - this is additive player-aggregate
+reporting only.
+
+### Source fields (real nflreadpy columns - nothing invented)
+
+Every metric below comes from `nfl.load_player_stats()`'s real columns:
+`carries`, `targets`, `receptions`, `rushing_yards`, `receiving_yards`,
+`receiving_air_yards`, `receiving_yards_after_catch`, `target_share`,
+`air_yards_share`, and `fantasy_points_ppr`. `receiving_air_yards` was
+confirmed present in the live source before use (not assumed) - it can be
+legitimately **negative** for a player whose targets are mostly short
+checkdowns/screens behind the line of scrimmage, which is why it (and
+`air_yards_share_pct`) are never clamped to zero.
+
+### Definitions
+
+All aggregates use completed regular-season games only
+(`season_type == "REG"`, `week <= latest_completed_week`); a bye week is
+simply an absent row, never a zero-filled one.
+
+- **Totals**: `total_carries`, `total_targets`, `total_receptions`,
+  `total_touches` (= carries + targets), `total_rushing_yards`,
+  `total_receiving_yards`, `total_yards` (= rushing + receiving),
+  `total_receiving_air_yards`, `total_yac`, `total_fantasy_points`.
+- **Per-game rates**: every total above also has a `..._per_game` sibling
+  (`carries_per_game`, `targets_per_game`, `receptions_per_game`,
+  `touches_per_game`, `rushing_yards_per_game`, `receiving_yards_per_game`,
+  `total_yards_per_game`, `receiving_air_yards_per_game`) = total /
+  `games_played`. Both the raw total and the per-game rate are always kept -
+  neither replaces the other.
+- **Efficiency** (unchanged from before this pass): `yards_per_carry`,
+  `yards_per_target`, `catch_rate`, `yac_per_reception`, `yards_per_touch`,
+  `points_per_touch`, `target_share_pct`, `air_yards_share_pct` (source
+  `target_share`/`air_yards_share`, averaged across weeks and ×100, same
+  convention as before).
+- **Latest-game context**: `latest_game_fantasy_points`,
+  `latest_game_carries`, `latest_game_targets`, `latest_game_receptions`,
+  `latest_game_rushing_yards`, `latest_game_receiving_yards`,
+  `latest_game_total_yards`, `latest_game_target_share_pct`,
+  `latest_game_air_yards_share_pct` - the single most recent **played**
+  game's raw stat line, not an average.
+- **Week-over-week (WoW) deltas**: `carries_wow_change`,
+  `targets_wow_change`, `receiving_yards_wow_change`,
+  `target_share_wow_change` (percentage points), alongside the existing
+  `touches_wow_change` - latest played game minus the one before it, across
+  any bye. **Null**, never zero, with only one played game.
+- Every division above uses the project's `safe_divide` - a zero/missing
+  denominator is always null, never `inf` or a misleading `0`.
+
+### Exact visible columns per position
+
+QB is unchanged by this pass. RB and WR/TE each show a fixed, exact column
+set/order (identity/role → fantasy output → volume → yardage →
+efficiency/opportunity → trend), defined in `lib/position_explorer.py`'s
+`RB_COLUMNS` / `WR_TE_COLUMNS`:
+
+- **RB**: Player, Team, Last Opponent, Games Played, Season FPPG, Last Game
+  FPPG, Momentum, Carries, Carries/Game, Targets, Receptions, Touches,
+  Touches/Game, Rushing Yards, Receiving Yards, Total Yards, Total
+  Yards/Game, YPC, Yards/Target, Catch Rate, Yards/Touch, Points/Touch,
+  Target Share %, WoW Carries, WoW Targets, WoW Touches, Trend.
+- **WR/TE**: Player, Team, Last Opponent, Games Played, Season FPPG, Last
+  Game FPPG, Momentum, Targets, Targets/Game, Receptions, Receptions/Game,
+  Receiving Yards, Receiving Yards/Game, Air Yards, Air Yards/Game, Target
+  Share %, Air Yards Share %, Catch Rate, Yards/Target, YAC/Reception,
+  Points/Touch, WoW Targets, WoW Receiving Yards, WoW Target Share, Trend.
+
+Raw internal field names (`avg_fantasy_points`, `target_share_pct`, etc.)
+are never shown as column headers - only the human-readable labels above.
+The raw names stay available in the CSV export (see below) for audit.
+
+### Charts
+
+- **RB**: the season Touches-vs-Points-per-Touch scatter is preserved as-is,
+  with a richer hover (carries, targets, rushing/receiving/total yards,
+  season FPPG, touches/game). A new "Weekly Volume" chart shows a selected
+  player's carries/targets/touches by completed week.
+- **WR/TE**: the primary scatter is now Targets/Game (x) vs. Yards/Target
+  (y), bubble size = Receiving Yards/Game, color = Season FPPG, with a full
+  workload/efficiency hover. A new "Weekly Receiving Workload" chart shows a
+  selected player's targets/receptions by week (receiving yards as an
+  overlaid line). Where `air_yards_share_pct` data exists, a Target-Share-
+  vs-Air-Yards-Share scatter is also shown.
+
+### Sample-size handling
+
+The existing "Hide < 3 games played" control and low-sample caption are
+unchanged. New: at 1-2 games played, a dedicated warning calls out that any
+visible players at that sample size have Momentum/Trend reflecting an
+*early, small sample*, not established form (`lib.position_explorer.early_sample_warning`).
+
+### CSV export
+
+Every position's table has a "Download filtered table as CSV" button
+(`lib.position_explorer.build_csv_export`) - it exports exactly the rows
+currently visible (after the name filter / hide-low-sample control) with
+the **raw** field names (audit-friendly, directly cross-referenceable with
+`players_current.parquet`) plus the stable `player_id`.
+
 ## Player identity & the DK / nflreadpy / ESPN crosswalk
 
 DraftKings' salary CSV, nflreadpy's player stats, nflreadpy's depth charts,
@@ -920,6 +1030,26 @@ Defense vs Position has its own dedicated test files too:
 - `tests/test_pipeline.py` additions - `defensive_pressure_events_per_game`'s
   exact calculation and its graceful, honest nulling (never a fabricated 0)
   when `def_qb_hits` isn't present in the source.
+
+Position Explorer's workload/yardage enrichment has its own dedicated test
+coverage too:
+
+- `tests/test_pipeline.py` additions - `total_yards`/`total_yards_per_game`,
+  carries/targets/receptions totals and per-game rates, rushing/receiving/
+  air-yards totals and per-game rates, `total_receiving_air_yards` nulling
+  honestly (not zero) when `receiving_air_yards` isn't in the source frame,
+  latest-game context extraction, per-stat week-over-week deltas (carries/
+  targets/receiving yards/target share) and their null-not-zero behavior
+  with only one played game, and that `_player_recent_form` still works
+  against a minimal weekly frame missing the optional stat columns.
+- `tests/test_position_explorer.py` - the non-UI column-set/filter/export
+  module: the exact RB and WR/TE visible column sets (and proof neither
+  leaks the other's columns, nor raw internal field names), QB's column set
+  staying untouched, name/low-sample filtering, the early-sample warning
+  (present at ≤2 games, absent otherwise or on an empty table), CSV export
+  content (raw field names + stable `player_id`), the weekly chart data
+  helpers, and an `AppTest` smoke test of the page across all four
+  positions.
 
 ## Known limitations
 
