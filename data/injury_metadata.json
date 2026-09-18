@@ -1,12 +1,12 @@
 {
-  "retrieved_at": "2026-09-15T13:09:59.584563+00:00",
+  "retrieved_at": "2026-09-18T23:11:17.683324+00:00",
   "source_success": true,
   "teams_attempted": 32,
   "teams_succeeded": 32,
   "teams_failed": [],
   "failed_team_abbrevs": [],
   "skipped_player_rows": 0,
-  "player_rows": 2476,
+  "player_rows": 2485,
   "season": 2026,
   "week": 2,
   "written_fresh": true
