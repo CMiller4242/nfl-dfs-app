@@ -80,23 +80,61 @@ def _freshness_label(age_hours, limit_hours):
 
 
 depth_age = _age_hours(depth_meta.get("source_timestamp"))
-injury_age = _age_hours(injury_meta.get("retrieved_at"))
 depth_freshness = _freshness_label(depth_age, DEPTH_CHART_FRESHNESS_HOURS)
 injury_source_ok = bool(injury_meta.get("source_success"))
-injury_freshness = _freshness_label(injury_age, INJURY_FRESHNESS_HOURS) if injury_source_ok else "unavailable (last fetch failed)"
+
+# role_context_source distinguishes what player_role_context.parquet was
+# ACTUALLY built from (see dfs_data_pipeline._resolve_role_injury_snapshot)
+# from source_success, which only ever describes the latest fetch attempt -
+# a failed fetch with a good preserved snapshot must not show as
+# "unavailable" here, since role classifications are still fully usable.
+role_context_source = injury_meta.get("role_context_source")
+fallback_age = injury_meta.get("fallback_snapshot_age_hours")
+fallback_stale = injury_meta.get("fallback_snapshot_is_stale")
+
+if role_context_source == "fresh_fetch":
+    injury_age = _age_hours(injury_meta.get("retrieved_at"))
+    injury_freshness = _freshness_label(injury_age, INJURY_FRESHNESS_HOURS)
+elif role_context_source == "fallback_snapshot":
+    age_str = f"{fallback_age:.0f}h old" if fallback_age is not None else "age unknown"
+    injury_freshness = f"stale fallback ({age_str})" if fallback_stale else f"fresh (fallback, {age_str})"
+elif role_context_source == "unavailable":
+    injury_freshness = "unavailable (last fetch failed, no fallback)"
+else:
+    # A metadata file written before this fallback fix existed - fall back
+    # to the old (less precise) source_success-only reading rather than
+    # crashing on a missing field.
+    injury_age = _age_hours(injury_meta.get("retrieved_at"))
+    injury_freshness = _freshness_label(injury_age, INJURY_FRESHNESS_HOURS) if injury_source_ok else "unavailable (last fetch failed)"
 
 freshness_cols = st.columns(2)
 with freshness_cols[0]:
     st.metric("Depth chart data", depth_freshness, help=f"Source timestamp: {depth_meta.get('source_timestamp', 'unknown')}")
 with freshness_cols[1]:
-    st.metric("ESPN injury data", injury_freshness, help=f"Last fetch: {injury_meta.get('retrieved_at', 'unknown')}")
+    st.metric(
+        "ESPN injury data", injury_freshness,
+        help=(
+            f"Last fetch attempt: {injury_meta.get('retrieved_at', 'unknown')} (source_success={injury_source_ok}). "
+            + (f"Role context is using a preserved snapshot from {injury_meta.get('fallback_snapshot_retrieved_at')}."
+               if role_context_source == "fallback_snapshot" else "")
+        ),
+    )
 
-if depth_freshness != "fresh" or not injury_source_ok or (injury_source_ok and injury_freshness != "fresh"):
+depth_ok = depth_freshness == "fresh"
+injury_ok = role_context_source == "fresh_fetch" or (role_context_source == "fallback_snapshot" and not fallback_stale)
+
+if not depth_ok or not injury_ok:
     st.warning(
         "Role/eligibility data (depth chart and/or ESPN injuries) is stale or unavailable. This is "
         "never treated as real-time - a scheduled refresh is a best-effort snapshot, not a live feed. "
         "Players whose role depends on unresolvable data are automatically routed to Needs Review "
         "rather than guessed at. Check the GitHub Actions tab if this persists."
+    )
+elif role_context_source == "fallback_snapshot":
+    st.info(
+        "The latest ESPN injury fetch failed, but role/eligibility is using a still-fresh preserved "
+        "snapshot from the last successful fetch - the Player Pool below reflects real injury data, "
+        "not a guess."
     )
 
 st.divider()
