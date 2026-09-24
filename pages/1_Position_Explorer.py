@@ -2,6 +2,15 @@ import plotly.express as px
 import streamlit as st
 
 from lib.data import POSITION_COLORS, POSITIONS, data_freshness_caption, load_players_current, load_players_weekly
+from lib.position_explorer import (
+    LOW_SAMPLE_GAMES,
+    build_csv_export,
+    build_display_table,
+    early_sample_warning,
+    filter_table,
+    weekly_receiving_for_player,
+    weekly_volume_for_player,
+)
 
 st.set_page_config(page_title="Position Explorer | NFL DFS", page_icon="📊", layout="wide")
 
@@ -14,59 +23,6 @@ weekly = load_players_weekly()
 if current.empty:
     st.warning("No completed-week data found yet. Run `python dfs_data_pipeline.py` first.")
     st.stop()
-
-LOW_SAMPLE_GAMES = 3  # players with fewer played games than this are flagged, not hidden by default
-
-# Base columns shown for every position, plus position-specific efficiency columns.
-BASE_COLUMNS = {
-    "player_display_name": "Player",
-    "team": "Team",
-    "last_opponent": "Last Opp",
-    "games_played": "GP",
-    "avg_fantasy_points": "Season Avg",
-    "consistency_score": "Consistency",
-    "momentum_score": "Momentum",
-    "momentum_games_used": "Games Used",
-    "opportunity_trend": "Trend",
-}
-
-POSITION_COLUMNS = {
-    "QB": {
-        "completion_pct": "Comp %",
-        "passing_yards_per_attempt": "Yds/Att",
-        "total_passing_yards": "Pass Yds",
-        "total_passing_tds": "Pass TDs",
-        "total_rushing_yards": "Rush Yds",
-        "yards_per_carry": "Rush YPC",
-        "total_rushing_tds": "Rush TDs",
-    },
-    "RB": {
-        "total_carries": "Carries",
-        "yards_per_carry": "YPC",
-        "total_targets": "Targets",
-        "catch_rate": "Catch Rate",
-        "points_per_touch": "Pts/Touch",
-        "yards_per_touch": "Yds/Touch",
-    },
-    "WR": {
-        "total_targets": "Targets",
-        "target_share_pct": "Target Share %",
-        "catch_rate": "Catch Rate",
-        "yards_per_target": "Yds/Target",
-        "yac_per_reception": "YAC/Rec",
-        "air_yards_share_pct": "Air Yards Share %",
-        "points_per_touch": "Pts/Touch",
-    },
-    "TE": {
-        "total_targets": "Targets",
-        "target_share_pct": "Target Share %",
-        "catch_rate": "Catch Rate",
-        "yards_per_target": "Yds/Target",
-        "yac_per_reception": "YAC/Rec",
-        "air_yards_share_pct": "Air Yards Share %",
-        "points_per_touch": "Pts/Touch",
-    },
-}
 
 
 @st.cache_data(show_spinner=False)
@@ -85,9 +41,9 @@ pos_weekly = weekly[weekly["position"] == position]
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Efficiency table
+# Reporting table - workload/opportunity first, efficiency alongside it
 # ---------------------------------------------------------------------------
-st.subheader(f"{position} Efficiency Table")
+st.subheader(f"{position} Reporting Table")
 
 filter_col1, filter_col2 = st.columns([2, 1])
 with filter_col1:
@@ -95,20 +51,50 @@ with filter_col1:
 with filter_col2:
     hide_low_sample = st.checkbox(f"Hide < {LOW_SAMPLE_GAMES} games played", value=False)
 
-table = pos_current
-if name_filter:
-    table = table[table["player_display_name"].str.contains(name_filter, case=False, na=False)]
-if hide_low_sample:
-    table = table[table["games_played"] >= LOW_SAMPLE_GAMES]
-else:
+table = filter_table(pos_current, name_filter=name_filter, hide_low_sample=hide_low_sample)
+if not hide_low_sample:
     st.caption(f"Players with fewer than {LOW_SAMPLE_GAMES} games played are shown but should be read with caution (small sample).")
 
-columns_for_position = {**BASE_COLUMNS, **POSITION_COLUMNS.get(position, {})}
-available_cols = [c for c in columns_for_position if c in table.columns]
+sample_warning = early_sample_warning(table)
+if sample_warning:
+    st.warning(sample_warning)
+
+display_table = build_display_table(table, position)
+sort_col = "Momentum" if "Momentum" in display_table.columns else display_table.columns[0]
+
+# Percentages/rates get explicit formatting so they stay legible at a glance
+# instead of showing raw floats; counts/totals are left as plain numbers.
+PCT_COLUMNS = ["Target Share %", "Air Yards Share %", "Comp %", "Catch Rate"]
+RATE_COLUMNS = [
+    "Season FPPG", "Last Game FPPG", "Momentum", "Yds/Att", "Rush YPC",
+    "Carries/Game", "Touches/Game", "Total Yards/Game", "YPC", "Yards/Target",
+    "Yards/Touch", "Points/Touch", "Targets/Game", "Receptions/Game",
+    "Receiving Yards/Game", "Air Yards/Game", "YAC/Reception",
+]
+WOW_COLUMNS = ["WoW Carries", "WoW Targets", "WoW Touches", "WoW Receiving Yards", "WoW Target Share"]
+
+column_config = {}
+for col in display_table.columns:
+    if col in PCT_COLUMNS:
+        column_config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
+    elif col in WOW_COLUMNS:
+        column_config[col] = st.column_config.NumberColumn(col, format="%+.1f")
+    elif col in RATE_COLUMNS:
+        column_config[col] = st.column_config.NumberColumn(col, format="%.2f")
+
 st.dataframe(
-    table[available_cols].rename(columns=columns_for_position).sort_values("Momentum", ascending=False, na_position="last"),
+    display_table.sort_values(sort_col, ascending=False, na_position="last"),
     width="stretch",
     hide_index=True,
+    column_config=column_config,
+)
+
+csv_export = build_csv_export(table, position)
+st.download_button(
+    "Download filtered table as CSV",
+    data=csv_export.to_csv(index=False).encode("utf-8"),
+    file_name=f"position_explorer_{position.lower()}.csv",
+    mime="text/csv",
 )
 
 st.divider()
@@ -116,31 +102,130 @@ st.divider()
 # ---------------------------------------------------------------------------
 # Volume vs. efficiency scatter
 # ---------------------------------------------------------------------------
-st.subheader(f"{position} Volume vs. Efficiency")
-st.caption("Touches = targets + carries (season total). Bubble size = season fantasy point average.")
+if position in ("WR", "TE"):
+    st.subheader(f"{position} Volume vs. Efficiency")
+    st.caption("Bubble size = Receiving Yards/Game. Color = Season FPPG.")
 
-scatter_df = pos_current[pos_current["total_touches"] > 0].copy()
-# Bubble size can't be negative, but fantasy points can be (fumbles/INTs) - clip for sizing only.
-scatter_df["_bubble_size"] = scatter_df["avg_fantasy_points"].clip(lower=0.1)
-scatter = px.scatter(
-    scatter_df,
-    x="total_touches",
-    y="points_per_touch",
-    size="_bubble_size",
-    color="team",
-    hover_name="player_display_name",
-    hover_data={
+    scatter_df = pos_current[pos_current["targets_per_game"] > 0].copy()
+    scatter_df["_bubble_size"] = scatter_df["receiving_yards_per_game"].clip(lower=0.1)
+    scatter = px.scatter(
+        scatter_df,
+        x="targets_per_game",
+        y="yards_per_target",
+        size="_bubble_size",
+        color="avg_fantasy_points",
+        color_continuous_scale="Viridis",
+        hover_name="player_display_name",
+        hover_data={
+            "total_targets": True,
+            "total_receptions": True,
+            "total_receiving_yards": True,
+            "total_receiving_air_yards": True,
+            "target_share_pct": ":.1f",
+            "air_yards_share_pct": ":.1f",
+            "catch_rate": ":.2f",
+            "yac_per_reception": ":.1f",
+            "avg_fantasy_points": ":.1f",
+            "_bubble_size": False,
+        },
+        labels={"targets_per_game": "Targets/Game", "yards_per_target": "Yards per Target", "avg_fantasy_points": "Season FPPG"},
+        size_max=30,
+    )
+    scatter.update_layout(height=550)
+    st.plotly_chart(scatter, width="stretch")
+
+    if "air_yards_share_pct" in pos_current.columns and pos_current["air_yards_share_pct"].notna().any():
+        st.caption(f"{position} Target Share vs. Air Yards Share")
+        share_df = pos_current[pos_current["target_share_pct"].notna() & pos_current["air_yards_share_pct"].notna()].copy()
+        share_fig = px.scatter(
+            share_df,
+            x="target_share_pct",
+            y="air_yards_share_pct",
+            color="team",
+            hover_name="player_display_name",
+            hover_data={"avg_fantasy_points": ":.1f", "total_targets": True},
+            labels={"target_share_pct": "Target Share %", "air_yards_share_pct": "Air Yards Share %"},
+        )
+        share_fig.update_layout(height=450, showlegend=False)
+        st.plotly_chart(share_fig, width="stretch")
+else:
+    st.subheader(f"{position} Volume vs. Efficiency")
+    st.caption("Touches = targets + carries (season total). Bubble size = season fantasy point average.")
+
+    scatter_df = pos_current[pos_current["total_touches"] > 0].copy()
+    # Bubble size can't be negative, but fantasy points can be (fumbles/INTs) - clip for sizing only.
+    scatter_df["_bubble_size"] = scatter_df["avg_fantasy_points"].clip(lower=0.1)
+    hover_data = {
         "last_opponent": True,
         "games_played": True,
         "momentum_score": ":.1f",
         "avg_fantasy_points": ":.1f",
         "_bubble_size": False,
-    },
-    labels={"total_touches": "Touches (season)", "points_per_touch": "Points per Touch"},
-    size_max=30,
-)
-scatter.update_layout(height=550, showlegend=False)
-st.plotly_chart(scatter, width="stretch")
+    }
+    if position == "RB":
+        hover_data.update({
+            "total_carries": True,
+            "total_targets": True,
+            "total_rushing_yards": True,
+            "total_receiving_yards": True,
+            "total_yards": True,
+            "touches_per_game": ":.1f",
+            "points_per_touch": ":.2f",
+        })
+    scatter = px.scatter(
+        scatter_df,
+        x="total_touches",
+        y="points_per_touch",
+        size="_bubble_size",
+        color="team",
+        hover_name="player_display_name",
+        hover_data=hover_data,
+        labels={"total_touches": "Touches (season)", "points_per_touch": "Points per Touch"},
+        size_max=30,
+    )
+    scatter.update_layout(height=550, showlegend=False)
+    st.plotly_chart(scatter, width="stretch")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Selected-player weekly workload chart
+# ---------------------------------------------------------------------------
+if position == "RB":
+    st.subheader("Weekly Volume - Selected Player")
+    player_options = sorted(pos_current["player_display_name"].unique())
+    if player_options:
+        selected_player = st.selectbox("Player", player_options)
+        volume_df = weekly_volume_for_player(pos_weekly, selected_player)
+        if not volume_df.empty:
+            volume_long = volume_df.melt(id_vars="week", value_vars=["carries", "targets", "touches"], var_name="stat", value_name="value")
+            volume_fig = px.bar(
+                volume_long, x="week", y="value", color="stat", barmode="group",
+                labels={"week": "Week", "value": "Count", "stat": "Stat"},
+            )
+            volume_fig.update_layout(height=450, legend_title_text="")
+            st.plotly_chart(volume_fig, width="stretch")
+elif position in ("WR", "TE"):
+    st.subheader("Weekly Receiving Workload - Selected Player")
+    player_options = sorted(pos_current["player_display_name"].unique())
+    if player_options:
+        selected_player = st.selectbox("Player", player_options)
+        receiving_df = weekly_receiving_for_player(pos_weekly, selected_player)
+        if not receiving_df.empty:
+            workload_long = receiving_df.melt(id_vars="week", value_vars=["targets", "receptions"], var_name="stat", value_name="value")
+            workload_fig = px.bar(
+                workload_long, x="week", y="value", color="stat", barmode="group",
+                labels={"week": "Week", "value": "Count", "stat": "Stat"},
+            )
+            workload_fig.add_scatter(
+                x=receiving_df["week"], y=receiving_df["receiving_yards"], mode="lines+markers",
+                name="Receiving Yards", yaxis="y2",
+            )
+            workload_fig.update_layout(
+                height=450, legend_title_text="",
+                yaxis2=dict(title="Receiving Yards", overlaying="y", side="right"),
+            )
+            st.plotly_chart(workload_fig, width="stretch")
 
 st.divider()
 
