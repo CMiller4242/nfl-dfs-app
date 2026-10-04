@@ -1,8 +1,8 @@
 {
   "season": 2026,
-  "week": 1,
+  "week": 4,
   "source": "manual_copy",
-  "updated_at_utc": "2026-08-10T20:16:27.858017+00:00",
-  "row_count": 715,
-  "filename": "DKSalaries (14).csv"
+  "updated_at_utc": "2026-10-04T14:56:52.728993+00:00",
+  "row_count": 629,
+  "filename": "DKSalaries_Week4.csv"
 }
