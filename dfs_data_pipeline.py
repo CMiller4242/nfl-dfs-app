@@ -1447,10 +1447,22 @@ def run_pipeline():
                 prior_raw_team_df, source_season, prior_team_max_week, "preseason_baseline"
             )
 
+    # In-Season Opportunity Model - pure windowed workload aggregation/
+    # classification from `weekly_df` (see lib.opportunity_model for why
+    # this lives there, not here: same precedent as `compute_role_context`
+    # living in lib/eligibility.py rather than inline in this pipeline).
+    # Built from whichever `weekly_df`/`baseline_df` this run already
+    # produced above (current-season in in_season mode; empty/prior-season
+    # baseline in preseason mode) - no separate fetch, no new source.
+    from lib.opportunity_model import build_player_opportunity_reporting
+
+    opportunity_df = build_player_opportunity_reporting(weekly_df, baseline_df, season=active_season)
+
     weekly_df.to_parquet(os.path.join(DATA_DIR, "players_weekly.parquet"), index=False)
     current_df.to_parquet(os.path.join(DATA_DIR, "players_current.parquet"), index=False)
     team_summary_df.to_parquet(os.path.join(DATA_DIR, "team_summary.parquet"), index=False)
     baseline_df.to_parquet(os.path.join(DATA_DIR, "players_prior_season_baseline.parquet"), index=False)
+    opportunity_df.to_parquet(os.path.join(DATA_DIR, "player_opportunity_reporting.parquet"), index=False)
     # Always written fresh, like player_role_context.parquet - a pure
     # recomputation from whichever raw team stats/weekly player rows are
     # currently in hand (current-season or prior-season baseline), never
@@ -1494,6 +1506,7 @@ def run_pipeline():
         "defense_reporting_season": (
             int(defense_reporting_df["season"].iloc[0]) if not defense_reporting_df.empty else None
         ),
+        "opportunity_reporting_rows": int(len(opportunity_df)),
     }
     with open(os.path.join(DATA_DIR, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
@@ -1510,6 +1523,7 @@ def run_pipeline():
     print(f"  team_reporting.parquet ({team_reporting_mode}): {len(team_reporting_df):>4} rows")
     print(f"  defense_reporting.parquet ({defense_reporting_mode}): {len(defense_reporting_df):>4} rows")
     print(f"  defense_position_weekly.parquet:     {len(defense_position_weekly_df):>6} rows")
+    print(f"  player_opportunity_reporting.parquet: {len(opportunity_df):>5} rows")
 
     print("\nRefreshing role/eligibility context (depth chart + ESPN injuries)...")
     role_week = next_slate_week if next_slate_week is not None else (latest_completed_week or 1)

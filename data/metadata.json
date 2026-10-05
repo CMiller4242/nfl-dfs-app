@@ -5,7 +5,7 @@
   "app_mode": "in_season",
   "latest_completed_week": 3,
   "next_slate_week": 4,
-  "last_updated": "2026-10-04T14:25:04.373922+00:00",
+  "last_updated": "2026-10-05T15:43:38.908713+00:00",
   "status": "ok",
   "player_rows": 1078,
   "player_count": 454,
@@ -49,5 +49,6 @@
   "team_reporting_season": 2026,
   "defense_reporting_mode": "in_season",
   "defense_reporting_rows": 128,
-  "defense_reporting_season": 2026
+  "defense_reporting_season": 2026,
+  "opportunity_reporting_rows": 454
 }

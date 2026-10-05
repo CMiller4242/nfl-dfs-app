@@ -12,6 +12,7 @@ from lib.data import (
     load_dk_slate_metadata,
     load_injury_metadata,
     load_metadata,
+    load_player_opportunity_reporting,
     load_player_role_context,
     load_players_current,
     load_players_prior_season_baseline,
@@ -31,12 +32,14 @@ from lib.matchup_analyzer import (
     inactive_players,
     needs_review_rows,
     plays_to_monitor,
+    rising_opportunity_section,
     salary_vs_value_chart_data,
     summary_counts,
     team_environment_chart_data,
     valid_player_pool,
     volume_vs_matchup_chart_data,
 )
+from lib.opportunity_config import OPPORTUNITY_LABEL_DISPLAY, POOL_PROMOTION_DISPLAY_LABEL
 from lib.role_config import DEPTH_CHART_FRESHNESS_HOURS, INJURY_FRESHNESS_HOURS
 
 st.set_page_config(page_title="Matchup Analyzer | NFL DFS", page_icon="🔎", layout="wide")
@@ -164,6 +167,7 @@ def _build_table(file_bytes: bytes) -> pd.DataFrame:
         load_defense_reporting(),
         load_team_reporting(),
         load_player_role_context(),
+        load_player_opportunity_reporting(),
     )
 
 
@@ -184,6 +188,8 @@ FILTER_DEFAULTS = {
     "ma_min_air_yards_share": 0.0, "ma_min_matchup_index": 0.0,
     "ma_matchup_pctile_min": 0, "ma_matchup_pctile_max": 100,
     "ma_min_momentum": 0.0, "ma_min_games": 0,
+    "ma_opportunity_labels": [], "ma_rising_only": False, "ma_min_opportunity_confidence": "Any",
+    "ma_show_monitor_rising": False,
 }
 for _key, _default in FILTER_DEFAULTS.items():
     st.session_state.setdefault(_key, _default)
@@ -258,6 +264,22 @@ with st.expander("Research filters (position-aware — a null metric never exclu
     with r8:
         min_games = st.number_input("Min games played", min_value=0, step=1, key="ma_min_games")
 
+with st.expander("Opportunity filters (In-Season Opportunity Model)"):
+    o1, o2, o3 = st.columns(3)
+    with o1:
+        opportunity_label_filter = st.multiselect(
+            "Opportunity label", list(OPPORTUNITY_LABEL_DISPLAY.keys()),
+            format_func=lambda v: OPPORTUNITY_LABEL_DISPLAY.get(v, v), key="ma_opportunity_labels",
+        )
+    with o2:
+        rising_opportunity_only = st.checkbox("Rising opportunity only", key="ma_rising_only")
+    with o3:
+        min_opportunity_confidence = st.selectbox(
+            "Min opportunity confidence", ["Any", "early_sample", "established_sample"],
+            format_func=lambda v: v if v == "Any" else {"early_sample": "Early Sample", "established_sample": "Established Sample"}[v],
+            key="ma_min_opportunity_confidence",
+        )
+
 st.button("Reset filters", on_click=_reset_filters)
 
 # ---------------------------------------------------------------------------
@@ -281,6 +303,9 @@ filtered = apply_research_filters(
     matchup_percentile_range=(pctile_min, pctile_max) if (pctile_min, pctile_max) != (0, 100) else None,
     min_offensive_momentum=min_momentum or None,
     min_games_played=min_games or None,
+    opportunity_labels=opportunity_label_filter or None,
+    rising_opportunity_only=rising_opportunity_only,
+    min_opportunity_confidence=None if min_opportunity_confidence == "Any" else min_opportunity_confidence,
 )
 
 if not show_early_sample:
@@ -389,6 +414,49 @@ for tab, pos in zip(value_tabs, POSITIONS):
                 }),
                 width="stretch", hide_index=True,
             )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Rising Opportunity (In-Season Opportunity Model) - Valid Player Pool only
+# by default; never monitor-only/inactive/unresolved/excluded.
+# ---------------------------------------------------------------------------
+st.subheader("📈 Rising Opportunity")
+st.caption(
+    "Valid Player Pool rows (role-eligible, confidently matched, a real salary/projection, a resolvable "
+    "opponent) whose recent workload is classified Rising Opportunity by the In-Season Opportunity Model. "
+    "Never includes monitor-only, inactive, unresolved, or excluded-by-role players by default."
+)
+show_monitor_rising = st.checkbox(
+    "Also show rising monitor-only (contingent) players here",
+    key="ma_show_monitor_rising",
+    help="OFF by default. When ON, rising contingent_backup players appear in this section too, "
+    "clearly tagged Monitor Injury Status - never merged into the regular pool rows.",
+)
+rising = rising_opportunity_section(
+    filtered, include_conditional=include_conditional, include_monitor_only=show_monitor_rising,
+)
+if rising.empty:
+    st.caption("No rising-opportunity players in the current filter.")
+else:
+    rising_display = rising.copy()
+    rising_display["Pool Status"] = rising_display.apply(
+        lambda r: POOL_PROMOTION_DISPLAY_LABEL if r.get("is_pool_only_rising_promotion")
+        else ("Monitor Injury Status" if r.get("role_classification") == "contingent_backup" else "Player Pool"),
+        axis=1,
+    )
+    cols = ["Name", "Position", "TeamAbbrev", "opponent", "Salary", "projected_value",
+            "opportunity_reason", "role_display", "Pool Status",
+            "recent_2_vs_season_display", "matchup_index"]
+    st.dataframe(
+        rising_display[cols].rename(columns={
+            "Name": "Player", "TeamAbbrev": "Team", "opponent": "Opponent", "Salary": "Salary",
+            "projected_value": "Projected Value", "opportunity_reason": "Opportunity Reason",
+            "role_display": "Role", "recent_2_vs_season_display": "Recent 2 vs Season",
+            "matchup_index": "Matchup Index",
+        }).sort_values("Projected Value", ascending=False, na_position="last"),
+        width="stretch", hide_index=True,
+    )
 
 st.divider()
 

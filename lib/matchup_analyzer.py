@@ -34,6 +34,8 @@ from lib.dk_helper import (
 )
 from lib.defense_trends import DVP_TREND_DISPLAY
 from lib.eligibility import attach_role_context_to_dk_rows
+from lib.opportunity_config import CONFIDENCE_LABEL_DISPLAY, OPPORTUNITY_LABEL_DISPLAY, POOL_PROMOTION_DISPLAY_LABEL
+from lib.opportunity_model import compute_role_safety_gate
 from lib.player_identity import normalize_team
 from lib.team_trends import SAMPLE_SIZE_DISPLAY
 
@@ -222,6 +224,52 @@ def _has_opponent(df: pd.DataFrame) -> pd.Series:
     return df["opponent"].notna() & (df["opponent"] != "")
 
 
+OPPORTUNITY_MERGE_COLUMNS = [
+    "player_id", "opportunity_label", "opportunity_reason", "supporting_metrics",
+    "latest_2_games_summary", "latest_3_games_summary", "confidence_label", "confidence_reason",
+    "touches_last_2_delta_vs_season", "touches_last_2_per_game",
+    "targets_last_2_delta_vs_season", "targets_last_2_per_game",
+    "attempts_last_2_delta_vs_season", "attempts_last_2_per_game",
+    "touches_last_3_delta_vs_season", "touches_last_3_per_game",
+    "targets_last_3_delta_vs_season", "targets_last_3_per_game",
+    "attempts_last_3_delta_vs_season", "attempts_last_3_per_game",
+]
+
+_RECENT_VS_SEASON_METRIC = {"RB": "touches", "WR": "targets", "TE": "targets", "QB": "attempts"}
+_RECENT_VS_SEASON_UNIT = {"touches": "touches/g", "targets": "targets/g", "attempts": "att/g"}
+
+
+def _recent_vs_season_display(row, window: str) -> str:
+    metric = _RECENT_VS_SEASON_METRIC.get(row.get("Position"))
+    if not metric:
+        return "—"
+    delta = row.get(f"{metric}_{window}_delta_vs_season")
+    per_game = row.get(f"{metric}_{window}_per_game")
+    if pd.isna(delta) or pd.isna(per_game):
+        return "—"
+    return f"{per_game:.1f} {_RECENT_VS_SEASON_UNIT[metric]} ({delta:+.1f})"
+
+
+def _merge_opportunity(df: pd.DataFrame, opportunity_df: pd.DataFrame) -> pd.DataFrame:
+    """Left-merge the Opportunity Model's classification/window fields by
+    the already-resolved `stat_player_id` - same convention as
+    `_merge_extra_current_stats`. Null/'—' when unresolved or the mart is
+    empty, never fabricated."""
+    out = df.copy()
+    value_cols = [c for c in OPPORTUNITY_MERGE_COLUMNS if c != "player_id"]
+    has_data = opportunity_df is not None and not opportunity_df.empty and "player_id" in opportunity_df.columns
+    if has_data:
+        cols = ["player_id"] + [c for c in value_cols if c in opportunity_df.columns]
+        extra = opportunity_df[cols].drop_duplicates(subset=["player_id"])
+        out = out.merge(extra, how="left", left_on="stat_player_id", right_on="player_id", suffixes=("", "_opp"))
+        if "player_id" in out.columns and "stat_player_id" in out.columns:
+            out = out.drop(columns=["player_id"])
+    for c in value_cols:
+        if c not in out.columns:
+            out[c] = pd.NA
+    return out
+
+
 def build_matchup_analyzer_table(
     dk_df: pd.DataFrame,
     players_current_df: pd.DataFrame,
@@ -229,13 +277,15 @@ def build_matchup_analyzer_table(
     defense_reporting_df: pd.DataFrame,
     team_reporting_df: pd.DataFrame,
     role_context_df: pd.DataFrame,
+    opportunity_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     Build the one research DataFrame the Matchup Analyzer page renders -
-    one row per DK salary row, joined to identity/stats/role/team/defense
-    context. Deterministic: same inputs always produce the same output, and
-    a player's row only ever carries ITS OWN resolved identity's data (see
-    each `_merge_*` helper's docstring for the exact join key).
+    one row per DK salary row, joined to identity/stats/role/team/defense/
+    opportunity context. Deterministic: same inputs always produce the same
+    output, and a player's row only ever carries ITS OWN resolved
+    identity's data (see each `_merge_*` helper's docstring for the exact
+    join key).
     """
     dk_df = dk_df.reset_index(drop=True)
 
@@ -250,6 +300,7 @@ def build_matchup_analyzer_table(
 
     df = _merge_team_reporting(df, team_reporting_df)
     df = _merge_defense_extra(df, defense_reporting_df)
+    df = _merge_opportunity(df, opportunity_df)
 
     df["role_display"] = df["role_classification"].map(ROLE_LABEL_DISPLAY).fillna(df["role_classification"])
     if "dvp_trend_label" in df.columns:
@@ -262,6 +313,26 @@ def build_matchup_analyzer_table(
     ) if "stat_games_played" in df.columns else False
     df["prior_fppg_delta"] = df["player_avg"] - pd.to_numeric(df["prior_season_fppg"], errors="coerce")
     df["needs_review_reason"] = df.apply(_describe_review_reason, axis=1)
+
+    df["opportunity_label_display"] = df["opportunity_label"].map(OPPORTUNITY_LABEL_DISPLAY).fillna("—")
+    df["opportunity_confidence_display"] = df["confidence_label"].map(CONFIDENCE_LABEL_DISPLAY).fillna("—")
+    df["recent_2_vs_season_display"] = df.apply(lambda r: _recent_vs_season_display(r, "last_2"), axis=1)
+    df["recent_3_vs_season_display"] = df.apply(lambda r: _recent_vs_season_display(r, "last_3"), axis=1)
+
+    # Role-safety gate (item 11) - the ONLY place opportunity data is allowed
+    # to touch role eligibility, and only additively (see
+    # lib.opportunity_model.compute_role_safety_gate's docstring for the
+    # exact, narrow rule: never overrides inactive/role_unresolved/
+    # contingent_backup, and never promotes beyond the research Player Pool).
+    df["games_played"] = df["stat_games_played"] if "stat_games_played" in df.columns else pd.NA
+    df["position"] = df["Position"] if "Position" in df.columns else pd.NA
+    gate = df.apply(compute_role_safety_gate, axis=1, result_type="expand")
+    df["opportunity_pool_eligible"] = gate["opportunity_pool_eligible"]
+    df["opportunity_top_value_eligible"] = gate["opportunity_top_value_eligible"]
+    df["opportunity_eligibility_reason"] = gate["opportunity_eligibility_reason"]
+    df["is_pool_only_rising_promotion"] = (
+        (df["role_classification"] == "bench_no_clear_path") & (df["opportunity_pool_eligible"] == True)  # noqa: E712
+    )
 
     return df
 
@@ -294,10 +365,46 @@ def _describe_review_reason(row) -> str:
 # fields from the unmodified role engine; never redefines eligibility itself.
 # ---------------------------------------------------------------------------
 def valid_player_pool(df: pd.DataFrame, include_conditional: bool = False) -> pd.DataFrame:
-    base = df[(df["projection_status"] == "ok") & (df["role_eligible_for_pool"] == True) & _has_opponent(df)]  # noqa: E712
+    """
+    Valid Player Pool = the existing role engine's own role_eligible_for_pool,
+    OR (additively) a player the Opportunity Model's narrow, configured
+    bench_no_clear_path promotion granted `opportunity_pool_eligible` to -
+    see lib.opportunity_model.compute_role_safety_gate. That promotion field
+    is False for every row unless `build_matchup_analyzer_table` computed it
+    (and False for inactive/role_unresolved/contingent_backup always), so
+    this is a pure extension, never a behavior change, when opportunity
+    data isn't present.
+    """
+    opportunity_promoted = (
+        df["opportunity_pool_eligible"] == True if "opportunity_pool_eligible" in df.columns  # noqa: E712
+        else pd.Series(False, index=df.index)
+    )
+    base = df[
+        (df["projection_status"] == "ok")
+        & ((df["role_eligible_for_pool"] == True) | opportunity_promoted)  # noqa: E712
+        & _has_opponent(df)
+    ]
     if not include_conditional:
         base = base[base["role_classification"] != "contingent_backup"]
     return base
+
+
+def rising_opportunity_section(df: pd.DataFrame, include_conditional: bool = False, include_monitor_only: bool = False) -> pd.DataFrame:
+    """
+    The "Rising Opportunity" compact view (item 13): Valid Player Pool rows
+    (which already excludes monitor-only/inactive/unresolved/excluded by
+    construction - see `valid_player_pool`) with a rising opportunity label.
+    `include_monitor_only` is a SEPARATE, clearly-labeled toggle (never the
+    default) that additionally surfaces rising contingent_backup players -
+    still tagged as monitor-only, never merged into the regular pool rows.
+    """
+    pool = valid_player_pool(df, include_conditional=include_conditional)
+    rising_pool = pool[pool["opportunity_label"] == "rising_opportunity"]
+    if not include_monitor_only:
+        return rising_pool
+
+    monitor_rising = df[(df["role_classification"] == "contingent_backup") & (df["opportunity_label"] == "rising_opportunity")]
+    return pd.concat([rising_pool, monitor_rising]).drop_duplicates(subset=["Name", "TeamAbbrev", "Position", "Salary"])
 
 
 def featured_top_value(df: pd.DataFrame) -> pd.DataFrame:
@@ -371,6 +478,9 @@ def apply_research_filters(
     matchup_percentile_range=None,
     min_offensive_momentum=None,
     min_games_played=None,
+    opportunity_labels=None,
+    rising_opportunity_only=False,
+    min_opportunity_confidence=None,
 ) -> pd.DataFrame:
     """Apply every "Controls" filter (item 7) to an already-built matchup
     table. Never mutates `df`; every threshold is a no-op unless set."""
@@ -412,6 +522,16 @@ def apply_research_filters(
         series = pd.to_numeric(out["stat_games_played"], errors="coerce")
         out = out[series.isna() | (series >= min_games_played)]
 
+    if rising_opportunity_only:
+        out = out[out["opportunity_label"] == "rising_opportunity"]
+    elif opportunity_labels:
+        out = out[out["opportunity_label"].isin(opportunity_labels)]
+
+    if min_opportunity_confidence:
+        tier = {"insufficient_sample": 0, "early_sample": 1, "established_sample": 2}
+        min_rank = tier.get(min_opportunity_confidence, 0)
+        out = out[out["confidence_label"].map(tier).fillna(-1) >= min_rank]
+
     return out
 
 
@@ -432,6 +552,12 @@ PROJECTION_COLUMNS = {
     "player_avg": "Current Season FPPG", "prior_season_fppg": "Prior Season FPPG",
     "prior_fppg_delta": "Delta vs Prior Season", "stat_games_played": "Current Season Games",
     "sample_label": "Sample Label",
+}
+OPPORTUNITY_COLUMNS = {
+    "opportunity_label_display": "Opportunity",
+    "recent_2_vs_season_display": "Recent 2 vs Season",
+    "recent_3_vs_season_display": "Recent 3 vs Season",
+    "opportunity_confidence_display": "Opportunity Confidence",
 }
 RB_VOLUME_COLUMNS = {
     "carries_per_game": "Carries/Game", "targets_per_game": "Targets/Game",
@@ -469,7 +595,10 @@ TEAM_ENV_COLUMNS = {
 def columns_for_position(position: str) -> dict:
     """The {raw_column: display_label} map, in display order, for one position."""
     volume = {"RB": RB_VOLUME_COLUMNS, "WR": WR_TE_VOLUME_COLUMNS, "TE": WR_TE_VOLUME_COLUMNS, "QB": QB_VOLUME_COLUMNS}.get(position, {})
-    return {**IDENTITY_COLUMNS, **ROLE_COLUMNS, **PROJECTION_COLUMNS, **volume, **MATCHUP_COLUMNS, **TEAM_ENV_COLUMNS}
+    return {
+        **IDENTITY_COLUMNS, **ROLE_COLUMNS, **PROJECTION_COLUMNS, **OPPORTUNITY_COLUMNS,
+        **volume, **MATCHUP_COLUMNS, **TEAM_ENV_COLUMNS,
+    }
 
 
 def build_display_table(df: pd.DataFrame, position: str = None) -> pd.DataFrame:
@@ -481,7 +610,7 @@ def build_display_table(df: pd.DataFrame, position: str = None) -> pd.DataFrame:
     if position:
         columns = columns_for_position(position)
     else:
-        columns = {**IDENTITY_COLUMNS, **ROLE_COLUMNS, **PROJECTION_COLUMNS,
+        columns = {**IDENTITY_COLUMNS, **ROLE_COLUMNS, **PROJECTION_COLUMNS, **OPPORTUNITY_COLUMNS,
                    **RB_VOLUME_COLUMNS, **WR_TE_VOLUME_COLUMNS, **QB_VOLUME_COLUMNS,
                    **MATCHUP_COLUMNS, **TEAM_ENV_COLUMNS}
     available = [c for c in columns if c in df.columns]
@@ -491,12 +620,14 @@ def build_display_table(df: pd.DataFrame, position: str = None) -> pd.DataFrame:
 def build_csv_export(df: pd.DataFrame) -> pd.DataFrame:
     """Every user-visible column (raw field names, audit-ready) plus stable
     identity fields needed to understand the joins."""
-    columns = {**IDENTITY_COLUMNS, **ROLE_COLUMNS, **PROJECTION_COLUMNS,
+    columns = {**IDENTITY_COLUMNS, **ROLE_COLUMNS, **PROJECTION_COLUMNS, **OPPORTUNITY_COLUMNS,
                **RB_VOLUME_COLUMNS, **WR_TE_VOLUME_COLUMNS, **QB_VOLUME_COLUMNS,
                **MATCHUP_COLUMNS, **TEAM_ENV_COLUMNS}
     audit_cols = ["stat_player_id", "role_player_id", "match_method", "match_score",
                   "role_classification", "projection_status", "canonical_team", "opponent",
-                  "dvp_trend_label", "prior_season_match_method"]
+                  "dvp_trend_label", "prior_season_match_method",
+                  "opportunity_label", "opportunity_pool_eligible", "opportunity_top_value_eligible",
+                  "opportunity_eligibility_reason", "is_pool_only_rising_promotion"]
     export_cols = audit_cols + [c for c in columns if c in df.columns and c not in audit_cols]
     export_cols = [c for c in export_cols if c in df.columns]
     return df[export_cols].reset_index(drop=True)
