@@ -5,13 +5,16 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from lib.position_explorer import (
+    OPPORTUNITY_COLUMNS,
     RB_COLUMNS,
     WR_TE_COLUMNS,
     build_csv_export,
     build_display_table,
     columns_for_position,
     early_sample_warning,
+    filter_by_opportunity,
     filter_table,
+    merge_opportunity,
     weekly_receiving_for_player,
     weekly_volume_for_player,
 )
@@ -217,9 +220,9 @@ def test_position_explorer_page_renders_without_exception(position):
 
 
 @pytest.mark.parametrize("position,expected_columns", [
-    ("RB", list(RB_COLUMNS.values())),
-    ("WR", list(WR_TE_COLUMNS.values())),
-    ("TE", list(WR_TE_COLUMNS.values())),
+    ("RB", list(RB_COLUMNS.values()) + list(OPPORTUNITY_COLUMNS.values())),
+    ("WR", list(WR_TE_COLUMNS.values()) + list(OPPORTUNITY_COLUMNS.values())),
+    ("TE", list(WR_TE_COLUMNS.values()) + list(OPPORTUNITY_COLUMNS.values())),
 ])
 def test_position_explorer_page_table_matches_exact_column_set(position, expected_columns):
     at = AppTest.from_file(PAGE_PATH, default_timeout=60)
@@ -228,3 +231,111 @@ def test_position_explorer_page_table_matches_exact_column_set(position, expecte
     at.run()
     assert not at.exception
     assert list(at.dataframe[0].value.columns) == expected_columns
+
+
+# ---------------------------------------------------------------------------
+# Opportunity Model integration (In-Season Opportunity Model pass)
+# ---------------------------------------------------------------------------
+def _opportunity_row(player_id, opportunity_label="rising_opportunity", confidence_label="established_sample"):
+    return {
+        "player_id": player_id, "opportunity_label": opportunity_label,
+        "opportunity_reason": f"Test reason for {player_id}.",
+        "supporting_metrics": "targets/game +3.0 vs season",
+        "latest_2_games_summary": "Last 2 games (2 games): 6.0 targets/game",
+        "latest_3_games_summary": "Last 3 games (3 games): 5.0 targets/game",
+        "confidence_label": confidence_label, "confidence_reason": "reason",
+        "touches_last_2_delta_vs_season": 4.0, "touches_last_2_per_game": 10.0,
+        "targets_last_2_delta_vs_season": 3.0, "targets_last_2_per_game": 6.0,
+        "attempts_last_2_delta_vs_season": 5.0, "attempts_last_2_per_game": 30.0,
+        "touches_last_3_delta_vs_season": 2.0, "touches_last_3_per_game": 9.0,
+        "targets_last_3_delta_vs_season": 1.0, "targets_last_3_per_game": 5.0,
+        "attempts_last_3_delta_vs_season": 3.0, "attempts_last_3_per_game": 28.0,
+    }
+
+
+def test_merge_opportunity_adds_display_columns():
+    df = pd.DataFrame([_current_row(player_id="p1", position="WR")])
+    opportunity = pd.DataFrame([_opportunity_row("p1", opportunity_label="rising_opportunity")])
+    merged = merge_opportunity(df, opportunity)
+    row = merged.iloc[0]
+    assert row["opportunity_label_display"] == "Rising Opportunity"
+    assert row["confidence_label_display"] == "Established Sample"
+    assert "targets/g" in row["recent_2_vs_season_display"]
+
+
+def test_merge_opportunity_safe_when_mart_empty():
+    df = pd.DataFrame([_current_row(player_id="p1", position="WR")])
+    merged = merge_opportunity(df, pd.DataFrame())
+    row = merged.iloc[0]
+    assert row["opportunity_label_display"] == "—"
+    assert row["recent_2_vs_season_display"] == "—"
+
+
+def test_merge_opportunity_never_leaks_another_players_data():
+    df = pd.DataFrame([_current_row(player_id="p1", position="WR"), _current_row(player_id="p2", position="RB")])
+    opportunity = pd.DataFrame([
+        _opportunity_row("p1", opportunity_label="rising_opportunity"),
+        _opportunity_row("p2", opportunity_label="declining_opportunity"),
+    ])
+    merged = merge_opportunity(df, opportunity)
+    assert merged[merged["player_id"] == "p1"].iloc[0]["opportunity_label"] == "rising_opportunity"
+    assert merged[merged["player_id"] == "p2"].iloc[0]["opportunity_label"] == "declining_opportunity"
+
+
+def test_filter_by_opportunity_rising_only():
+    df = pd.DataFrame([_current_row(player_id="p1"), _current_row(player_id="p2")])
+    opportunity = pd.DataFrame([
+        _opportunity_row("p1", opportunity_label="rising_opportunity"),
+        _opportunity_row("p2", opportunity_label="stable_opportunity"),
+    ])
+    merged = merge_opportunity(df, opportunity)
+    out = filter_by_opportunity(merged, rising_only=True)
+    assert out["player_id"].tolist() == ["p1"]
+
+
+def test_filter_by_opportunity_label_multiselect():
+    df = pd.DataFrame([_current_row(player_id="p1"), _current_row(player_id="p2"), _current_row(player_id="p3")])
+    opportunity = pd.DataFrame([
+        _opportunity_row("p1", opportunity_label="rising_opportunity"),
+        _opportunity_row("p2", opportunity_label="declining_opportunity"),
+        _opportunity_row("p3", opportunity_label="stable_opportunity"),
+    ])
+    merged = merge_opportunity(df, opportunity)
+    out = filter_by_opportunity(merged, labels=["rising_opportunity", "declining_opportunity"])
+    assert set(out["player_id"]) == {"p1", "p2"}
+
+
+def test_filter_by_opportunity_min_confidence():
+    df = pd.DataFrame([_current_row(player_id="p1"), _current_row(player_id="p2")])
+    opportunity = pd.DataFrame([
+        _opportunity_row("p1", confidence_label="established_sample"),
+        _opportunity_row("p2", confidence_label="early_sample"),
+    ])
+    merged = merge_opportunity(df, opportunity)
+    out = filter_by_opportunity(merged, min_confidence="established_sample")
+    assert out["player_id"].tolist() == ["p1"]
+
+
+def test_page_opportunity_filters_render_and_do_not_raise():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=60)
+    at.run()
+    assert not at.exception
+    assert any(el.label == "Opportunity label" for el in at.multiselect)
+
+    opportunity_multiselect = [el for el in at.multiselect if el.label == "Opportunity label"][0]
+    opportunity_multiselect.set_value(["rising_opportunity"])
+    at.run()
+    assert not at.exception
+
+    rising_only_checkbox = [el for el in at.checkbox if el.label == "Show rising only"][0]
+    rising_only_checkbox.set_value(True)
+    at.run()
+    assert not at.exception
+
+
+def test_page_opportunity_detail_expander_renders_without_exception():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=60)
+    at.run()
+    at.radio[0].set_value("WR")
+    at.run()
+    assert not at.exception

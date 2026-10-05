@@ -10,12 +10,21 @@ formatted here.
 
 import pandas as pd
 
+from lib.opportunity_config import OPPORTUNITY_LABEL_DISPLAY, CONFIDENCE_LABEL_DISPLAY
+
 # Players with fewer played games than this are flagged, not hidden by default.
 LOW_SAMPLE_GAMES = 3
 # At or below this many played games, momentum/trend reflect an early, small
 # sample - not established form - and should be labeled as such rather than
 # read with the same confidence as a mature sample.
 EARLY_SAMPLE_GAMES = 2
+
+# Position -> the raw players_weekly/opportunity-model metric used for the
+# compact "Recent N vs Season" summary column (RB=touches, WR/TE=targets,
+# QB=pass attempts) - the same primary-volume metric the opportunity model
+# itself classifies on. See lib.opportunity_model.primary_workload_last_2.
+_RECENT_VS_SEASON_METRIC = {"RB": "touches", "WR": "targets", "TE": "targets", "QB": "attempts"}
+_RECENT_VS_SEASON_UNIT = {"touches": "touches/g", "targets": "targets/g", "attempts": "att/g"}
 
 # Base identity/fantasy-output columns shared by every position's table.
 BASE_COLUMNS = {
@@ -30,8 +39,17 @@ BASE_COLUMNS = {
     "opportunity_trend": "Trend",
 }
 
-# QB's column set is unchanged by this pass - QB reporting is out of scope
-# (see the Position Explorer enhancement's title/scope: RB, WR, TE only).
+# Opportunity Model columns (lib.opportunity_model) - appended to every
+# position's column set so the exact RB/WR-TE lists from the Position
+# Explorer workload pass stay intact, with the new workload-trend columns
+# added at the end rather than reordering what already exists.
+OPPORTUNITY_COLUMNS = {
+    "opportunity_label_display": "Opportunity",
+    "recent_2_vs_season_display": "Recent 2 vs Season",
+    "recent_3_vs_season_display": "Recent 3 vs Season",
+    "confidence_label_display": "Sample",
+}
+
 QB_COLUMNS = {
     "completion_pct": "Comp %",
     "passing_yards_per_attempt": "Yds/Att",
@@ -108,10 +126,12 @@ WR_TE_COLUMNS = {
 def columns_for_position(position: str) -> dict:
     """The {raw_column: display_label} map, in display order, for one position."""
     if position == "RB":
-        return RB_COLUMNS
-    if position in ("WR", "TE"):
-        return WR_TE_COLUMNS
-    return {**BASE_COLUMNS, **QB_COLUMNS}
+        base = RB_COLUMNS
+    elif position in ("WR", "TE"):
+        base = WR_TE_COLUMNS
+    else:
+        base = {**BASE_COLUMNS, **QB_COLUMNS}
+    return {**base, **OPPORTUNITY_COLUMNS}
 
 
 def filter_table(df: pd.DataFrame, name_filter: str = "", hide_low_sample: bool = False) -> pd.DataFrame:
@@ -121,6 +141,81 @@ def filter_table(df: pd.DataFrame, name_filter: str = "", hide_low_sample: bool 
         out = out[out["player_display_name"].str.contains(name_filter, case=False, na=False)]
     if hide_low_sample:
         out = out[out["games_played"] >= LOW_SAMPLE_GAMES]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Opportunity Model integration (lib.opportunity_model /
+# data/player_opportunity_reporting.parquet) - a plain left-merge by
+# player_id, never recomputed here. A player who isn't in the opportunity
+# mart (e.g. the mart is empty/not yet built) simply gets null opportunity
+# columns, never a fabricated label.
+# ---------------------------------------------------------------------------
+_OPPORTUNITY_MERGE_COLUMNS = [
+    "player_id", "opportunity_label", "opportunity_reason", "supporting_metrics",
+    "latest_2_games_summary", "latest_3_games_summary", "confidence_label", "confidence_reason",
+    "touches_last_2_delta_vs_season", "touches_last_2_per_game",
+    "targets_last_2_delta_vs_season", "targets_last_2_per_game",
+    "attempts_last_2_delta_vs_season", "attempts_last_2_per_game",
+    "touches_last_3_delta_vs_season", "touches_last_3_per_game",
+    "targets_last_3_delta_vs_season", "targets_last_3_per_game",
+    "attempts_last_3_delta_vs_season", "attempts_last_3_per_game",
+]
+
+
+def _recent_vs_season_display(row, window: str) -> str:
+    metric = _RECENT_VS_SEASON_METRIC.get(row.get("position"))
+    if not metric:
+        return "—"
+    delta = row.get(f"{metric}_{window}_delta_vs_season")
+    per_game = row.get(f"{metric}_{window}_per_game")
+    if pd.isna(delta) or pd.isna(per_game):
+        return "—"
+    return f"{per_game:.1f} {_RECENT_VS_SEASON_UNIT[metric]} ({delta:+.1f})"
+
+
+def merge_opportunity(df: pd.DataFrame, opportunity_df: pd.DataFrame) -> pd.DataFrame:
+    """Left-merge the Opportunity Model's classification/window fields onto
+    the Position Explorer table by player_id, plus the human-readable
+    display columns the table/filters use. Safe to call with an empty
+    `opportunity_df` - every new column is simply null/'—' in that case."""
+    out = df.copy()
+    has_data = opportunity_df is not None and not opportunity_df.empty and "player_id" in opportunity_df.columns
+    cols = [c for c in _OPPORTUNITY_MERGE_COLUMNS if has_data and c in opportunity_df.columns]
+
+    if has_data and cols:
+        extra = opportunity_df[cols].drop_duplicates(subset=["player_id"])
+        out = out.merge(extra, on="player_id", how="left")
+    else:
+        for c in _OPPORTUNITY_MERGE_COLUMNS:
+            if c != "player_id":
+                out[c] = pd.NA
+
+    out["opportunity_label"] = out.get("opportunity_label", pd.NA)
+    out["opportunity_label_display"] = out["opportunity_label"].map(OPPORTUNITY_LABEL_DISPLAY).fillna("—")
+    out["confidence_label"] = out.get("confidence_label", pd.NA)
+    out["confidence_label_display"] = out["confidence_label"].map(CONFIDENCE_LABEL_DISPLAY).fillna("—")
+    out["recent_2_vs_season_display"] = out.apply(lambda r: _recent_vs_season_display(r, "last_2"), axis=1)
+    out["recent_3_vs_season_display"] = out.apply(lambda r: _recent_vs_season_display(r, "last_3"), axis=1)
+    return out
+
+
+def filter_by_opportunity(
+    df: pd.DataFrame, labels=None, rising_only: bool = False, min_confidence: str = None,
+) -> pd.DataFrame:
+    """Opportunity-label multi-select / "rising only" toggle / minimum-
+    confidence filters (item 12's Position Explorer controls). `min_confidence`
+    is one of "insufficient_sample" < "early_sample" < "established_sample";
+    a row at or above that tier passes."""
+    out = df
+    if rising_only:
+        out = out[out["opportunity_label"] == "rising_opportunity"]
+    elif labels:
+        out = out[out["opportunity_label"].isin(labels)]
+    if min_confidence:
+        tier = {"insufficient_sample": 0, "early_sample": 1, "established_sample": 2}
+        min_rank = tier.get(min_confidence, 0)
+        out = out[out["confidence_label"].map(tier).fillna(-1) >= min_rank]
     return out
 
 

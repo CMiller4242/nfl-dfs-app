@@ -17,6 +17,7 @@ from lib.matchup_analyzer import (
     inactive_players,
     needs_review_rows,
     plays_to_monitor,
+    rising_opportunity_section,
     salary_vs_value_chart_data,
     summary_counts,
     valid_player_pool,
@@ -560,3 +561,187 @@ def test_page_no_salary_data_shows_info_and_stops(tmp_path, monkeypatch):
     at.run()
     assert not at.exception
     assert any("No salary data available" in el.value for el in at.info)
+
+
+# ---------------------------------------------------------------------------
+# Opportunity Model integration (In-Season Opportunity Model pass)
+# ---------------------------------------------------------------------------
+def _opportunity_row(player_id, opportunity_label="rising_opportunity", targets_last_2_per_game=6.0,
+                      touches_last_2_per_game=10.0, attempts_last_2_per_game=30.0, confidence_label="established_sample"):
+    return {
+        "player_id": player_id, "opportunity_label": opportunity_label,
+        "opportunity_reason": f"Rising opportunity test reason for {player_id}.",
+        "supporting_metrics": "targets/game +3.0 vs season",
+        "latest_2_games_summary": "Last 2 games (2 games): 6.0 targets/game",
+        "latest_3_games_summary": "Last 3 games (3 games): 5.0 targets/game",
+        "confidence_label": confidence_label, "confidence_reason": "3 games played this season.",
+        "touches_last_2_delta_vs_season": 4.0, "touches_last_2_per_game": touches_last_2_per_game,
+        "targets_last_2_delta_vs_season": 3.0, "targets_last_2_per_game": targets_last_2_per_game,
+        "attempts_last_2_delta_vs_season": 6.0, "attempts_last_2_per_game": attempts_last_2_per_game,
+        "touches_last_3_delta_vs_season": 3.0, "touches_last_3_per_game": 9.0,
+        "targets_last_3_delta_vs_season": 2.0, "targets_last_3_per_game": 5.0,
+        "attempts_last_3_delta_vs_season": 5.0, "attempts_last_3_per_game": 28.0,
+    }
+
+
+def _opportunity_scenario():
+    """A bench_no_clear_path WR with rising, workload-qualifying opportunity
+    (should be promoted into the research Player Pool only), a bench WR
+    with stable opportunity (should NOT be promoted), a contingent_backup
+    RB with rising opportunity (should stay monitor-only unless the
+    separate toggle is used), and the usual confirmed-starter control."""
+    dk = pd.DataFrame([
+        _dk_row("Starter Control", "WR", "DAL", "NYG", salary=8000, avg=18.0),
+        _dk_row("Promotable Bench", "WR", "DAL", "NYG", salary=4500, avg=9.0),
+        _dk_row("Non Rising Bench", "WR", "DAL", "NYG", salary=4000, avg=6.0),
+        _dk_row("Rising Contingent", "RB", "SF", "LA", salary=5000, avg=10.0),
+    ])
+    current = pd.DataFrame([
+        _player_row("p_starter", "Starter Control", "DAL", "WR", avg=18.0, targets=8),
+        _player_row("p_bench_rising", "Promotable Bench", "DAL", "WR", avg=9.0, targets=4),
+        _player_row("p_bench_stable", "Non Rising Bench", "DAL", "WR", avg=6.0, targets=2),
+        _player_row("p_contingent_rising", "Rising Contingent", "SF", "RB", avg=10.0, carries=8),
+    ])
+    role_context = pd.DataFrame([
+        _role_row("p_starter", "Starter Control", "DAL", "WR", role="standard_eligible_rotation", depth_rank=2),
+        _role_row("p_bench_rising", "Promotable Bench", "DAL", "WR", role="bench_no_clear_path", depth_rank=4,
+                   eligible_pool=False, eligible_top=False, blockers="Healthy Starter (WR1) is Healthy"),
+        _role_row("p_bench_stable", "Non Rising Bench", "DAL", "WR", role="bench_no_clear_path", depth_rank=5,
+                   eligible_pool=False, eligible_top=False, blockers="Healthy Starter (WR1) is Healthy"),
+        _role_row("p_contingent_rising", "Rising Contingent", "SF", "RB", role="contingent_backup", depth_rank=2,
+                   eligible_top=False, monitor=True, blockers="Starter RB (RB1) is Questionable"),
+    ])
+    defense = pd.DataFrame([
+        _defense_row("NYG", "WR", matchup_index=100.0),
+        _defense_row("LA", "RB", matchup_index=100.0),
+    ])
+    team_reporting = pd.DataFrame([_team_reporting_row("DAL"), _team_reporting_row("SF")])
+    opportunity = pd.DataFrame([
+        _opportunity_row("p_starter", opportunity_label="stable_opportunity"),
+        _opportunity_row("p_bench_rising", opportunity_label="rising_opportunity", targets_last_2_per_game=6.0),
+        _opportunity_row("p_bench_stable", opportunity_label="stable_opportunity", targets_last_2_per_game=2.0),
+        _opportunity_row("p_contingent_rising", opportunity_label="rising_opportunity", touches_last_2_per_game=12.0),
+    ])
+    prior_baseline = pd.DataFrame(columns=[
+        "player_id", "player_display_name", "position", "historical_team", "season", "games_played",
+        "avg_fantasy_points",
+    ])
+    return dk, current, prior_baseline, defense, team_reporting, role_context, opportunity
+
+
+@pytest.fixture
+def opportunity_table():
+    dk, current, prior, defense, team, role, opportunity = _opportunity_scenario()
+    return build_matchup_analyzer_table(dk, current, prior, defense, team, role, opportunity)
+
+
+def test_opportunity_fields_merge_correctly(opportunity_table):
+    row = opportunity_table[opportunity_table["Name"] == "Promotable Bench"].iloc[0]
+    assert row["opportunity_label"] == "rising_opportunity"
+    assert row["opportunity_label_display"] == "Rising Opportunity"
+    assert "+" in row["recent_2_vs_season_display"] or "targets/g" in row["recent_2_vs_season_display"]
+
+
+def test_bench_no_clear_path_with_rising_workload_is_promoted_to_pool(opportunity_table):
+    promoted = opportunity_table[opportunity_table["Name"] == "Promotable Bench"].iloc[0]
+    assert promoted["opportunity_pool_eligible"] == True  # noqa: E712
+    assert promoted["opportunity_top_value_eligible"] == False  # noqa: E712
+    assert promoted["is_pool_only_rising_promotion"] == True  # noqa: E712
+
+    pool = valid_player_pool(opportunity_table)
+    assert "Promotable Bench" in set(pool["Name"])
+
+
+def test_bench_no_clear_path_with_stable_opportunity_is_not_promoted(opportunity_table):
+    not_promoted = opportunity_table[opportunity_table["Name"] == "Non Rising Bench"].iloc[0]
+    assert not_promoted["opportunity_pool_eligible"] == False  # noqa: E712
+
+    pool = valid_player_pool(opportunity_table)
+    assert "Non Rising Bench" not in set(pool["Name"])
+
+
+def test_promoted_player_never_appears_in_featured_top_value(opportunity_table):
+    featured = featured_top_value(opportunity_table)
+    assert "Promotable Bench" not in set(featured["Name"])
+
+
+def test_rising_contingent_player_stays_monitor_only_by_default(opportunity_table):
+    pool = valid_player_pool(opportunity_table)
+    assert "Rising Contingent" not in set(pool["Name"])
+    rising = rising_opportunity_section(opportunity_table)
+    assert "Rising Contingent" not in set(rising["Name"])
+
+    monitor = plays_to_monitor(opportunity_table)
+    assert "Rising Contingent" in set(monitor["Name"])
+
+
+def test_rising_contingent_player_included_only_via_explicit_monitor_toggle(opportunity_table):
+    rising_with_monitor = rising_opportunity_section(opportunity_table, include_monitor_only=True)
+    assert "Rising Contingent" in set(rising_with_monitor["Name"])
+    # Still never silently merged into the plain pool-eligible flag.
+    contingent_row = rising_with_monitor[rising_with_monitor["Name"] == "Rising Contingent"].iloc[0]
+    assert contingent_row["role_classification"] == "contingent_backup"
+
+
+def test_rising_opportunity_section_excludes_inactive_unresolved_excluded_by_default(table):
+    # `table` (the standard scenario fixture) has no opportunity data at all
+    # (opportunity_df=None default) - the section must still never raise
+    # and must never include Hurt Runner (inactive), Bench Wideout
+    # (bench_no_clear_path), or Unresolved QB (role_unresolved).
+    rising = rising_opportunity_section(table)
+    leaked = set(rising["Name"]) & {"Hurt Runner", "Bench Wideout", "Unresolved QB", "Rookie Nobody"}
+    assert leaked == set()
+
+
+def test_rising_opportunity_section_empty_when_no_rising_players(opportunity_table):
+    only_stable = opportunity_table[opportunity_table["Name"].isin(["Starter Control"])]
+    rising = rising_opportunity_section(only_stable)
+    assert rising.empty
+
+
+def test_valid_player_pool_unaffected_when_opportunity_column_absent(table):
+    # Backward compatibility: when opportunity_pool_eligible isn't present
+    # at all (e.g. a caller that never merged opportunity data), behavior
+    # is identical to before this pass.
+    stripped = table.drop(columns=["opportunity_pool_eligible"])
+    pool_stripped = valid_player_pool(stripped)
+    pool_normal = valid_player_pool(table)
+    assert set(pool_stripped["Name"]) == set(pool_normal["Name"])
+
+
+# ---------------------------------------------------------------------------
+# AppTest: opportunity columns/filters/section render safely
+# ---------------------------------------------------------------------------
+def test_page_renders_opportunity_columns_and_filters():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    assert any("Rising Opportunity" in el.value for el in at.subheader)
+
+
+def test_page_opportunity_filter_interactions_do_not_raise():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+
+    at.multiselect(key="ma_opportunity_labels").set_value(["rising_opportunity", "declining_opportunity"])
+    at.run()
+    assert not at.exception
+
+    at.checkbox(key="ma_rising_only").set_value(True)
+    at.run()
+    assert not at.exception
+
+    at.checkbox(key="ma_show_monitor_rising").set_value(True)
+    at.run()
+    assert not at.exception
+
+
+def test_page_rising_opportunity_section_handles_empty_results_safely():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    at.multiselect(key="ma_positions").set_value(["QB"])
+    at.run()
+    at.checkbox(key="ma_rising_only").set_value(True)
+    at.run()
+    assert not at.exception

@@ -1,13 +1,23 @@
 import plotly.express as px
 import streamlit as st
 
-from lib.data import POSITION_COLORS, POSITIONS, data_freshness_caption, load_players_current, load_players_weekly
+from lib.data import (
+    POSITION_COLORS,
+    POSITIONS,
+    data_freshness_caption,
+    load_player_opportunity_reporting,
+    load_players_current,
+    load_players_weekly,
+)
+from lib.opportunity_config import OPPORTUNITY_LABEL_DISPLAY
 from lib.position_explorer import (
     LOW_SAMPLE_GAMES,
     build_csv_export,
     build_display_table,
     early_sample_warning,
+    filter_by_opportunity,
     filter_table,
+    merge_opportunity,
     weekly_receiving_for_player,
     weekly_volume_for_player,
 )
@@ -19,10 +29,13 @@ st.caption(data_freshness_caption())
 
 current = load_players_current()
 weekly = load_players_weekly()
+opportunity = load_player_opportunity_reporting()
 
 if current.empty:
     st.warning("No completed-week data found yet. Run `python dfs_data_pipeline.py` first.")
     st.stop()
+
+current = merge_opportunity(current, opportunity)
 
 
 @st.cache_data(show_spinner=False)
@@ -51,7 +64,25 @@ with filter_col1:
 with filter_col2:
     hide_low_sample = st.checkbox(f"Hide < {LOW_SAMPLE_GAMES} games played", value=False)
 
+opp_col1, opp_col2, opp_col3 = st.columns([2, 1, 1])
+with opp_col1:
+    opportunity_labels = st.multiselect(
+        "Opportunity label", list(OPPORTUNITY_LABEL_DISPLAY.keys()),
+        format_func=lambda v: OPPORTUNITY_LABEL_DISPLAY.get(v, v),
+    )
+with opp_col2:
+    rising_only = st.checkbox("Show rising only", value=False)
+with opp_col3:
+    min_confidence = st.selectbox(
+        "Min sample/confidence", ["Any", "early_sample", "established_sample"],
+        format_func=lambda v: v if v == "Any" else {"early_sample": "Early Sample", "established_sample": "Established Sample"}[v],
+    )
+
 table = filter_table(pos_current, name_filter=name_filter, hide_low_sample=hide_low_sample)
+table = filter_by_opportunity(
+    table, labels=opportunity_labels, rising_only=rising_only,
+    min_confidence=None if min_confidence == "Any" else min_confidence,
+)
 if not hide_low_sample:
     st.caption(f"Players with fewer than {LOW_SAMPLE_GAMES} games played are shown but should be read with caution (small sample).")
 
@@ -96,6 +127,21 @@ st.download_button(
     file_name=f"position_explorer_{position.lower()}.csv",
     mime="text/csv",
 )
+
+with st.expander("Opportunity detail for a player"):
+    detail_options = sorted(table["player_display_name"].unique())
+    if not detail_options:
+        st.caption("No players in the current filter.")
+    else:
+        detail_player = st.selectbox("Player", detail_options, key="opportunity_detail_player")
+        detail_row = table[table["player_display_name"] == detail_player].iloc[0]
+        st.markdown(f"**{OPPORTUNITY_LABEL_DISPLAY.get(detail_row.get('opportunity_label'), '—')}**")
+        st.write(detail_row.get("opportunity_reason") or "No opportunity data available for this player.")
+        if detail_row.get("supporting_metrics"):
+            st.caption(f"Supporting metrics: {detail_row['supporting_metrics']}")
+        st.caption(detail_row.get("latest_2_games_summary") or "")
+        st.caption(detail_row.get("latest_3_games_summary") or "")
+        st.caption(detail_row.get("confidence_reason") or "")
 
 st.divider()
 

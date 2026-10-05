@@ -92,6 +92,17 @@ def load_team_reporting() -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def load_player_opportunity_reporting() -> pd.DataFrame:
+    """In-season Opportunity Model output (pages/1_Position_Explorer.py,
+    pages/5_Matchup_Analyzer.py) - see lib.opportunity_model for the full
+    windowed-workload/classification definitions."""
+    path = os.path.join(DATA_DIR, "player_opportunity_reporting.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data(show_spinner=False)
 def load_players_prior_season_baseline() -> pd.DataFrame:
     path = os.path.join(DATA_DIR, "players_prior_season_baseline.parquet")
     if not os.path.exists(path):

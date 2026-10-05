@@ -774,6 +774,147 @@ other composite ranking - every number on the page traces back to a real,
 named source column. It is decision support, not a lineup generator (see
 the in-page "How to read this page" expander).
 
+## In-Season Opportunity Model (`lib/opportunity_model.py`, `lib/opportunity_config.py`, `data/player_opportunity_reporting.parquet`)
+
+A transparent, configurable workload/role-trend classifier - NOT a Smash
+Score, ownership model, lineup generator, or new projection formula. It
+answers one question: is a player's recent workload rising, stable, or
+declining relative to their own season? Built entirely from
+`players_weekly.parquet`'s real, confirmed columns - no snap count, route
+rate, red-zone work, or any other field the pipeline doesn't actually have.
+
+### Source fields used
+
+`carries`, `targets`, `receptions`, `touches`, `rushing_yards`,
+`receiving_yards`, `receiving_air_yards`, `receiving_yards_after_catch`,
+`target_share`, `air_yards_share`, `attempts` (passing), `passing_yards`,
+`passing_tds`, `fantasy_points_ppr`. All of these were already confirmed
+present in the real nflreadpy source by earlier passes (see Position
+Explorer above) - nothing new was invented for this one.
+
+### Windows - most recent PLAYED games, not calendar weeks
+
+`ENABLED_WINDOWS = [2, 3]` today; `SUPPORTED_WINDOWS = [2, 3, 4, 5]` is the
+full range the column-naming convention (`{metric}_last_{n}_...`) already
+supports - adding 4/5 later is a config change plus a pipeline re-run, not a
+schema redesign, because the windowing function
+(`lib.opportunity_model._window_metrics`) is generic over `n` (it's also how
+"season to date" is computed: the same function called with a sentinel
+window large enough to always return a player's whole history). A bye week
+is simply an absent row - windows use `tail(n)` on the player's actually-
+played rows, never a zero-filled or calendar-offset game, and
+`last_2_games_used`/`last_3_games_used` always say exactly how many played
+games were available (never silently padded to a full window).
+
+### Metrics and deltas
+
+For each window (season, last-2, last-3): totals and per-game rates for
+carries/targets/receptions/touches/rushing yards/receiving yards/total
+yards (rushing+receiving)/receiving air yards/receiving yards after
+catch/fantasy points/passing attempts/passing yards/passing TDs, plus mean
+target share and air-yards share (×100, same "mean across weeks" convention
+established in `dfs_data_pipeline._season_aggregates`). Catch rate, yards
+per target, and yards per reception are computed from **totals**, never an
+average of per-game rates (so a 1-for-1 game and a 0-for-9 game correctly
+average to 1-for-10, not 50%).
+
+Every applicable metric also gets `{metric}_last_2_delta_vs_season` /
+`{metric}_last_3_delta_vs_season` (raw-count difference) or
+`{metric}_last_N_delta_vs_season_pct_points` (for target/air-yards share) -
+all plain subtraction of two already-safe-divided rates, so there's no new
+division and therefore no new way to produce an infinity; null whenever
+either side is null.
+
+### Classification
+
+Position-aware, volume-first (never fantasy points alone):
+
+- **RB**: rising if last-2 touches/game is ≥ **+3.0** vs season, OR
+  carries/game ≥ **+3.0**, OR targets/game ≥ **+2.0** (declining at the
+  mirrored negative thresholds); below **5.0** touches/game with neither
+  signal → `limited_opportunity`.
+- **WR/TE**: rising if last-2 targets/game is ≥ **+2.0** vs season, OR
+  target share ≥ **+5.0** percentage points, OR air-yards share ≥ **+5.0**
+  points (declining mirrored); below **2.0** targets/game → `limited_opportunity`.
+- **QB**: rising if last-2 pass attempts/game is ≥ **+4.0** vs season, OR
+  rush attempts/game ≥ **+2.0** (declining mirrored); below **10.0** pass
+  attempts/game → `limited_opportunity`. Passing yards alone is never a
+  signal - a single big-yardage game on flat volume is explicitly NOT rising.
+- Conflicting signals (e.g. carries up sharply, targets down sharply) ->
+  `stable_opportunity` ("mixed signals"), never an arbitrary pick.
+- Every threshold above lives in `lib/opportunity_config.py`, nowhere else -
+  see that module for the full list plus the "limited opportunity" floors.
+
+### Sample behavior
+
+- Fewer than 2 played games → `insufficient_sample` (no classification at
+  all, no fabricated trend).
+- Exactly 2 played games → classified from those 2 games, but
+  `confidence_label = "early_sample"` - never read with established-sample
+  confidence.
+- Fewer than 3 played games → the last-3 window naturally uses however many
+  games exist (`last_3_games_used` says so explicitly) - this falls out of
+  the same generic `tail(n)` windowing, not a special case.
+- `opportunity_reason`, `supporting_metrics`, `latest_2_games_summary`,
+  `latest_3_games_summary`, `confidence_label`, `confidence_reason` are all
+  explicit, human-readable fields - e.g. "Rising opportunity — 9.0
+  targets/game over last 2 versus 6.3 season average (+2.7), with target
+  share up +6.1 percentage points."
+
+### Role-safety integration - additive only, never an override
+
+`lib.opportunity_model.compute_role_safety_gate` is a SEPARATE function from
+the classification above - it's the only place opportunity data is allowed
+to touch role eligibility, and only additively:
+
+- `inactive` and `role_unresolved` players are NEVER promoted, full stop.
+- `contingent_backup` (Questionable/Doubtful-blocker monitor scenarios) is
+  NEVER promoted either - a rising-opportunity contingent player stays
+  monitor-only until the EXISTING role engine itself promotes them through
+  confirmed blocker absence (see "Depth chart & injury role/eligibility
+  engine" below). This pass adds no new path around that.
+- The ONE narrow promotion this adds: a `bench_no_clear_path` player (role-
+  ineligible for the pool under the existing engine) gains
+  `opportunity_pool_eligible = True` - never `role_eligible_for_pool`
+  itself, which is left completely unchanged - when ALL of: role data is
+  `fresh` (not stale/unresolved), current-season games played ≥
+  `OPPORTUNITY_POOL_PROMOTION_MIN_GAMES` (2), `opportunity_label ==
+  "rising_opportunity"`, and the position's primary last-2 volume metric
+  (touches for RB, targets for WR/TE, pass attempts for QB) is at or above
+  its configured floor (RB 8.0, WR/TE 4.0, QB 20.0) - so a token/garbage-
+  time uptick is never promoted.
+- This promotion is Player-Pool-only - `opportunity_top_value_eligible` is
+  never set True by it. Top-Value promotion has config hooks
+  (`OPPORTUNITY_TOP_VALUE_PROMOTION_ENABLED` = False,
+  plus its own min-games/workload-floor config) for a future pass only.
+
+### UI integration
+
+- **Position Explorer**: every position's table gains an Opportunity
+  column, a compact "Recent 2 vs Season" / "Recent 3 vs Season" column, and
+  a Sample column, plus filters (opportunity label multi-select, "show
+  rising only," minimum confidence/sample) and an "Opportunity detail for a
+  player" expander with the full reason/summary/confidence text.
+- **Matchup Analyzer Expanded**: the main table gains Opportunity, Recent 2
+  vs Season, Recent 3 vs Season, and Opportunity Confidence columns, the
+  same filter set, and a new "Rising Opportunity" section - Valid Player
+  Pool only by default (never monitor-only/inactive/unresolved/excluded), a
+  `bench_no_clear_path` promotion shows "Player Pool Only — Rising
+  Workload," and a separate, clearly-labeled toggle can additionally surface
+  rising contingent players there, tagged "Monitor Injury Status," never
+  merged into the regular pool rows.
+
+### Performance
+
+Computed once in the pipeline (`dfs_data_pipeline.run_pipeline`, which
+imports `build_player_opportunity_reporting` from `lib.opportunity_model` -
+the same precedent as `compute_role_context` living in `lib/eligibility.py`
+rather than inline in the pipeline) and written to
+`data/player_opportunity_reporting.parquet`. Both pages read it through a
+`st.cache_data`-wrapped loader (`lib.data.load_player_opportunity_reporting`)
+and only filter/format it - no rolling/recent aggregation ever re-runs on a
+widget interaction.
+
 ## Player identity & the DK / nflreadpy / ESPN crosswalk
 
 DraftKings' salary CSV, nflreadpy's player stats, nflreadpy's depth charts,
@@ -1179,6 +1320,35 @@ The Matchup Analyzer Expanded page has its own dedicated test file too:
   category sections, and the CSV download buttons, including the genuine
   no-salary-data empty state.
 
+The In-Season Opportunity Model has its own dedicated test file too:
+
+- `tests/test_opportunity_model.py` - last-2/last-3 windowing using actual
+  played games across a bye (not a calendar-week offset), `games_used`
+  reflecting real availability rather than a fabricated full window; safe/
+  null handling for zero/missing denominators and an entirely-absent source
+  column; catch rate / yards-per-target computed from totals (proven
+  distinct from an average-of-game-rates); season-vs-recent deltas; RB,
+  WR/TE, and QB rising/declining/stable/limited scenarios (plus proof QB
+  classification never reads a passing-yards outlier as rising); insufficient-
+  and early-sample behavior; a monkeypatched-config test proving thresholds
+  are read from `lib.opportunity_config`, not hardcoded; schema/no-duplicate-
+  row checks; and the role-safety gate's full rule set (inactive/
+  role_unresolved never promoted, contingent_backup always passes through
+  unchanged and stays monitor-only, the bench_no_clear_path promotion firing
+  only when every gate - freshness, min games, rising label, workload floor -
+  passes, and never crashing on null role fields).
+- `tests/test_position_explorer.py` / `tests/test_matchup_analyzer.py`
+  additions - the opportunity merge/filter helpers (never leaking one
+  player's classification onto another), end-to-end promotion of a
+  `bench_no_clear_path` player with qualifying rising workload into the
+  research Player Pool (and proof a non-rising bench player at the same
+  role is NOT promoted, and a promoted player never appears in Featured/Top
+  Value), a rising contingent player staying monitor-only by default and
+  surfacing only via its own explicit toggle, backward-compatibility when
+  the opportunity column is entirely absent, and `AppTest` coverage of the
+  new columns/filters/"Rising Opportunity" section rendering safely
+  (including with an empty result).
+
 ## Known limitations
 
 - **Early-season small samples.** With 1-2 games played, `consistency_score`
@@ -1282,3 +1452,21 @@ The Matchup Analyzer Expanded page has its own dedicated test file too:
   time; `tests/test_matchup_analyzer.py`'s synthetic role-context fixtures
   independently prove every category (Valid Pool, Featured, Monitor,
   Excluded, Inactive) works correctly once role data resolves.
+- **No live bench_no_clear_path→Player-Pool promotion example in this
+  environment, for the same reason.** Every player being `role_unresolved`
+  means nobody reaches the `bench_no_clear_path` branch the Opportunity
+  Model's promotion gate checks at all during this pass's live validation -
+  `tests/test_matchup_analyzer.py::test_bench_no_clear_path_with_rising_workload_is_promoted_to_pool`
+  (and its sibling "not promoted" tests) exercise the full rule with
+  synthetic role/opportunity fixtures instead, end to end through
+  `build_matchup_analyzer_table`.
+- **Opportunity classification is most informative once the season has 3+
+  games for most players.** Through Week 3/4, `confidence_label` is
+  frequently `early_sample` or `insufficient_sample` (92 of 454 current
+  players in this pass's validation run) - read the label, not just the
+  classification, especially this early.
+- **The Opportunity Model's thresholds are an initial, conservative,
+  explicitly-configured starting point** (see
+  `lib/opportunity_config.py`), not derived from historical backtesting -
+  they're deliberately easy to see and tune in one place as more of the
+  season accumulates.
