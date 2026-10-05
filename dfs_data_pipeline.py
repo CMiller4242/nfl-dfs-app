@@ -59,13 +59,15 @@ MOMENTUM_WEIGHTS = (0.5, 0.3, 0.2)
 # Columns pulled from nflreadpy's player-week stats. `receiving_yards_after_catch`,
 # `target_share`, and `air_yards_share` are used for yac_per_reception /
 # target_share_pct / air_yards_share_pct in players_current when present.
+# `receiving_air_yards` (confirmed present in nflreadpy's real load_player_stats
+# output) feeds total_receiving_air_yards / receiving_air_yards_per_game.
 PLAYER_STAT_COLUMNS = [
     "player_id", "player_name", "player_display_name", "position", "position_group",
     "season", "week", "season_type", "team", "opponent_team",
     "completions", "attempts", "passing_yards", "passing_tds", "passing_interceptions",
     "carries", "rushing_yards", "rushing_tds",
     "receptions", "targets", "receiving_yards", "receiving_tds", "receiving_yards_after_catch",
-    "target_share", "air_yards_share",
+    "receiving_air_yards", "target_share", "air_yards_share",
     "fantasy_points", "fantasy_points_ppr",
 ]
 
@@ -93,21 +95,40 @@ TEAM_STAT_COLUMNS = [
 FANTASY_COLUMNS_TO_ZERO_FILL = [
     "fantasy_points", "fantasy_points_ppr", "targets", "carries", "attempts",
     "receptions", "receiving_yards", "rushing_yards", "receiving_yards_after_catch",
+    "receiving_air_yards",
 ]
 
 PLAYERS_CURRENT_EMPTY_COLUMNS = [
+    # Identity / role
     "player_id", "player_display_name", "position", "team", "last_opponent",
     "season", "latest_game_week", "games_played",
-    "avg_fantasy_points", "total_touches",
-    "total_targets", "total_carries", "total_receptions",
-    "total_passing_yards", "total_rushing_yards", "total_receiving_yards",
-    "total_passing_tds", "total_rushing_tds", "total_receiving_tds",
+    # Fantasy output (season + latest game)
+    "avg_fantasy_points", "total_fantasy_points", "latest_game_fantasy_points",
+    # Volume (totals + per-game)
+    "total_touches", "touches_per_game",
+    "total_targets", "targets_per_game",
+    "total_carries", "carries_per_game",
+    "total_receptions", "receptions_per_game",
+    # Yardage (totals + per-game)
+    "total_rushing_yards", "rushing_yards_per_game",
+    "total_receiving_yards", "receiving_yards_per_game",
+    "total_yards", "total_yards_per_game",
+    "total_receiving_air_yards", "receiving_air_yards_per_game",
+    "total_yac",
+    "total_passing_yards", "total_passing_tds", "total_rushing_tds", "total_receiving_tds",
+    # Efficiency / opportunity
     "completion_pct", "passing_yards_per_attempt",
     "yards_per_target", "yards_per_carry",
     "catch_rate", "yac_per_reception", "target_share_pct", "air_yards_share_pct",
     "yards_per_touch", "points_per_touch", "consistency_score",
+    # Trend / sample context
     "momentum_score", "momentum_games_used",
-    "latest_game_touches", "prior_game_touches", "touches_wow_change", "opportunity_trend",
+    "latest_game_touches", "prior_game_touches", "touches_wow_change",
+    "latest_game_carries", "latest_game_targets", "latest_game_receptions",
+    "latest_game_rushing_yards", "latest_game_receiving_yards", "latest_game_total_yards",
+    "latest_game_target_share_pct", "latest_game_air_yards_share_pct",
+    "carries_wow_change", "targets_wow_change", "receiving_yards_wow_change", "target_share_wow_change",
+    "opportunity_trend",
 ]
 
 PRIOR_SEASON_BASELINE_EMPTY_COLUMNS = [
@@ -422,11 +443,20 @@ def build_players_weekly(raw_player_df, season, latest_completed_week):
 
 def _player_recent_form(group):
     """
-    Momentum + week-over-week touches trend from a player's most recent
-    PLAYED games (bye weeks just aren't rows, so they're skipped naturally).
-    Momentum uses up to the last 3 played games, weighted 50/30/20
-    (most-recent first); with fewer than 3 games the weights actually used
-    are renormalized to sum to 1.0.
+    Momentum + week-over-week trend from a player's most recent PLAYED games
+    (bye weeks just aren't rows, so they're skipped naturally). Momentum uses
+    up to the last 3 played games, weighted 50/30/20 (most-recent first);
+    with fewer than 3 games the weights actually used are renormalized to
+    sum to 1.0.
+
+    Also surfaces the single most recent played game's raw stat line
+    (latest_game_*) and week-over-week deltas (*_wow_change = latest played
+    game minus the one before it, across any bye - null, never zero, with
+    only one played game) for touches, carries, targets, receiving yards,
+    and target share. Optional source columns (carries/targets/receptions/
+    rushing_yards/receiving_yards/target_share/air_yards_share) are guarded
+    so this also works against a minimal weekly frame that only has
+    week/fantasy_points_ppr/touches (as in the momentum-only unit tests).
     """
     g = group.sort_values("week")
     recent = g.tail(3)
@@ -443,12 +473,46 @@ def _player_recent_form(group):
     prior_touches = touches[1] if n >= 2 else None
     touches_wow_change = (latest_touches - prior_touches) if n >= 2 else None
 
+    def _latest_and_wow(col, scale=1):
+        if col not in recent.columns:
+            return None, None
+        values = list(recent[col])[::-1]
+        latest = values[0] * scale if n >= 1 else None
+        wow_change = (values[0] - values[1]) * scale if n >= 2 else None
+        return latest, wow_change
+
+    latest_carries, carries_wow_change = _latest_and_wow("carries")
+    latest_targets, targets_wow_change = _latest_and_wow("targets")
+    latest_receptions, _ = _latest_and_wow("receptions")
+    latest_rushing_yards, _ = _latest_and_wow("rushing_yards")
+    latest_receiving_yards, receiving_yards_wow_change = _latest_and_wow("receiving_yards")
+    latest_fantasy_points = fps[0] if n >= 1 else None
+    latest_target_share_pct, target_share_wow_change = _latest_and_wow("target_share", scale=100)
+    latest_air_yards_share_pct, _ = _latest_and_wow("air_yards_share", scale=100)
+
+    latest_total_yards = None
+    if n >= 1 and latest_rushing_yards is not None and latest_receiving_yards is not None:
+        latest_total_yards = latest_rushing_yards + latest_receiving_yards
+
     return pd.Series({
         "momentum_score": momentum_score,
         "momentum_games_used": n,
         "latest_game_touches": latest_touches,
         "prior_game_touches": prior_touches,
         "touches_wow_change": touches_wow_change,
+        "latest_game_fantasy_points": latest_fantasy_points,
+        "latest_game_carries": latest_carries,
+        "latest_game_targets": latest_targets,
+        "latest_game_receptions": latest_receptions,
+        "latest_game_rushing_yards": latest_rushing_yards,
+        "latest_game_receiving_yards": latest_receiving_yards,
+        "latest_game_total_yards": latest_total_yards,
+        "latest_game_target_share_pct": latest_target_share_pct,
+        "latest_game_air_yards_share_pct": latest_air_yards_share_pct,
+        "carries_wow_change": carries_wow_change,
+        "targets_wow_change": targets_wow_change,
+        "receiving_yards_wow_change": receiving_yards_wow_change,
+        "target_share_wow_change": target_share_wow_change,
     })
 
 
@@ -485,6 +549,7 @@ def _season_aggregates(weekly_df):
     has_yac = "receiving_yards_after_catch" in weekly_df.columns
     has_target_share = "target_share" in weekly_df.columns
     has_air_yards_share = "air_yards_share" in weekly_df.columns
+    has_receiving_air_yards = "receiving_air_yards" in weekly_df.columns
 
     agg_spec = {
         "games_played": ("week", "count"),
@@ -509,6 +574,8 @@ def _season_aggregates(weekly_df):
         agg_spec["mean_target_share"] = ("target_share", "mean")
     if has_air_yards_share:
         agg_spec["mean_air_yards_share"] = ("air_yards_share", "mean")
+    if has_receiving_air_yards:
+        agg_spec["sum_receiving_air_yards"] = ("receiving_air_yards", "sum")
 
     agg = weekly_df.groupby("player_id").agg(**agg_spec).reset_index()
 
@@ -522,6 +589,24 @@ def _season_aggregates(weekly_df):
     agg["total_passing_tds"] = agg["sum_passing_tds"]
     agg["total_rushing_tds"] = agg["sum_rushing_tds"]
     agg["total_receiving_tds"] = agg["sum_receiving_tds"]
+    agg["total_fantasy_points"] = agg["sum_fantasy_points"]
+    agg["total_yards"] = agg["total_rushing_yards"] + agg["total_receiving_yards"]
+    agg["total_yac"] = agg["sum_yac"] if has_yac else pd.NA
+    agg["total_receiving_air_yards"] = agg["sum_receiving_air_yards"] if has_receiving_air_yards else pd.NA
+
+    # Raw totals above are the whole season; these are the same totals
+    # divided by games actually played, so both a "how much have they done"
+    # and a "how much per week" read are always available side by side.
+    agg["touches_per_game"] = safe_divide(agg["total_touches"], agg["games_played"])
+    agg["targets_per_game"] = safe_divide(agg["total_targets"], agg["games_played"])
+    agg["carries_per_game"] = safe_divide(agg["total_carries"], agg["games_played"])
+    agg["receptions_per_game"] = safe_divide(agg["total_receptions"], agg["games_played"])
+    agg["rushing_yards_per_game"] = safe_divide(agg["total_rushing_yards"], agg["games_played"])
+    agg["receiving_yards_per_game"] = safe_divide(agg["total_receiving_yards"], agg["games_played"])
+    agg["total_yards_per_game"] = safe_divide(agg["total_yards"], agg["games_played"])
+    agg["receiving_air_yards_per_game"] = (
+        safe_divide(agg["total_receiving_air_yards"], agg["games_played"]) if has_receiving_air_yards else pd.NA
+    )
 
     agg["yards_per_target"] = safe_divide(agg["sum_receiving_yards"], agg["sum_targets"])
     agg["yards_per_carry"] = safe_divide(agg["sum_rushing_yards"], agg["sum_carries"])
@@ -1082,6 +1167,95 @@ def build_team_reporting(raw_team_df, season, latest_completed_week, reporting_m
     return result
 
 
+def _resolve_role_injury_snapshot(injuries_df, injury_run_metadata, injuries_path, injuries_written_fresh, now=None):
+    """
+    Decide which injury DataFrame + metadata is authoritative for
+    `compute_role_context`, and produce the audit fields describing that
+    decision. This is the single place that reconciles a fresh ESPN fetch
+    against `write_snapshot_with_fallback`'s on-disk fallback decision, so
+    `player_role_context.parquet`, role classifications, freshness fields,
+    and the `injury_metadata.json` audit trail can never disagree about
+    which injury data was actually used.
+
+    Three outcomes, distinguished exactly like `depth_status` already does
+    in `run_role_refresh`:
+      - Fresh fetch succeeded (`injuries_written_fresh` and the fetched data
+        is non-empty): use the freshly fetched DataFrame/metadata as-is.
+        `role_context_source = "fresh_fetch"`.
+      - Fetch failed but a valid preserved snapshot exists on disk
+        (`write_snapshot_with_fallback` returned `injuries_written_fresh =
+        False`, which only happens when a prior valid file was kept): RELOAD
+        that snapshot from disk - never trust the empty in-memory fetch
+        result - and build injury metadata whose `retrieved_at` reflects the
+        PRESERVED snapshot's own real retrieval time (from its
+        `source_retrieved_at` column), never "now". This is what makes
+        `compute_role_context`'s own staleness math (see
+        `INJURY_FRESHNESS_HOURS`) evaluate the data actually being used
+        rather than the failed attempt's timestamp - a stale preserved
+        snapshot still correctly fails closed to `role_unresolved`, exactly
+        as if it had just been fetched stale.
+        `role_context_source = "fallback_snapshot"`.
+      - Fetch failed and no usable snapshot ever existed (`injuries_df` is
+        empty AND `injuries_written_fresh` is True, meaning
+        `write_snapshot_with_fallback` had nothing to fall back to and wrote
+        the empty frame): pass the empty DataFrame through unchanged -
+        `compute_role_context` already fails closed to `role_unresolved` for
+        this case, nothing new needed here.
+        `role_context_source = "unavailable"`.
+
+    Returns `(role_injury_df, role_injury_metadata, audit_fields)` where
+    `audit_fields` is merged into `injury_metadata.json`: `used_fallback_snapshot`,
+    `fallback_snapshot_retrieved_at`, `fallback_snapshot_age_hours`,
+    `fallback_snapshot_is_stale`, `role_context_source`.
+    """
+    from lib.eligibility import _as_aware_utc, _hours_since
+    from lib.role_config import INJURY_FRESHNESS_HOURS
+
+    now = _as_aware_utc(now or datetime.now(timezone.utc))
+    fresh_fetch_ok = injuries_written_fresh and injuries_df is not None and not injuries_df.empty
+
+    if fresh_fetch_ok:
+        audit_fields = {
+            "used_fallback_snapshot": False,
+            "fallback_snapshot_retrieved_at": None,
+            "fallback_snapshot_age_hours": None,
+            "fallback_snapshot_is_stale": None,
+            "role_context_source": "fresh_fetch",
+        }
+        return injuries_df, injury_run_metadata, audit_fields
+
+    if not injuries_written_fresh:
+        preserved_df = pd.read_parquet(injuries_path) if os.path.exists(injuries_path) else pd.DataFrame()
+        preserved_retrieved_at = (
+            preserved_df["source_retrieved_at"].iloc[0]
+            if not preserved_df.empty and "source_retrieved_at" in preserved_df.columns
+            else None
+        )
+        age_hours = _hours_since(preserved_retrieved_at, now) if preserved_retrieved_at is not None else None
+        is_stale = age_hours is None or age_hours > INJURY_FRESHNESS_HOURS
+
+        role_injury_metadata = {**injury_run_metadata, "retrieved_at": preserved_retrieved_at}
+        audit_fields = {
+            "used_fallback_snapshot": True,
+            "fallback_snapshot_retrieved_at": preserved_retrieved_at,
+            "fallback_snapshot_age_hours": age_hours,
+            "fallback_snapshot_is_stale": is_stale,
+            "role_context_source": "fallback_snapshot",
+        }
+        return preserved_df, role_injury_metadata, audit_fields
+
+    # injuries_written_fresh is True but injuries_df is empty: nothing valid
+    # was ever written here before either, so there's no fallback to use.
+    audit_fields = {
+        "used_fallback_snapshot": False,
+        "fallback_snapshot_retrieved_at": None,
+        "fallback_snapshot_age_hours": None,
+        "fallback_snapshot_is_stale": None,
+        "role_context_source": "unavailable",
+    }
+    return injuries_df, injury_run_metadata, audit_fields
+
+
 def run_role_refresh(season, week, data_dir=None):
     """
     Refresh depth-chart + ESPN injury + role/eligibility outputs. Deliberately
@@ -1103,7 +1277,8 @@ def run_role_refresh(season, week, data_dir=None):
 
     data_dir = data_dir or DATA_DIR
     os.makedirs(data_dir, exist_ok=True)
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
 
     raw_depth = load_raw_depth_charts(season)
     depth_df = build_depth_chart_snapshot(raw_depth, season, week)
@@ -1117,14 +1292,23 @@ def run_role_refresh(season, week, data_dir=None):
     for line in override_log:
         print(f"[manual override] {line}")
 
-    role_context_df = compute_role_context(depth_df, injuries_df, injury_run_metadata, overrides_df)
-
     depth_path = os.path.join(data_dir, "depth_charts_current.parquet")
     injuries_path = os.path.join(data_dir, "injuries_current.parquet")
     role_path = os.path.join(data_dir, "player_role_context.parquet")
 
     depth_written_fresh = write_snapshot_with_fallback(depth_df, depth_path, "depth chart")
     injuries_written_fresh = write_snapshot_with_fallback(injuries_df, injuries_path, "ESPN injury")
+
+    # The DataFrame actually written to disk above (fresh fetch, or a
+    # preserved prior snapshot) is what role context MUST be built from -
+    # never the raw in-memory fetch result on its own, which is empty on a
+    # failed fetch even when good data was just preserved to injuries_path.
+    # See _resolve_role_injury_snapshot's docstring for the three outcomes.
+    role_injury_df, role_injury_metadata, injury_fallback_audit = _resolve_role_injury_snapshot(
+        injuries_df, injury_run_metadata, injuries_path, injuries_written_fresh, now=now
+    )
+
+    role_context_df = compute_role_context(depth_df, role_injury_df, role_injury_metadata, overrides_df, now=now)
     role_context_df.to_parquet(role_path, index=False)
 
     if depth_written_fresh and not depth_df.empty:
@@ -1146,7 +1330,19 @@ def run_role_refresh(season, week, data_dir=None):
     with open(os.path.join(data_dir, "depth_chart_metadata.json"), "w") as f:
         json.dump(depth_chart_metadata, f, indent=2)
 
-    injury_metadata = {**injury_run_metadata, "season": season, "week": week, "written_fresh": injuries_written_fresh}
+    # `source_success`/`retrieved_at`/etc. describe the LATEST fetch attempt
+    # exactly as before (unchanged meaning); the new `fallback_snapshot_*`/
+    # `used_fallback_snapshot`/`role_context_source` fields describe what
+    # player_role_context.parquet was actually built from - which can differ
+    # from the latest attempt whenever that attempt failed but a preserved
+    # snapshot was usable. See _resolve_role_injury_snapshot.
+    injury_metadata = {
+        **injury_run_metadata,
+        "season": season,
+        "week": week,
+        "written_fresh": injuries_written_fresh,
+        **injury_fallback_audit,
+    }
     with open(os.path.join(data_dir, "injury_metadata.json"), "w") as f:
         json.dump(injury_metadata, f, indent=2)
 
@@ -1154,8 +1350,15 @@ def run_role_refresh(season, week, data_dir=None):
     print(
         f"ESPN injuries: {injury_run_metadata.get('teams_succeeded')}/"
         f"{injury_run_metadata.get('teams_attempted')} teams succeeded, "
-        f"source_success={injury_run_metadata.get('source_success')}"
+        f"source_success={injury_run_metadata.get('source_success')}, "
+        f"role_context_source={injury_fallback_audit['role_context_source']}"
     )
+    if injury_fallback_audit["used_fallback_snapshot"]:
+        print(
+            f"  Using preserved injury snapshot from {injury_fallback_audit['fallback_snapshot_retrieved_at']} "
+            f"({injury_fallback_audit['fallback_snapshot_age_hours']:.1f}h old, "
+            f"stale={injury_fallback_audit['fallback_snapshot_is_stale']}) for role context."
+        )
     print(f"Role context: {len(role_context_df)} players classified")
     if not role_context_df.empty:
         print(role_context_df["role_classification"].value_counts().to_string())

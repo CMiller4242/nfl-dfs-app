@@ -556,6 +556,224 @@ whether that player is actually startable this week (see the role/eligibility
 engine below), or DK pricing/value. Use it to build research context, not as
 a standalone lineup decision.
 
+## Position Explorer (`data/players_current.parquet`, `pages/1_Position_Explorer.py`)
+
+RB, WR, and TE reporting shows workload/opportunity **before** efficiency -
+raw carries/targets/receptions/yardage sit alongside the rate stats
+(YPC, catch rate, yards/target, etc.) that only make sense once you can see
+the volume behind them. All of this is computed once in the pipeline
+(`dfs_data_pipeline._season_aggregates` / `_player_recent_form`) and only
+filtered/sorted/formatted in the page (`lib/position_explorer.py`, a non-UI
+module so none of it re-runs an aggregation on a widget click). QB reporting
+and the underlying DFS eligibility/role engine, injury/depth-chart logic, DK
+salary loading, Team Trends, Defense vs Position, and player projection
+logic are all unchanged by this - this is additive player-aggregate
+reporting only.
+
+### Source fields (real nflreadpy columns - nothing invented)
+
+Every metric below comes from `nfl.load_player_stats()`'s real columns:
+`carries`, `targets`, `receptions`, `rushing_yards`, `receiving_yards`,
+`receiving_air_yards`, `receiving_yards_after_catch`, `target_share`,
+`air_yards_share`, and `fantasy_points_ppr`. `receiving_air_yards` was
+confirmed present in the live source before use (not assumed) - it can be
+legitimately **negative** for a player whose targets are mostly short
+checkdowns/screens behind the line of scrimmage, which is why it (and
+`air_yards_share_pct`) are never clamped to zero.
+
+### Definitions
+
+All aggregates use completed regular-season games only
+(`season_type == "REG"`, `week <= latest_completed_week`); a bye week is
+simply an absent row, never a zero-filled one.
+
+- **Totals**: `total_carries`, `total_targets`, `total_receptions`,
+  `total_touches` (= carries + targets), `total_rushing_yards`,
+  `total_receiving_yards`, `total_yards` (= rushing + receiving),
+  `total_receiving_air_yards`, `total_yac`, `total_fantasy_points`.
+- **Per-game rates**: every total above also has a `..._per_game` sibling
+  (`carries_per_game`, `targets_per_game`, `receptions_per_game`,
+  `touches_per_game`, `rushing_yards_per_game`, `receiving_yards_per_game`,
+  `total_yards_per_game`, `receiving_air_yards_per_game`) = total /
+  `games_played`. Both the raw total and the per-game rate are always kept -
+  neither replaces the other.
+- **Efficiency** (unchanged from before this pass): `yards_per_carry`,
+  `yards_per_target`, `catch_rate`, `yac_per_reception`, `yards_per_touch`,
+  `points_per_touch`, `target_share_pct`, `air_yards_share_pct` (source
+  `target_share`/`air_yards_share`, averaged across weeks and ×100, same
+  convention as before).
+- **Latest-game context**: `latest_game_fantasy_points`,
+  `latest_game_carries`, `latest_game_targets`, `latest_game_receptions`,
+  `latest_game_rushing_yards`, `latest_game_receiving_yards`,
+  `latest_game_total_yards`, `latest_game_target_share_pct`,
+  `latest_game_air_yards_share_pct` - the single most recent **played**
+  game's raw stat line, not an average.
+- **Week-over-week (WoW) deltas**: `carries_wow_change`,
+  `targets_wow_change`, `receiving_yards_wow_change`,
+  `target_share_wow_change` (percentage points), alongside the existing
+  `touches_wow_change` - latest played game minus the one before it, across
+  any bye. **Null**, never zero, with only one played game.
+- Every division above uses the project's `safe_divide` - a zero/missing
+  denominator is always null, never `inf` or a misleading `0`.
+
+### Exact visible columns per position
+
+QB is unchanged by this pass. RB and WR/TE each show a fixed, exact column
+set/order (identity/role → fantasy output → volume → yardage →
+efficiency/opportunity → trend), defined in `lib/position_explorer.py`'s
+`RB_COLUMNS` / `WR_TE_COLUMNS`:
+
+- **RB**: Player, Team, Last Opponent, Games Played, Season FPPG, Last Game
+  FPPG, Momentum, Carries, Carries/Game, Targets, Receptions, Touches,
+  Touches/Game, Rushing Yards, Receiving Yards, Total Yards, Total
+  Yards/Game, YPC, Yards/Target, Catch Rate, Yards/Touch, Points/Touch,
+  Target Share %, WoW Carries, WoW Targets, WoW Touches, Trend.
+- **WR/TE**: Player, Team, Last Opponent, Games Played, Season FPPG, Last
+  Game FPPG, Momentum, Targets, Targets/Game, Receptions, Receptions/Game,
+  Receiving Yards, Receiving Yards/Game, Air Yards, Air Yards/Game, Target
+  Share %, Air Yards Share %, Catch Rate, Yards/Target, YAC/Reception,
+  Points/Touch, WoW Targets, WoW Receiving Yards, WoW Target Share, Trend.
+
+Raw internal field names (`avg_fantasy_points`, `target_share_pct`, etc.)
+are never shown as column headers - only the human-readable labels above.
+The raw names stay available in the CSV export (see below) for audit.
+
+### Charts
+
+- **RB**: the season Touches-vs-Points-per-Touch scatter is preserved as-is,
+  with a richer hover (carries, targets, rushing/receiving/total yards,
+  season FPPG, touches/game). A new "Weekly Volume" chart shows a selected
+  player's carries/targets/touches by completed week.
+- **WR/TE**: the primary scatter is now Targets/Game (x) vs. Yards/Target
+  (y), bubble size = Receiving Yards/Game, color = Season FPPG, with a full
+  workload/efficiency hover. A new "Weekly Receiving Workload" chart shows a
+  selected player's targets/receptions by week (receiving yards as an
+  overlaid line). Where `air_yards_share_pct` data exists, a Target-Share-
+  vs-Air-Yards-Share scatter is also shown.
+
+### Sample-size handling
+
+The existing "Hide < 3 games played" control and low-sample caption are
+unchanged. New: at 1-2 games played, a dedicated warning calls out that any
+visible players at that sample size have Momentum/Trend reflecting an
+*early, small sample*, not established form (`lib.position_explorer.early_sample_warning`).
+
+### CSV export
+
+Every position's table has a "Download filtered table as CSV" button
+(`lib.position_explorer.build_csv_export`) - it exports exactly the rows
+currently visible (after the name filter / hide-low-sample control) with
+the **raw** field names (audit-friendly, directly cross-referenceable with
+`players_current.parquet`) plus the stable `player_id`.
+
+## Matchup Analyzer Expanded (`lib/matchup_analyzer.py`, `pages/5_Matchup_Analyzer.py`)
+
+The main desktop DFS research workflow: one auditable, sortable, filterable
+table of the current DK slate joining player role, salary, workload, trend,
+team environment, and DvP matchup evidence - all from marts that already
+exist. This page computes **nothing new** - no projection formula, no role
+classification, no DvP number. It reuses, unchanged:
+
+- `lib.dk_helper.match_dk_players` / `compute_projections` - the exact same
+  identity-matching ladder and transparent projection formula as the Lineup
+  Helper page.
+- `lib.dk_helper.match_dk_players_prior_season` - reused only for its
+  identity match, to carry prior-season FPPG alongside current-season FPPG
+  (its own baseline-projection function is not used here).
+- `lib.eligibility.attach_role_context_to_dk_rows` - the exact same role/
+  injury/depth-chart engine, with the exact same fail-closed defaults.
+
+On top of that shared foundation, `lib.matchup_analyzer` adds three more
+left-merges, all keyed on already-resolved identities so a merge that can't
+resolve leaves the new columns **null**, never fabricated, and never borrows
+another player's or team's data:
+
+- **Extra current-season stats** (`_merge_extra_current_stats`): every
+  players_current.parquet workload/yardage/per-game/WoW column NOT already
+  carried by `lib.dk_helper.STAT_COLUMNS_TO_CARRY` (that carry list is
+  deliberately minimal for the Lineup Helper's needs) - keyed on the
+  already-resolved `stat_player_id`.
+- **Team environment** (`_merge_team_reporting`): the player's own team's
+  row from `team_reporting.parquet`, keyed on the DK row's canonicalized
+  team code, prefixed `team_*` so it's never confused with the player's own
+  stats.
+- **Extra DvP fields** (`_merge_defense_extra`): the last-3-games DvP trend,
+  sample size, and league average from `defense_reporting.parquet` that
+  `compute_projections` doesn't already carry, keyed on the same
+  `(opponent, Position)` pair `compute_projections` itself uses.
+
+### Player categories (mutually exclusive by `role_classification`, computed
+entirely by the unmodified role engine - this page only buckets by it)
+
+- **Valid Player Pool** (`valid_player_pool`): confident stats match, valid
+  salary, real projection, `role_eligible_for_pool`, and a resolvable
+  opponent - contingent/conditional players excluded unless the "Include
+  conditional injury replacements" toggle is on (default OFF).
+- **Featured / Top Value** (`featured_top_value`): the above, but
+  `role_eligible_for_top_values` - a strict subset of Valid Player Pool.
+  Never includes a contingent/conditional player, regardless of the toggle.
+- **Plays to Monitor** (`plays_to_monitor`): `contingent_backup` rows -
+  always shown here regardless of the toggle (the toggle only controls
+  whether they *also* appear in Valid Player Pool).
+- **Excluded by Role Context** (`excluded_by_role_context`):
+  `bench_no_clear_path` rows.
+- **Needs Review** (`needs_review_rows`): unions `lib.dk_helper.needs_review`
+  (unmatched/ambiguous stats, no average, no salary) with rows whose stats
+  matched fine but role/injury identity is `role_unresolved`, and with
+  otherwise pool-eligible rows whose opponent/matchup couldn't be resolved
+  (a malformed/missing DK `Game Info`) - each with an exact `needs_review_reason`.
+- **Inactive** (`inactive_players`): `inactive` rows - confirmed unavailable,
+  never in rankings.
+
+Role labels are translated for display (`ROLE_LABEL_DISPLAY`) -
+`confirmed_starter` → "Confirmed Starter", `standard_eligible_rotation` →
+"Eligible Rotation", `injury_elevated_backup` → "Injury-Elevated",
+`contingent_backup` → "Monitor Injury Status", `bench_no_clear_path` → "No
+Clear Opportunity Path", `role_unresolved` → "Role Needs Review" - the raw
+value is never shown as primary UI, only in the CSV export for audit.
+
+### Position-aware filters and columns
+
+Every "Minimum X" research filter (`apply_research_filters`) treats a null
+metric as **not applicable**, never as a failing zero - a QB or RB is never
+excluded by a WR-only "min target share" filter just because that field is
+null for them. The visible column set (`build_display_table`) is also
+position-aware: RB shows Carries/Game, Touches/Game, Total Yards/Game, WoW
+Carries/Targets/Touches; WR/TE shows Targets/Game, Air Yards/Game, Target
+Share %, Air Yards Share %, YAC/Rec, WoW Targets/Target Share; QB shows
+passing volume, rush attempts, and recent trend - never a mix of another
+position's columns.
+
+### Sample-size handling
+
+Reuses the exact same `insufficient_sample` / `limited_sample` /
+`full_sample` vocabulary and thresholds as Team Trends / Defense vs Position
+(`SAMPLE_SIZE_LIMITED_MIN_GAMES` = 3, `SAMPLE_SIZE_FULL_MIN_GAMES` = 6) for
+each player's current-season `games_played`. Players at 2 or fewer games are
+additionally flagged `is_early_sample` - the data-status banner at the top
+of the page surfaces this explicitly (e.g. "current-season rates reflect 2
+completed games... momentum/trend numbers at this sample size are not
+established form") whenever the league-wide latest completed week is below
+that threshold.
+
+### Charts
+
+Three, matching the existing charts-are-evidence-not-a-model convention:
+Salary vs. Projected Value (bubble = projected points, symbol = role,
+inactive/unresolved excluded), Volume vs. Matchup Opportunity (position-
+appropriate volume metric vs. Matchup Index, a horizontal reference line at
+100 = league average), and Team Offensive Momentum vs. opponent positional
+Matchup Index (one point per team+opponent+position actually in the slate).
+Every chart excludes rows with a null value on either axis rather than
+plotting a fabricated zero.
+
+### What this page deliberately does NOT do
+
+No Smash Score, ownership projection, boom/bust model, ceiling model, or any
+other composite ranking - every number on the page traces back to a real,
+named source column. It is decision support, not a lineup generator (see
+the in-page "How to read this page" expander).
+
 ## Player identity & the DK / nflreadpy / ESPN crosswalk
 
 DraftKings' salary CSV, nflreadpy's player stats, nflreadpy's depth charts,
@@ -666,6 +884,33 @@ injury Parquet file (`dfs_data_pipeline.write_snapshot_with_fallback`)
 - `player_role_context.parquet` is the one file always safe to write fresh,
 since it's a pure recomputation of whatever source data (fresh or preserved)
 is currently on disk.
+
+**A failed ESPN fetch reuses the preserved snapshot for role context, not an
+empty one.** `write_snapshot_with_fallback` keeps `injuries_current.parquet`
+on disk untouched when a fetch fails, but `player_role_context.parquet` is
+always recomputed fresh every run - so it must be built from whatever is
+actually ON DISK, never from the empty in-memory result of the failed fetch
+itself. `dfs_data_pipeline._resolve_role_injury_snapshot` is the single place
+that reconciles the two, with three outcomes recorded in
+`injury_metadata.json`:
+
+| `role_context_source` | When | Role classifications |
+|---|---|---|
+| `fresh_fetch` | Latest ESPN fetch succeeded | Built from the fresh data, as normal |
+| `fallback_snapshot` | Fetch failed, a preserved snapshot exists | Built from the preserved snapshot - a starter who was `Out` in that snapshot still elevates their backup, exactly as if the fetch had succeeded |
+| `unavailable` | Fetch failed, no snapshot ever existed | Fails closed to `role_unresolved`, as before |
+
+The preserved snapshot's own real retrieval timestamp (from its
+`source_retrieved_at` column, never "now") feeds the same staleness check
+described above - a fallback that's past `INJURY_FRESHNESS_HOURS` still
+degrades to `role_unresolved` exactly like a stale fresh fetch would, so a
+stale fallback can never grant eligibility on its own. `injury_metadata.json`
+additionally records `used_fallback_snapshot`, `fallback_snapshot_retrieved_at`,
+`fallback_snapshot_age_hours`, and `fallback_snapshot_is_stale` so this is
+auditable without recomputing anything, and the Lineup Helper's freshness
+banner reads these same fields - a failed fetch with a good fallback shows
+*"fresh (fallback, Xh old)"*, not a blanket "unavailable," so one transient
+ESPN outage can never make a previously-usable Player Pool look broken.
 
 **On the Lineup Helper page:** the player pool is split into **Player Pool**
 (eligible plays), **Plays to Monitor** (`contingent_backup` - conditional
@@ -811,6 +1056,15 @@ The role/eligibility engine has its own dedicated test files:
 - `tests/test_manual_overrides.py` - override-file validation (missing
   columns, missing fields, unrecognized/`role_unresolved` status, unparseable
   or expired timestamps, season/week scoping) with a trace line for every row.
+- `tests/test_role_refresh.py` - the ESPN-fetch-fallback reconciliation
+  (`_resolve_role_injury_snapshot`): a successful fetch, a failed fetch with
+  a valid preserved snapshot (role classifications - including an
+  `injury_elevated_backup` - survive unchanged, the on-disk file stays
+  untouched), a failed fetch with no snapshot at all (fails closed), a
+  failed fetch with a stale preserved snapshot (labeled stale, still fails
+  closed, never grants eligibility), and a full `run_role_refresh`
+  integration test proving one failed refresh cannot turn a populated Player
+  Pool into an all-`role_unresolved` one.
 
 The persistent backend salary loading feature has its own dedicated test
 files too:
@@ -885,6 +1139,46 @@ Defense vs Position has its own dedicated test files too:
   exact calculation and its graceful, honest nulling (never a fabricated 0)
   when `def_qb_hits` isn't present in the source.
 
+Position Explorer's workload/yardage enrichment has its own dedicated test
+coverage too:
+
+- `tests/test_pipeline.py` additions - `total_yards`/`total_yards_per_game`,
+  carries/targets/receptions totals and per-game rates, rushing/receiving/
+  air-yards totals and per-game rates, `total_receiving_air_yards` nulling
+  honestly (not zero) when `receiving_air_yards` isn't in the source frame,
+  latest-game context extraction, per-stat week-over-week deltas (carries/
+  targets/receiving yards/target share) and their null-not-zero behavior
+  with only one played game, and that `_player_recent_form` still works
+  against a minimal weekly frame missing the optional stat columns.
+- `tests/test_position_explorer.py` - the non-UI column-set/filter/export
+  module: the exact RB and WR/TE visible column sets (and proof neither
+  leaks the other's columns, nor raw internal field names), QB's column set
+  staying untouched, name/low-sample filtering, the early-sample warning
+  (present at ≤2 games, absent otherwise or on an empty table), CSV export
+  content (raw field names + stable `player_id`), the weekly chart data
+  helpers, and an `AppTest` smoke test of the page across all four
+  positions.
+
+The Matchup Analyzer Expanded page has its own dedicated test file too:
+
+- `tests/test_matchup_analyzer.py` - a deterministic-join test proving
+  identical inputs always produce identical output; no-cross-team/no-cross-
+  position leakage (two same-team players at different positions never swap
+  matchup context); unresolved player and unresolved matchup null-handling;
+  every category bucket (Valid Player Pool, Featured/Top Value, Plays to
+  Monitor, Excluded by Role Context, Needs Review, Inactive), including
+  proof that conditional players are excluded from the pool by default and
+  only included with the toggle on, and that inactive/excluded/needs-review
+  rows never leak into Featured; position-aware filter behavior (a null
+  metric never excludes a QB/RB from a WR-only "minimum X" filter, while a
+  real low value is still legitimately filtered); the extra DvP/team/player
+  merges and their null-safety when a mart is empty or missing columns;
+  early-season sample labels and flags; CSV export field content (audit +
+  visible columns); a fully-empty-marts join that never crashes; and
+  `AppTest` coverage of the page rendering, filter/reset interactions, all
+  category sections, and the CSV download buttons, including the genuine
+  no-salary-data empty state.
+
 ## Known limitations
 
 - **Early-season small samples.** With 1-2 games played, `consistency_score`
@@ -933,18 +1227,20 @@ Defense vs Position has its own dedicated test files too:
 - **Team Trends is a research/trend-signal report, not a projection.** It
   intentionally has no read or write path to player-level projections,
   matchup ratings, or DK salary/eligibility data - see "Trend signals vs.
-  DFS projections" above. It also doesn't build the full "Matchup Analyzer
-  Expanded" report or a composite DFS score from the old Power BI workbook -
-  those are explicitly out of scope for this pass.
+  DFS projections" above. Its output (`team_reporting.parquet`) IS one of
+  the marts joined into the Matchup Analyzer Expanded page's evidence
+  table, but Team Trends itself still computes and writes nothing
+  player-level or DFS-specific.
 - **`recent_form_label`/`wow_change_label` thresholds are a documented
   design choice**, not sourced from the old Power BI report (which had no
   such labels) - see `RECENT_FORM_HEATING_UP_PCT`/`RECENT_FORM_COOLING_OFF_PCT`/
   `WOW_INCREASING_YARDS`/`WOW_DECREASING_YARDS` in `dfs_data_pipeline.py` if
   you want to tune them.
 - **Defense vs Position is also a research/trend-signal report, not a
-  composite score.** It doesn't build the full "Matchup Analyzer Expanded"
-  report from the old Power BI workbook - explicitly out of scope for this
-  pass. `dvp_trend_label`'s thresholds
+  composite score.** Like Team Trends, its output
+  (`defense_reporting.parquet`) is joined into the Matchup Analyzer Expanded
+  page's evidence table, but computes nothing DFS-specific itself.
+  `dvp_trend_label`'s thresholds
   (`DEFENSE_TREND_MORE_FAVORABLE_PCT`/`DEFENSE_TREND_TOUGHER_PCT` in
   `dfs_data_pipeline.py`) are the same kind of documented design choice as
   Team Trends' thresholds above, independently tunable.
@@ -959,3 +1255,30 @@ Defense vs Position has its own dedicated test files too:
   by the pipeline - `build_defense_matchups` no longer exists. If you have a
   stale local copy of the old file from before this change, it's safe to
   delete; nothing in the app reads it anymore.
+- **Prior-season FPPG is null during in-season mode, by existing (unchanged)
+  design.** `players_prior_season_baseline.parquet` is deliberately only
+  populated in `preseason_week_1_baseline` mode (see
+  `dfs_data_pipeline.run_pipeline`) - once the current season has a
+  completed week, it stays empty. The Matchup Analyzer Expanded page's
+  "Prior Season FPPG" / "Delta vs Prior Season" columns correctly show "—"
+  during the season as a result; this pass did not change when that table
+  gets populated, since that's explicitly protected "current season/
+  baseline mode logic."
+- **Committed Week 3 salary slate is a research placeholder, not a real DK
+  export.** No live DraftKings export was available to commit for this
+  pass's validation, so `data/dk_salaries/current.csv` was generated from
+  REAL player names/teams (`players_current.parquet`) and the REAL Week 3
+  schedule (`nflreadpy.load_schedules`), with salaries estimated from each
+  player's real current-season average (`dk_slate_metadata.json`'s
+  `source: "synthetic_research_placeholder"` marks it as such). Replace it
+  with a real export via `python load_dk_salaries.py` for actual slate use
+  - the Matchup Analyzer/Lineup Helper pages work identically either way.
+- **ESPN injury source was unreachable during this pass's validation.** With
+  no fresh injury fetch and a preserved fallback snapshot older than
+  `INJURY_FRESHNESS_HOURS`, every player's `role_classification` correctly
+  fails closed to `role_unresolved` (Needs Review) rather than a guess - see
+  "Depth chart & injury role/eligibility engine." This means the live
+  Player Pool / Featured counts were 0 in this environment at validation
+  time; `tests/test_matchup_analyzer.py`'s synthetic role-context fixtures
+  independently prove every category (Valid Pool, Featured, Monitor,
+  Excluded, Inactive) works correctly once role data resolves.

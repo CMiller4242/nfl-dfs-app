@@ -156,6 +156,79 @@ def test_wow_touches_null_not_zero_with_only_one_game():
     assert pd.isna(result["touches_wow_change"])
 
 
+# ---------------------------------------------------------------------------
+# Latest-game context + per-stat week-over-week deltas
+# ---------------------------------------------------------------------------
+def _full_weekly_rows(player_id, rows):
+    """rows: list of dicts with week, fp, touches, carries, targets, receptions,
+    rushing_yards, receiving_yards, target_share, air_yards_share."""
+    return pd.DataFrame([{"player_id": player_id, **r} for r in rows])
+
+
+def test_latest_game_context_extraction():
+    g = _full_weekly_rows("p1", [
+        {"week": 1, "fantasy_points_ppr": 10, "touches": 8, "carries": 2, "targets": 6,
+         "receptions": 4, "rushing_yards": 8, "receiving_yards": 40,
+         "target_share": 0.15, "air_yards_share": 0.10},
+        {"week": 2, "fantasy_points_ppr": 22, "touches": 14, "carries": 5, "targets": 9,
+         "receptions": 7, "rushing_yards": 20, "receiving_yards": 65,
+         "target_share": 0.28, "air_yards_share": 0.22},
+    ])
+    result = _player_recent_form(g)
+    assert result["latest_game_fantasy_points"] == 22
+    assert result["latest_game_carries"] == 5
+    assert result["latest_game_targets"] == 9
+    assert result["latest_game_receptions"] == 7
+    assert result["latest_game_rushing_yards"] == 20
+    assert result["latest_game_receiving_yards"] == 65
+    assert result["latest_game_total_yards"] == 85
+    assert result["latest_game_target_share_pct"] == pytest.approx(28.0)
+    assert result["latest_game_air_yards_share_pct"] == pytest.approx(22.0)
+
+
+def test_wow_deltas_for_carries_targets_receiving_yards_and_target_share():
+    g = _full_weekly_rows("p1", [
+        {"week": 1, "fantasy_points_ppr": 10, "touches": 8, "carries": 2, "targets": 6,
+         "receptions": 4, "rushing_yards": 8, "receiving_yards": 40,
+         "target_share": 0.15, "air_yards_share": 0.10},
+        {"week": 2, "fantasy_points_ppr": 22, "touches": 14, "carries": 5, "targets": 9,
+         "receptions": 7, "rushing_yards": 20, "receiving_yards": 65,
+         "target_share": 0.28, "air_yards_share": 0.22},
+    ])
+    result = _player_recent_form(g)
+    assert result["carries_wow_change"] == pytest.approx(3)
+    assert result["targets_wow_change"] == pytest.approx(3)
+    assert result["receiving_yards_wow_change"] == pytest.approx(25)
+    assert result["target_share_wow_change"] == pytest.approx(13.0)
+
+
+def test_wow_deltas_null_not_zero_with_only_one_game():
+    g = _full_weekly_rows("p1", [
+        {"week": 1, "fantasy_points_ppr": 10, "touches": 8, "carries": 2, "targets": 6,
+         "receptions": 4, "rushing_yards": 8, "receiving_yards": 40,
+         "target_share": 0.15, "air_yards_share": 0.10},
+    ])
+    result = _player_recent_form(g)
+    assert pd.isna(result["carries_wow_change"])
+    assert pd.isna(result["targets_wow_change"])
+    assert pd.isna(result["receiving_yards_wow_change"])
+    assert pd.isna(result["target_share_wow_change"])
+    # But the latest-game single-game values are still populated.
+    assert result["latest_game_carries"] == 2
+    assert result["latest_game_targets"] == 6
+
+
+def test_player_recent_form_handles_minimal_columns_without_optional_stats():
+    """The original momentum-only fixture (week/fantasy_points_ppr/touches, no
+    carries/targets/receiving stats) must still work - optional fields are
+    guarded, not required."""
+    g = _weekly_rows("p1", [(1, 10, 5), (2, 20, 8)])
+    result = _player_recent_form(g)
+    assert pd.isna(result["latest_game_carries"])
+    assert pd.isna(result["carries_wow_change"])
+    assert pd.isna(result["latest_game_target_share_pct"])
+
+
 @pytest.mark.parametrize("change,expected", [
     (2, "gaining"), (1, "gaining"),
     (0.5, "stable"), (-0.5, "stable"), (0, "stable"),
@@ -169,15 +242,20 @@ def test_classify_opportunity_trend(change, expected):
 # ---------------------------------------------------------------------------
 # build_players_weekly - completed-week filtering + idempotency
 # ---------------------------------------------------------------------------
-def _raw_player_row(week, opponent, fp, targets=5, carries=0, receiving_yards=40):
+def _raw_player_row(
+    week, opponent, fp, targets=5, carries=0, receiving_yards=40, rushing_yards=0,
+    receptions=3, receiving_air_yards=25, target_share=0.2, air_yards_share=0.15,
+    position="WR", player_id="p1",
+):
     return {
-        "player_id": "p1", "player_name": "x", "player_display_name": "Player One",
-        "position": "WR", "position_group": "WR", "season": 2025, "week": week,
+        "player_id": player_id, "player_name": "x", "player_display_name": "Player One",
+        "position": position, "position_group": position, "season": 2025, "week": week,
         "season_type": "REG", "team": "KC", "opponent_team": opponent,
         "completions": 0, "attempts": 0, "passing_yards": 0, "passing_tds": 0, "passing_interceptions": 0,
-        "carries": carries, "rushing_yards": 0, "rushing_tds": 0,
-        "receptions": 3, "targets": targets, "receiving_yards": receiving_yards, "receiving_tds": 0,
-        "receiving_yards_after_catch": 20, "target_share": 0.2, "air_yards_share": 0.15,
+        "carries": carries, "rushing_yards": rushing_yards, "rushing_tds": 0,
+        "receptions": receptions, "targets": targets, "receiving_yards": receiving_yards, "receiving_tds": 0,
+        "receiving_yards_after_catch": 20, "receiving_air_yards": receiving_air_yards,
+        "target_share": target_share, "air_yards_share": air_yards_share,
         "fantasy_points": fp, "fantasy_points_ppr": fp,
     }
 
@@ -239,6 +317,75 @@ def test_build_players_current_empty_input_returns_empty_with_schema():
     current = build_players_current(pd.DataFrame())
     assert current.empty
     assert "avg_fantasy_points" in current.columns
+
+
+# ---------------------------------------------------------------------------
+# Workload/yardage/per-game enrichment (Position Explorer enhancement)
+# ---------------------------------------------------------------------------
+def test_total_yards_and_total_yards_per_game():
+    raw = pd.DataFrame([
+        _raw_player_row(1, "BUF", 10, targets=5, carries=8, receiving_yards=40, rushing_yards=30),
+        _raw_player_row(2, "DEN", 12, targets=7, carries=10, receiving_yards=60, rushing_yards=50),
+    ])
+    weekly = build_players_weekly(raw, 2025, 2)
+    current = build_players_current(weekly)
+    row = current.iloc[0]
+    assert row["total_yards"] == 30 + 40 + 50 + 60
+    assert row["total_yards_per_game"] == pytest.approx((30 + 40 + 50 + 60) / 2)
+
+
+def test_carries_targets_receptions_totals_and_per_game_rates():
+    raw = pd.DataFrame([
+        _raw_player_row(1, "BUF", 10, targets=4, carries=6, receptions=3),
+        _raw_player_row(2, "DEN", 12, targets=8, carries=12, receptions=6),
+    ])
+    weekly = build_players_weekly(raw, 2025, 2)
+    current = build_players_current(weekly)
+    row = current.iloc[0]
+    assert row["total_carries"] == 18
+    assert row["carries_per_game"] == pytest.approx(9.0)
+    assert row["total_targets"] == 12
+    assert row["targets_per_game"] == pytest.approx(6.0)
+    assert row["total_receptions"] == 9
+    assert row["receptions_per_game"] == pytest.approx(4.5)
+    assert row["total_touches"] == 30
+    assert row["touches_per_game"] == pytest.approx(15.0)
+
+
+def test_rushing_receiving_and_air_yards_totals_and_per_game_rates():
+    raw = pd.DataFrame([
+        _raw_player_row(1, "BUF", 10, receiving_yards=40, rushing_yards=10, receiving_air_yards=25),
+        _raw_player_row(2, "DEN", 12, receiving_yards=60, rushing_yards=20, receiving_air_yards=45),
+    ])
+    weekly = build_players_weekly(raw, 2025, 2)
+    current = build_players_current(weekly)
+    row = current.iloc[0]
+    assert row["total_rushing_yards"] == 30
+    assert row["rushing_yards_per_game"] == pytest.approx(15.0)
+    assert row["total_receiving_yards"] == 100
+    assert row["receiving_yards_per_game"] == pytest.approx(50.0)
+    assert row["total_receiving_air_yards"] == 70
+    assert row["receiving_air_yards_per_game"] == pytest.approx(35.0)
+
+
+def test_air_yards_metrics_null_when_source_field_absent():
+    """Do not invent source fields - if a weekly frame genuinely lacks
+    receiving_air_yards, the derived totals must be null, not a fabricated 0."""
+    raw = pd.DataFrame([_raw_player_row(1, "BUF", 10)])
+    weekly = build_players_weekly(raw, 2025, 1).drop(columns=["receiving_air_yards"])
+    current = build_players_current(weekly)
+    row = current.iloc[0]
+    assert pd.isna(row["total_receiving_air_yards"])
+    assert pd.isna(row["receiving_air_yards_per_game"])
+
+
+def test_total_fantasy_points_and_latest_game_fantasy_points():
+    raw = pd.DataFrame([_raw_player_row(1, "BUF", 10), _raw_player_row(2, "DEN", 20)])
+    weekly = build_players_weekly(raw, 2025, 2)
+    current = build_players_current(weekly)
+    row = current.iloc[0]
+    assert row["total_fantasy_points"] == pytest.approx(30)
+    assert row["latest_game_fantasy_points"] == pytest.approx(20)
 
 
 # ---------------------------------------------------------------------------
