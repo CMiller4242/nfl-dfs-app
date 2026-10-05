@@ -1,5 +1,5 @@
 {
-  "retrieved_at": "2026-10-05T15:38:08.076371+00:00",
+  "retrieved_at": "2026-10-05T15:43:40.083231+00:00",
   "source_success": false,
   "teams_attempted": 0,
   "teams_succeeded": 0,
@@ -11,8 +11,8 @@
   "week": 4,
   "written_fresh": false,
   "used_fallback_snapshot": true,
-  "fallback_snapshot_retrieved_at": "2026-08-25T11:24:14.334448+00:00",
-  "fallback_snapshot_age_hours": 988.2312720997223,
-  "fallback_snapshot_is_stale": true,
+  "fallback_snapshot_retrieved_at": "2026-10-04T20:28:48.537167+00:00",
+  "fallback_snapshot_age_hours": 19.24732621472222,
+  "fallback_snapshot_is_stale": false,
   "role_context_source": "fallback_snapshot"
 }
