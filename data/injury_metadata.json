@@ -1,18 +1,13 @@
 {
-  "retrieved_at": "2026-09-24T16:26:46.830796+00:00",
+  "retrieved_at": "2026-10-04T20:28:48.537167+00:00",
   "source_success": true,
   "teams_attempted": 32,
   "teams_succeeded": 32,
   "teams_failed": [],
   "failed_team_abbrevs": [],
   "skipped_player_rows": 0,
-  "player_rows": 2507,
+  "player_rows": 2544,
   "season": 2026,
-  "week": 3,
-  "written_fresh": true,
-  "used_fallback_snapshot": false,
-  "fallback_snapshot_retrieved_at": null,
-  "fallback_snapshot_age_hours": null,
-  "fallback_snapshot_is_stale": null,
-  "role_context_source": "fresh_fetch"
+  "week": 4,
+  "written_fresh": true
 }
