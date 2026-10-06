@@ -1,10 +1,12 @@
 import io
 import os
+from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from lib.cache_fingerprint import reporting_inputs_fingerprint
 from lib.data import (
     POSITIONS,
     load_defense_reporting,
@@ -38,8 +40,13 @@ from lib.matchup_analyzer import (
     team_environment_chart_data,
     valid_player_pool,
     volume_vs_matchup_chart_data,
+    workload_watchlist_section,
 )
-from lib.opportunity_config import OPPORTUNITY_LABEL_DISPLAY, POOL_PROMOTION_DISPLAY_LABEL
+from lib.opportunity_config import (
+    OPPORTUNITY_LABEL_DISPLAY,
+    POOL_PROMOTION_DISPLAY_LABEL,
+    WORKLOAD_WATCHLIST_DISPLAY_LABEL,
+)
 from lib.player_case_summary import (
     CASE_SUMMARY_COLUMNS,
     SIGNAL_ALIGNMENT_VALUES,
@@ -122,6 +129,48 @@ st.caption(
     f"Player-stat source last refreshed: {meta.get('last_updated', 'unknown')}."
 )
 
+# ---------------------------------------------------------------------------
+# Slate rollover / cache invalidation integrity (Issue 4) - the loaded DK
+# slate is checked against what the statistical pipeline considers the
+# intended upcoming slate, never silently assumed to match. An older slate
+# stays fully usable for review; it's just never described as current
+# upcoming-slate research.
+# ---------------------------------------------------------------------------
+_intended_upcoming_week = meta.get("next_slate_week")
+_slate_season, _slate_week_val = slate_meta.get("season"), slate_meta.get("week")
+
+if _slate_week_val is not None and _intended_upcoming_week is not None and _slate_week_val < _intended_upcoming_week:
+    st.warning(
+        f"**Previous slate loaded — not current upcoming-slate research.** The loaded DK salary slate "
+        f"is Week {_slate_week_val}, but the statistical pipeline's intended upcoming slate is Week "
+        f"{_intended_upcoming_week}. This slate is still fully usable for reviewing that past week's "
+        "research, but it is not this week's live research.",
+        icon="⚠️",
+    )
+
+if _slate_season is not None and active_season is not None and _slate_season != active_season:
+    st.warning(
+        f"**Salary slate season mismatch.** The loaded DK salary slate is season {_slate_season}, but "
+        f"the statistical pipeline's active season is {active_season}. Player stats, role context, and "
+        "matchup data below are for a DIFFERENT season than this salary slate - treat this research with "
+        "caution until the matching season's data or slate is loaded.",
+        icon="🚨",
+    )
+
+_missing_sources = []
+if load_players_current().empty:
+    _missing_sources.append("current-season player stats")
+if load_defense_reporting().empty:
+    _missing_sources.append("defense vs. position reporting")
+if load_player_role_context().empty:
+    _missing_sources.append("role/eligibility context")
+if _missing_sources:
+    st.warning(
+        f"**Required data source(s) unavailable:** {', '.join(_missing_sources)}. Affected rows will show "
+        "null/'—' values rather than a guessed one - see Needs Review for anything this blocks.",
+        icon="⚠️",
+    )
+
 games_played_for_warning = load_players_current()
 current_season_games = int(games_played_for_warning["games_played"].max()) if not games_played_for_warning.empty else 0
 if 0 < current_season_games < SAMPLE_SIZE_LIMITED_MIN_GAMES:
@@ -169,7 +218,17 @@ st.divider()
 
 
 @st.cache_data(show_spinner="Building matchup research table...")
-def _build_table(file_bytes: bytes) -> pd.DataFrame:
+def _build_table(file_bytes: bytes, inputs_fingerprint: str) -> pd.DataFrame:
+    """
+    `inputs_fingerprint` (lib.cache_fingerprint.reporting_inputs_fingerprint)
+    is an explicit, hashed cache argument covering every parquet/json file
+    this function reads besides `file_bytes` itself (players_current,
+    prior-season baseline, defense_reporting, team_reporting,
+    player_role_context, player_opportunity_reporting, dk_slate_metadata,
+    metadata, and the role-safety/signal-alignment config modules) - see
+    that module's docstring for why a no-argument cached function reading
+    these internally would never notice a changed file on disk.
+    """
     dk = pd.read_csv(io.BytesIO(file_bytes))
     matchup_table = build_matchup_analyzer_table(
         dk,
@@ -185,10 +244,33 @@ def _build_table(file_bytes: bytes) -> pd.DataFrame:
     # lib.player_case_summary's module docstring). Computed once here,
     # cached alongside the rest of the table - never recomputed per widget
     # interaction.
-    return build_case_summary(matchup_table)
+    cased = build_case_summary(matchup_table)
+
+    # Temporal integrity (Issue 5): stamped INSIDE the cached function, so
+    # `analysis_generated_at_utc` genuinely reflects when this result was
+    # last (re)computed - not just the current page render time - and the
+    # other two fields record exactly what stats/slate week it was computed
+    # against. Never presented as a preserved pre-lock snapshot - see the
+    # "How to read this page" explainer below.
+    cased["stats_through_week"] = load_metadata().get("latest_completed_week")
+    cased["slate_week"] = load_dk_slate_metadata().get("week")
+    cased["analysis_generated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    return cased
 
 
-table = _build_table(file_bytes)
+table = _build_table(file_bytes, reporting_inputs_fingerprint())
+
+_analysis_generated_at = table["analysis_generated_at_utc"].iloc[0] if not table.empty else None
+try:
+    _analysis_generated_display = pd.to_datetime(_analysis_generated_at, utc=True).strftime("%b %d, %Y %I:%M %p UTC")
+except (ValueError, TypeError):
+    _analysis_generated_display = str(_analysis_generated_at) if _analysis_generated_at else "unknown"
+st.caption(
+    f"**Recomputed analysis — not a preserved pre-lock evaluation.** This research table was generated "
+    f"{_analysis_generated_display}, from stats through Week {table['stats_through_week'].iloc[0] if not table.empty else '—'} "
+    f"against Week {table['slate_week'].iloc[0] if not table.empty else '—'} salaries. There is no frozen "
+    "pre-lock snapshot in this app - every view reflects current data recomputed on demand."
+)
 
 # ---------------------------------------------------------------------------
 # Controls (item 7)
@@ -423,7 +505,7 @@ else:
     pool_csv = build_csv_export(filtered).reset_index(drop=True)
     case_cols = [c for c in CASE_SUMMARY_COLUMNS if c in filtered.columns]
     case_extra = filtered[case_cols].reset_index(drop=True).copy()
-    for col in ("positives", "concerns"):
+    for col in ("positives", "concerns", "missing_evidence", "sample_warnings", "alignment_trigger_codes"):
         if col in case_extra.columns:
             case_extra[col] = case_extra[col].apply(positives_text)
     pool_csv = pd.concat([pool_csv, case_extra], axis=1)
@@ -506,6 +588,40 @@ else:
 st.divider()
 
 # ---------------------------------------------------------------------------
+# Workload Watchlist / Role Review (Issue 2 hardening) - RESEARCH VISIBILITY
+# ONLY. Bench/no-clear-path players whose recent workload is rising are
+# never Player Pool eligible or Top Value approved from workload alone -
+# see lib.opportunity_config's "Workload Watchlist / Role Review policy."
+# ---------------------------------------------------------------------------
+st.subheader("🔬 Workload Watchlist / Role Review")
+st.caption(
+    "Bench players excluded by role context (no confirmed injury path ahead of them) whose recent "
+    "workload is rising. This is RESEARCH VISIBILITY ONLY - never Player Pool eligibility or Top "
+    "Value approval. A workload signal alone never overrides the role engine's own "
+    "bench_no_clear_path finding."
+)
+watchlist = workload_watchlist_section(filtered)
+if watchlist.empty:
+    st.caption("No bench/no-clear-path players with a rising-workload watchlist signal in the current filter.")
+else:
+    watchlist_display = watchlist.copy()
+    watchlist_display["Status"] = WORKLOAD_WATCHLIST_DISPLAY_LABEL
+    cols = ["Name", "Position", "TeamAbbrev", "opponent", "Salary", "role_display", "Status",
+            "workload_watchlist_reason", "recent_2_vs_season_display", "eligibility_reason"]
+    watchlist_renamed = watchlist_display[cols].rename(columns={
+        "Name": "Player", "TeamAbbrev": "Team", "opponent": "Opponent", "Salary": "Salary",
+        "role_display": "Role", "workload_watchlist_reason": "Workload Watchlist Reason",
+        "recent_2_vs_season_display": "Recent 2 vs Season", "eligibility_reason": "Role Context",
+    })
+    st.dataframe(watchlist_renamed, width="stretch", hide_index=True)
+    st.download_button(
+        "Download Workload Watchlist as CSV", watchlist_renamed.to_csv(index=False).encode("utf-8"),
+        file_name="matchup_analyzer_workload_watchlist.csv", mime="text/csv",
+    )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
 # Mixed Signals / Review (Player Case Summary) - Valid Player Pool only by
 # default, same role-safety gate as Rising Opportunity above.
 # ---------------------------------------------------------------------------
@@ -560,7 +676,10 @@ else:
         st.markdown(f"- **Salary/projection/value:** {detail['salary_context']}")
         st.markdown(f"- **Matchup evidence:** {detail['matchup_context']}")
         st.markdown(f"- **Team environment evidence:** {detail['team_context']}")
+        st.markdown(f"- **Missing evidence (for the next-higher tier):** {detail['missing_evidence']}")
+        st.markdown(f"- **Sample-size warnings:** {detail['sample_warnings']}")
         st.markdown(f"- **Data quality notes:** {detail['data_quality_notes']}")
+        st.caption(detail["classification_reason"])
         st.caption(detail["recommendation_context"])
 
 st.divider()
@@ -726,5 +845,13 @@ with st.expander("How to read this page"):
 - This page is decision support, not a lineup generator - it surfaces evidence (role, volume,
   matchup, team environment, opportunity, and the case-summary layer above) so you can apply your
   own judgment. It never computes a composite score, ownership projection, or ceiling/boom-bust model.
+- **Recomputed analysis, not a preserved pre-lock evaluation**: this app keeps no frozen snapshot of
+  a player's case from before a slate locked. Every case summary is recomputed from CURRENT data each
+  time the underlying inputs change (see `analysis_generated_at_utc`/`stats_through_week`/`slate_week`
+  in the CSV exports) - never presented as "what the app said before this slate locked."
+- **Workload Watchlist / Role Review** surfaces bench/no-clear-path players with a rising recent
+  workload for RESEARCH VISIBILITY ONLY - it is never Player Pool eligibility or Top Value approval.
+  A workload signal alone can never override the role engine's own bench_no_clear_path/inactive/
+  role_unresolved/contingent_backup findings.
         """
     )

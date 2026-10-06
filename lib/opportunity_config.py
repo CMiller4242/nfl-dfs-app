@@ -75,23 +75,35 @@ WR_TE_LIMITED_OPPORTUNITY_TARGETS_FLOOR = 2.0
 QB_LIMITED_OPPORTUNITY_ATTEMPTS_FLOOR = 10.0
 
 # ---------------------------------------------------------------------------
-# Player Pool promotion policy (role-eligibility integration).
+# Workload Watchlist / Role Review policy (role-eligibility integration).
 #
-# This is the ONLY override the opportunity model is allowed to make on top
-# of the existing (unmodified) role engine: a player whose role_classification
-# is SPECIFICALLY "bench_no_clear_path" - and only that classification;
-# inactive, role_unresolved, and contingent_backup are never touched by this
-# - may gain `opportunity_pool_eligible = True` for the RESEARCH Player Pool
-# view (never `role_eligible_for_pool` itself, which is left completely
-# unchanged) when ALL of the following hold:
-#   - role_data_freshness == "fresh" (role data is resolved, not stale)
-#   - current-season games_played >= OPPORTUNITY_POOL_PROMOTION_MIN_GAMES
-#   - opportunity_label == "rising_opportunity"
-#   - the position's primary volume metric (last-2 games, per game) is at
-#     or above its configured floor, so a token/garbage-time uptick is
-#     never promoted
-# See lib.opportunity_model.compute_role_safety_gate for the exact logic.
+# Hardening note (Reporting Integrity pass): a prior version of this policy
+# let a "bench_no_clear_path" player's rising workload promote them into
+# `opportunity_pool_eligible = True` - i.e. into the Valid Player Pool - by
+# default. That violated the standing rule that a workload signal ALONE must
+# never override bench_no_clear_path (no confirmed injury path ahead of
+# them opened up): the role engine's own "no clear path" finding is role
+# SAFETY, not a soft default to be out-voted by volume. It has been fixed:
+# by default (OPPORTUNITY_POOL_PROMOTION_ENABLED = False below),
+# bench_no_clear_path can NEVER gain `opportunity_pool_eligible` or
+# `role_eligible_for_top_values` from workload alone, regardless of how
+# large the workload gets. The gates below (min games, rising label,
+# workload floor) now control a SEPARATE, strictly research-only signal -
+# `workload_watchlist_eligible` / `workload_watchlist_reason` /
+# `role_review_required` - surfaced in a clearly labeled "Workload
+# Watchlist / Role Review" section, never merged into the Player Pool or
+# Top Value views. See lib.opportunity_model.compute_role_safety_gate.
+#
+# OPPORTUNITY_POOL_PROMOTION_ENABLED is a disabled-by-default HOOK for a
+# future, explicitly-approved exception (same pattern as
+# OPPORTUNITY_TOP_VALUE_PROMOTION_ENABLED below): flipping it to True would
+# let a player who clears every Workload Watchlist gate ALSO gain
+# `opportunity_pool_eligible = True` (Player Pool only, never Top Value).
+# Leave it False unless a human has explicitly decided that exception
+# should ship - it must never be enabled implicitly by this pass or any
+# future automated change.
 # ---------------------------------------------------------------------------
+OPPORTUNITY_POOL_PROMOTION_ENABLED = False
 OPPORTUNITY_POOL_PROMOTION_MIN_GAMES = 2
 OPPORTUNITY_POOL_PROMOTION_WORKLOAD_FLOOR = {
     "RB": 8.0,   # touches/game, last 2
@@ -128,3 +140,4 @@ CONFIDENCE_LABEL_DISPLAY = {
     "insufficient_sample": "Insufficient Sample",
 }
 POOL_PROMOTION_DISPLAY_LABEL = "Player Pool Only — Rising Workload"
+WORKLOAD_WATCHLIST_DISPLAY_LABEL = "Workload Watchlist — Role Review (Not Pool-Eligible)"

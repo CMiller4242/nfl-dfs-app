@@ -16,6 +16,7 @@ def _dr_row(defense_team, position, games=5, points_allowed=15.0, league_avg=15.
             trend_label="stable"):
     return {
         "defense_team": defense_team, "position": position, "games_in_sample": games,
+        "player_game_row_count": games, "defensive_games_played": games,
         "fantasy_points_allowed_per_game": points_allowed,
         "league_avg_points_allowed_for_position": league_avg,
         "matchup_index": points_allowed / league_avg * 100 if league_avg else None,

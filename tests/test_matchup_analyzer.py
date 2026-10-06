@@ -22,6 +22,7 @@ from lib.matchup_analyzer import (
     summary_counts,
     valid_player_pool,
     volume_vs_matchup_chart_data,
+    workload_watchlist_section,
 )
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -564,6 +565,53 @@ def test_page_no_salary_data_shows_info_and_stops(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Issue 4 (slate rollover) / Issue 5 (temporal integrity) AppTest coverage
+# ---------------------------------------------------------------------------
+def test_page_shows_recomputed_analysis_disclaimer_not_a_pre_lock_snapshot():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    assert any("Recomputed analysis" in el.value for el in at.caption)
+    assert any("not a preserved pre-lock evaluation" in el.value for el in at.caption)
+
+
+def test_page_old_slate_warning_renders_without_crashing(monkeypatch):
+    import lib.data as data_module
+
+    real_metadata = data_module.load_metadata()
+    real_slate_meta = data_module.load_dk_slate_metadata()
+
+    def _fake_metadata():
+        out = dict(real_metadata)
+        out["next_slate_week"] = (real_slate_meta.get("week") or 0) + 1
+        return out
+
+    monkeypatch.setattr(data_module, "load_metadata", _fake_metadata)
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    assert any("Previous slate loaded" in el.value for el in at.warning)
+    assert any("not current upcoming-slate research" in el.value for el in at.warning)
+
+
+def test_page_season_mismatch_warning_renders_without_crashing(monkeypatch):
+    import lib.data as data_module
+
+    real_metadata = data_module.load_metadata()
+
+    def _fake_metadata():
+        out = dict(real_metadata)
+        out["active_season"] = (out.get("active_season") or out.get("season") or 2025) + 1
+        return out
+
+    monkeypatch.setattr(data_module, "load_metadata", _fake_metadata)
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    assert any("Salary slate season mismatch" in el.value for el in at.warning)
+
+
+# ---------------------------------------------------------------------------
 # Opportunity Model integration (In-Season Opportunity Model pass)
 # ---------------------------------------------------------------------------
 def _opportunity_row(player_id, opportunity_label="rising_opportunity", targets_last_2_per_game=6.0,
@@ -642,14 +690,36 @@ def test_opportunity_fields_merge_correctly(opportunity_table):
     assert "+" in row["recent_2_vs_season_display"] or "targets/g" in row["recent_2_vs_season_display"]
 
 
-def test_bench_no_clear_path_with_rising_workload_is_promoted_to_pool(opportunity_table):
-    promoted = opportunity_table[opportunity_table["Name"] == "Promotable Bench"].iloc[0]
-    assert promoted["opportunity_pool_eligible"] == True  # noqa: E712
-    assert promoted["opportunity_top_value_eligible"] == False  # noqa: E712
-    assert promoted["is_pool_only_rising_promotion"] == True  # noqa: E712
+def test_bench_no_clear_path_with_rising_workload_is_never_promoted_to_pool(opportunity_table):
+    # Role-safety hardening (the "Jared Wayne" scenario): a workload signal
+    # alone must NEVER promote bench_no_clear_path into the Valid Player
+    # Pool, however much that workload has risen.
+    not_promoted = opportunity_table[opportunity_table["Name"] == "Promotable Bench"].iloc[0]
+    assert not_promoted["opportunity_pool_eligible"] == False  # noqa: E712
+    assert not_promoted["opportunity_top_value_eligible"] == False  # noqa: E712
+    assert not_promoted["is_pool_only_rising_promotion"] == False  # noqa: E712
+    assert not_promoted["role_classification"] == "bench_no_clear_path"
+    assert not_promoted["role_eligible_for_pool"] == False  # noqa: E712
 
     pool = valid_player_pool(opportunity_table)
-    assert "Promotable Bench" in set(pool["Name"])
+    assert "Promotable Bench" not in set(pool["Name"])
+    excluded = excluded_by_role_context(opportunity_table)
+    assert "Promotable Bench" in set(excluded["Name"])
+
+
+def test_bench_no_clear_path_rising_workload_appears_only_in_watchlist(opportunity_table):
+    # Research visibility only - never Player Pool/Top Value, and never a
+    # contradictory "role-excluded but also pool-eligible" state.
+    watchlisted = workload_watchlist_section(opportunity_table)
+    assert "Promotable Bench" in set(watchlisted["Name"])
+    row = watchlisted[watchlisted["Name"] == "Promotable Bench"].iloc[0]
+    assert row["workload_watchlist_eligible"] == True  # noqa: E712
+    assert row["role_review_required"] == True  # noqa: E712
+    assert row["role_classification"] == "bench_no_clear_path"
+    assert row["opportunity_pool_eligible"] == False  # noqa: E712
+
+    pool = valid_player_pool(opportunity_table)
+    assert "Promotable Bench" not in set(pool["Name"])
 
 
 def test_bench_no_clear_path_with_stable_opportunity_is_not_promoted(opportunity_table):
@@ -658,6 +728,8 @@ def test_bench_no_clear_path_with_stable_opportunity_is_not_promoted(opportunity
 
     pool = valid_player_pool(opportunity_table)
     assert "Non Rising Bench" not in set(pool["Name"])
+    watchlisted = workload_watchlist_section(opportunity_table)
+    assert "Non Rising Bench" not in set(watchlisted["Name"])
 
 
 def test_promoted_player_never_appears_in_featured_top_value(opportunity_table):

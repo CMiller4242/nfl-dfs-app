@@ -74,8 +74,9 @@ elif reporting_mode == "no_current_season_data":
 
 if (defense_reporting["sample_size_label"] == "insufficient_sample").any() and reporting_mode == "in_season":
     st.caption(
-        "Some defense/position combinations have fewer than 3 games in sample - their recent "
-        "trend reads \"Insufficient Sample\" rather than a real direction. See the toggle below."
+        "Some defense/position combinations have fewer than 3 distinct DEFENSIVE GAMES played "
+        "against that position - their recent trend reads \"Insufficient Sample\" rather than a "
+        "real direction. See the toggle below."
     )
 
 st.divider()
@@ -102,8 +103,8 @@ team_col, min_games_col, toggle_col = st.columns([2, 1, 1.6])
 with team_col:
     team_filter = st.multiselect("Teams (blank = all)", all_teams, default=[])
 with min_games_col:
-    max_games = int(defense_reporting["games_in_sample"].max())
-    min_games = st.number_input("Min games in sample", min_value=0, max_value=max_games, value=0, step=1)
+    max_games = int(defense_reporting["defensive_games_played"].max())
+    min_games = st.number_input("Min defensive games", min_value=0, max_value=max_games, value=0, step=1)
 with toggle_col:
     show_insufficient = st.checkbox("Show insufficient-sample rows", value=True)
 
@@ -130,7 +131,7 @@ st.caption(
 
 percentile_matrix = pivot_matrix(filtered_all_positions, "position_percentile_most_favorable")
 value_matrix = pivot_matrix(filtered_all_positions, MATRIX_VIEWS[matrix_view])
-games_matrix = pivot_matrix(filtered_all_positions, "games_in_sample")
+games_matrix = pivot_matrix(filtered_all_positions, "defensive_games_played")
 
 if percentile_matrix.empty:
     st.info("No defenses match the current filters.")
@@ -148,7 +149,7 @@ else:
             customdata=games_matrix.reindex_like(percentile_matrix).values,
             hovertemplate=(
                 "Defense: %{y}<br>Position: %{x}<br>" + matrix_view + ": %{text}<br>"
-                "Percentile: %{z:.0f}<br>Games in sample: %{customdata}<extra></extra>"
+                "Percentile: %{z:.0f}<br>Defensive games: %{customdata}<extra></extra>"
             ),
             colorscale="RdYlGn",
             showscale=False,
@@ -210,7 +211,7 @@ else:
         color_continuous_scale="RdYlGn",
         range_color=(0, 100),
         labels={"fantasy_points_allowed_per_game": "Avg Fantasy Points Allowed (PPR)", "defense_team": "Defense"},
-        hover_data={"games_in_sample": True, "matchup_index": ":.1f", "dvp_trend_label": True},
+        hover_data={"defensive_games_played": True, "player_game_row_count": True, "matchup_index": ":.1f", "dvp_trend_label": True},
     )
     bar.add_vline(x=league_avg, line_dash="dash", line_color="gray", annotation_text="League avg")
     bar.update_layout(height=max(500, 24 * len(bar_source)), coloraxis_showscale=False, yaxis=dict(categoryorder="total ascending"))
@@ -249,11 +250,15 @@ st.divider()
 with st.expander("How Defense vs Position is calculated"):
     st.markdown(
         """
-**Season DvP** (completed regular-season games only): `fantasy_points_allowed_per_game` is the
-average fantasy points (PPR) a defense has allowed to a position, across every completed
-player-game - exactly the original Power BI DAX's `AVERAGE(fantasy_points_ppr)` semantics,
-including that a week where a defense faced two players at the same position counts both
-games (`games_in_sample` is a raw game count for the same reason).
+**Season DvP**: `fantasy_points_allowed_per_game` is the **average PPR fantasy points per
+opposing player appearance** - every completed player-row averaged directly, exactly the
+original Power BI DAX's `AVERAGE(fantasy_points_ppr)` semantics. It is NOT a sum of positional
+fantasy points allowed per defensive game: a week where a defense faced two players at the same
+position contributes **two appearances** to this average, not two defensive games.
+`player_game_row_count` is that raw appearance count; `defensive_games_played` is the real,
+distinct count of defensive games/weeks this defense has played against this position, and is
+what the sample-size label, confidence, and the "Min defensive games" filter above all use.
+`defensive_games_played` is always <= `player_game_row_count`.
 
 `matchup_index = fantasy_points_allowed_per_game / league_avg_points_allowed_for_position * 100`
 and `matchup_delta = fantasy_points_allowed_per_game - league_avg_points_allowed_for_position`.
@@ -262,11 +267,14 @@ and `matchup_delta = fantasy_points_allowed_per_game - league_avg_points_allowed
 **within each position separately** - never a shared/global scale.
 
 **Recent DvP** uses each defense's last 3 PLAYED weeks against a position - bye weeks are
-skipped, not treated as zero. `dvp_recent_trend_delta` (last-3 vs season) needs at least 2
-games to be a real number; `dvp_trend_label` needs the full 3-game window before it will name a
-direction (`becoming_more_favorable` / `stable` / `becoming_tougher`), otherwise it reads
-"Insufficient Sample" even if the raw number already exists at 2 games - a low-sample trend is
-never labeled with the same confidence as a mature one.
+skipped, not treated as zero. Unlike season DvP, this is computed from a table that's already
+one row per week, so it weights every WEEK equally rather than every player appearance - the
+two numbers are not computed the same way, and a trend comparison between them (below) reflects
+that difference, not just a difference in window length. `dvp_recent_trend_delta` (last-3 vs
+season) needs at least 2 games to be a real number; `dvp_trend_label` needs the full 3-game
+window before it will name a direction (`becoming_more_favorable` / `stable` /
+`becoming_tougher`), otherwise it reads "Insufficient Sample" even if the raw number already
+exists at 2 games - a low-sample trend is never labeled with the same confidence as a mature one.
 
 **Week 1 Baseline Mode**: before the active season has any completed games, season DvP here
 comes from the prior season's full regular season; recent-DvP fields are unavailable and shown

@@ -52,8 +52,9 @@ MATRIX_VIEWS = {
 
 DETAIL_TABLE_COLUMNS = [
     ("defense_team", "Defense"),
-    ("games_in_sample", "Games"),
-    ("fantasy_points_allowed_per_game", "Pts Allowed"),
+    ("defensive_games_played", "Defensive Games"),
+    ("player_game_row_count", "Opposing Player Appearances"),
+    ("fantasy_points_allowed_per_game", "Avg PPR / Opposing Player Appearance"),
     ("league_avg_points_allowed_for_position", "League Avg"),
     ("matchup_index", "Matchup Index"),
     ("matchup_delta", "Matchup Delta"),
@@ -76,7 +77,7 @@ def filter_defense_reporting(df: pd.DataFrame, positions=None, teams=None, min_g
     if teams:
         out = out[out["defense_team"].isin(teams)]
     if min_games:
-        out = out[out["games_in_sample"] >= min_games]
+        out = out[out["defensive_games_played"] >= min_games]
     if not include_insufficient_sample:
         out = out[out["sample_size_label"] != "insufficient_sample"]
     return out.reset_index(drop=True)
@@ -127,6 +128,8 @@ def _fmt(value, decimals=1, signed=False, suffix=""):
 
 
 NUMERIC_FORMAT_SPEC = {
+    "defensive_games_played": (0, False, ""),
+    "player_game_row_count": (0, False, ""),
     "fantasy_points_allowed_per_game": (2, False, ""),
     "league_avg_points_allowed_for_position": (2, False, ""),
     "matchup_index": (1, False, ""),

@@ -149,3 +149,41 @@ def test_no_salary_data_at_all_produces_useful_empty_state(isolated_salary_files
     assert not at.exception
     assert any("No salary data available" in el.value for el in at.info)
     assert any("load_dk_salaries.py" in el.value for el in at.info)
+
+
+# ---------------------------------------------------------------------------
+# Issue 4 (slate rollover) warnings - real committed slate, metadata patched
+# ---------------------------------------------------------------------------
+def test_old_slate_warning_renders_without_crashing(monkeypatch):
+    import lib.data as data_module
+
+    real_metadata = data_module.load_metadata()
+    real_slate_meta = data_module.load_dk_slate_metadata()
+
+    def _fake_metadata():
+        out = dict(real_metadata)
+        out["next_slate_week"] = (real_slate_meta.get("week") or 0) + 1
+        return out
+
+    monkeypatch.setattr(data_module, "load_metadata", _fake_metadata)
+    at = AppTest.from_file(PAGE_PATH, default_timeout=60)
+    at.run()
+    assert not at.exception
+    assert any("Previous slate loaded" in el.value for el in at.warning)
+
+
+def test_season_mismatch_warning_renders_without_crashing(monkeypatch):
+    import lib.data as data_module
+
+    real_metadata = data_module.load_metadata()
+
+    def _fake_metadata():
+        out = dict(real_metadata)
+        out["active_season"] = (out.get("active_season") or out.get("season") or 2025) + 1
+        return out
+
+    monkeypatch.setattr(data_module, "load_metadata", _fake_metadata)
+    at = AppTest.from_file(PAGE_PATH, default_timeout=60)
+    at.run()
+    assert not at.exception
+    assert any("Salary slate season mismatch" in el.value for el in at.warning)

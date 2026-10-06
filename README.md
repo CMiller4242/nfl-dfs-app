@@ -349,9 +349,31 @@ matchup_delta =
 
 This exactly preserves the original Power BI DAX's `AVERAGE(PlayerStats[fantasy_points_ppr])`
 semantics - a week where a defense faced 2 WRs contributes 2 rows to that
-average, so `games_in_sample` is a **raw row count**, not a distinct-week
-count (kept deliberately, per the original report's own behavior - see
-"How byes are handled" below for where this differs for recent-DvP).
+average, so `games_in_sample` (kept, unchanged, for backward compatibility)
+/ `player_game_row_count` (the same value under an honest name) is a **raw
+opposing-player-appearance count**, never a defensive-game count. Read
+`fantasy_points_allowed_per_game` as **"average PPR per opposing player
+appearance,"** not as positional fantasy points summed per defense-game.
+
+**`defensive_games_played`** (Reporting Integrity hardening) is the real,
+distinct count of defensive games/weeks this defense has played against
+this position - one per week regardless of how many same-position players
+appeared that week, computed by counting rows of the already one-row-per-week
+`defense_position_weekly` table (see "Recent DvP" below). `sample_size_label`,
+confidence, and the Defense vs Position page's "Min defensive games" filter
+all use `defensive_games_played`, never `games_in_sample`/
+`player_game_row_count` - a defense that faced 2 WRs in its only game this
+season has `player_game_row_count = 2` but `defensive_games_played = 1`,
+and reads as `insufficient_sample`, not as a 2-game sample.
+
+Season DvP and recent DvP are **not directly comparable confidence-wise**:
+season DvP weights every player-ROW equally (so a 2-WR week counts twice),
+while recent DvP (below) weights every WEEK equally (that same week counts
+once, averaged across whichever players appeared). `dvp_recent_trend_delta`/
+`dvp_trend_label` therefore compare a row-weighted number against a
+week-weighted number - this is intentional (it preserves each number's own
+documented historical formula unchanged) but is a real difference in what's
+being averaged, not just a difference in window length.
 
 `position_rank_most_favorable` (dense rank, 1 = most favorable - allows the
 **most** to that position) and `position_percentile_most_favorable` (0-100,
@@ -362,12 +384,16 @@ favorable matchup for the offensive DFS player - never the inverse.
 
 ### Recent DvP - last 3 played weeks
 
-Recent-DvP fields (`last_3_games_*`, `dvp_recent_trend_delta`,
-`dvp_trend_label`) are computed from `data/defense_position_weekly.parquet`
-(one row per defense/position/**week**, source columns first averaged
-within a week - so a week where a defense faced 2 WRs counts as **one**
-game here, unlike the raw-row-count season number above) rather than from
-the raw per-player rows directly:
+Recent-DvP fields (`last_3_games_*`, `recent_defensive_games_used` (alias of
+`last_3_games_count`), `dvp_recent_trend_delta`, `dvp_trend_label`) are
+computed from `data/defense_position_weekly.parquet` (one row per
+defense/position/**week**, source columns first averaged within a week - so
+a week where a defense faced 2 WRs counts as **one** game here, unlike the
+raw-appearance-count season number above) rather than from the raw
+per-player rows directly. `last_3_games_count` was already a correct
+distinct-game count before the Reporting Integrity pass (it's derived from
+this same one-row-per-week table) - only the season-level count had the
+row/game ambiguity fixed above:
 
 - **Last 3** always means the defense's last 3 **PLAYED** completed weeks
   against that position - bye weeks are simply absent rows, never treated
@@ -873,20 +899,34 @@ to touch role eligibility, and only additively:
   monitor-only until the EXISTING role engine itself promotes them through
   confirmed blocker absence (see "Depth chart & injury role/eligibility
   engine" below). This pass adds no new path around that.
-- The ONE narrow promotion this adds: a `bench_no_clear_path` player (role-
-  ineligible for the pool under the existing engine) gains
-  `opportunity_pool_eligible = True` - never `role_eligible_for_pool`
-  itself, which is left completely unchanged - when ALL of: role data is
-  `fresh` (not stale/unresolved), current-season games played ≥
+- **`bench_no_clear_path` is never promoted into the Valid Player Pool by
+  workload alone** (Reporting Integrity hardening - this was a real bug in
+  an earlier pass, where a rising-workload bench player with no confirmed
+  injury path ahead of them WAS promoted into the pool; it is fixed).
+  `opportunity_pool_eligible` and `opportunity_top_value_eligible` always
+  mirror the existing, unmodified role engine's own `role_eligible_for_pool`/
+  `role_eligible_for_top_values` for this classification, by default.
+- Instead, a `bench_no_clear_path` player whose recent workload clears every
+  one of the same gates (role data `fresh`, current-season games played ≥
   `OPPORTUNITY_POOL_PROMOTION_MIN_GAMES` (2), `opportunity_label ==
-  "rising_opportunity"`, and the position's primary last-2 volume metric
-  (touches for RB, targets for WR/TE, pass attempts for QB) is at or above
-  its configured floor (RB 8.0, WR/TE 4.0, QB 20.0) - so a token/garbage-
-  time uptick is never promoted.
-- This promotion is Player-Pool-only - `opportunity_top_value_eligible` is
-  never set True by it. Top-Value promotion has config hooks
-  (`OPPORTUNITY_TOP_VALUE_PROMOTION_ENABLED` = False,
-  plus its own min-games/workload-floor config) for a future pass only.
+  "rising_opportunity"`, and the position's primary last-2 volume metric at
+  or above its configured floor: RB 8.0 touches/game, WR/TE 4.0 targets/game,
+  QB 20.0 attempts/game) gets `workload_watchlist_eligible = True` /
+  `role_review_required = True` / a human-readable `workload_watchlist_reason`
+  - a **research-only** signal, surfaced in a separate "Workload Watchlist /
+  Role Review" section (see "Matchup Analyzer Expanded" above), never Player
+  Pool eligibility or Top Value approval. A player is never simultaneously
+  described as role-excluded (`bench_no_clear_path`, `role_eligible_for_pool
+  = False`) and pool-eligible.
+- `OPPORTUNITY_POOL_PROMOTION_ENABLED` (`lib/opportunity_config.py`) is a
+  disabled-by-default config hook for a FUTURE, explicitly-approved exception
+  - the same precedent as `OPPORTUNITY_TOP_VALUE_PROMOTION_ENABLED` below.
+  Only when a human explicitly flips it to `True` does clearing the Workload
+  Watchlist gates also grant `opportunity_pool_eligible = True` (Player Pool
+  only, still never Top Value). It must never be enabled implicitly.
+- Top-Value promotion has its own, separately disabled config hook
+  (`OPPORTUNITY_TOP_VALUE_PROMOTION_ENABLED` = False, plus its own
+  min-games/workload-floor config) for a future pass only.
 
 ### UI integration
 
@@ -897,12 +937,16 @@ to touch role eligibility, and only additively:
   player" expander with the full reason/summary/confidence text.
 - **Matchup Analyzer Expanded**: the main table gains Opportunity, Recent 2
   vs Season, Recent 3 vs Season, and Opportunity Confidence columns, the
-  same filter set, and a new "Rising Opportunity" section - Valid Player
-  Pool only by default (never monitor-only/inactive/unresolved/excluded), a
-  `bench_no_clear_path` promotion shows "Player Pool Only — Rising
-  Workload," and a separate, clearly-labeled toggle can additionally surface
+  same filter set, and a "Rising Opportunity" section - Valid Player Pool
+  only by default (never monitor-only/inactive/unresolved/excluded by
+  default; a separate, clearly-labeled toggle can additionally surface
   rising contingent players there, tagged "Monitor Injury Status," never
-  merged into the regular pool rows.
+  merged into the regular pool rows). A SEPARATE "Workload Watchlist / Role
+  Review" section surfaces `bench_no_clear_path` players with
+  `workload_watchlist_eligible = True` - research visibility only, never
+  Player Pool eligibility (`POOL_PROMOTION_DISPLAY_LABEL`/
+  `WORKLOAD_WATCHLIST_DISPLAY_LABEL` in `lib/opportunity_config.py` label
+  the two, distinct outcomes unambiguously).
 
 ### Performance
 
@@ -931,14 +975,29 @@ a composite score, ownership model, or lineup generator.
 `lib.matchup_analyzer.build_matchup_analyzer_table` already produces (DK
 slate + identity match + the unchanged projection formula + role/
 eligibility + the Opportunity Model + defense + team reporting - every
-existing safety rule already applied) and adds eight descriptive columns:
+existing safety rule already applied) and adds twelve descriptive columns:
 `signal_alignment`, `case_summary`, `primary_positive`, `primary_concern`,
-`positives`, `concerns`, `data_quality_notes`, `recommendation_context`.
-`pages/5_Matchup_Analyzer.py` calls `build_case_summary` once, inside the
-same `st.cache_data`-wrapped builder that already constructs the matchup
-table - no case data is recomputed per widget interaction, and no separate
-parquet/pipeline step was needed since (like the matchup table itself) this
-depends on the current DK slate, not season-level data.
+`positives`, `concerns`, `missing_evidence`, `sample_warnings`,
+`alignment_trigger_codes`, `classification_reason`, `data_quality_notes`,
+`recommendation_context`. `pages/5_Matchup_Analyzer.py` calls
+`build_case_summary` once, inside the same `st.cache_data`-wrapped builder
+that already constructs the matchup table - no case data is recomputed per
+widget interaction, and no separate parquet/pipeline step was needed since
+(like the matchup table itself) this depends on the current DK slate, not
+season-level data.
+
+**Four kinds of evidence, never blurred together** (Reporting Integrity
+hardening - see the module docstring for the full precedence order):
+`positives` (POSITIVE - a confirmed favorable condition), `concerns`
+(NEGATIVE - a confirmed unfavorable condition), `missing_evidence` (a
+condition required for the next-higher alignment tier that simply isn't
+confirmed either way - never a manufactured concern just to explain a lower
+tier), and `sample_warnings` (a real signal whose underlying sample -
+distinct defensive games, or current-season games played - is too small to
+read with full confidence, distinct from both a concern and missing
+evidence). `alignment_trigger_codes` is the machine-readable list of every
+condition that actually fired; `classification_reason` is the matching
+plain-language explanation.
 
 ### The five signal categories (never blended into one number)
 
@@ -956,10 +1015,18 @@ depends on the current DK slate, not season-level data.
    3.0, `VALUE_CONCERN_THRESHOLD_PTS_PER_1K` = 2.0) - reported
    transparently, never scored.
 4. **Matchup** - reads `position_percentile_most_favorable`/
-   `fantasy_points_allowed_per_game`/`games_in_sample` (defense_reporting.parquet,
-   via the existing join). Favorable at or above the 65th percentile,
-   tough at or below the 35th (`MATCHUP_FAVORABLE_PERCENTILE`/
-   `MATCHUP_CONCERN_PERCENTILE`) - every statement keeps its DvP sample size.
+   `fantasy_points_allowed_per_game`/`defensive_games_played`
+   (defense_reporting.parquet, via the existing join - **never**
+   `games_in_sample`/`player_game_row_count`, the raw opposing-player-
+   appearance count, which is never read as a defensive-game sample size).
+   Favorable at or above the 65th percentile AND at least
+   `MIN_DVP_SAMPLE_GAMES` (3) distinct defensive games - a favorable-looking
+   percentile from an insufficient defensive-game sample is surfaced as a
+   concern ("looks favorable... but cannot be read as a high-confidence
+   favorable matchup yet"), never as a confident positive, however large the
+   underlying appearance count is. Tough at or below the 35th percentile
+   (`MATCHUP_CONCERN_PERCENTILE`) - every statement keeps its real
+   distinct-defensive-game sample size.
 5. **Team environment** - reads `team_recent_form_label`/
    `team_offensive_momentum_yards` (team_reporting.parquet, built from
    dfs_data_pipeline's existing, documented `RECENT_FORM_HEATING_UP_PCT`/
@@ -981,28 +1048,35 @@ is always traceable to the exact evidence behind it. In order:
   never reaches any other evaluation, regardless of how favorable the rest
   of the signals look.
 - **High Variance** preempts everything else for a fragile role (a
-  `contingent_backup` monitor-only player, or the narrow
-  `bench_no_clear_path` → Player Pool promotion from the Opportunity Model)
-  or a positive case that rests entirely on a rising-but-low-confidence
-  opportunity reading.
+  `contingent_backup` monitor-only player, or the disabled-by-default
+  `bench_no_clear_path` → Player Pool promotion hook from the Opportunity
+  Model, when explicitly enabled) or a positive case that rests entirely on
+  a rising-but-low-confidence opportunity reading.
 - **Strongly Supported** requires a safe role, a favorable value, a genuine
   opportunity case (rising, or stable AND independently corroborated by a
   favorable matchup/team signal), a favorable matchup or team signal, and
   zero concerns anywhere.
 - **Mostly Supported** requires a safe role, a favorable value, a real
   (non-declining/non-limited) opportunity signal, and at most one other
-  concern.
+  concern - OR zero concerns anywhere with at least one real positive, in
+  which case `missing_evidence` names exactly what corroboration for
+  Strongly Supported is absent (never a manufactured concern to explain the
+  lower tier).
 - **Weak Case** fires when two or more concerns exist with little
   corroborating positive evidence - even a genuinely positive raw salary
   value does not override multiple real concerns.
 - Everything else with evidence on both sides lands in **Mixed Signals**.
 
-A monitor-only or inactive player can never be "Strongly Supported" - see
-the dedicated tests in `tests/test_player_case_summary.py` for the exact
+A monitor-only, inactive, unresolved, or role-excluded (`bench_no_clear_path`)
+player can never be "Strongly Supported" or "Mostly Supported" - see the
+dedicated tests in `tests/test_player_case_summary.py` for the exact
 required example shapes (a favorable matchup with declining opportunity
 lands in Mixed Signals/High Variance, never Strongly Supported; a tough
 matchup with a safe role, strong stable workload, and good value lands in
-Mostly Supported with the matchup as the named concern).
+Mostly Supported with the matchup as the named concern; a Mostly Supported
+case with zero concerns always shows its missing corroboration; an
+insufficient defensive-game sample can never be read as a high-confidence
+favorable matchup just because the player-row count is large).
 
 ### UI integration
 
@@ -1011,14 +1085,23 @@ Mostly Supported with the matchup as the named concern).
   before Role); a Signal Alignment filter; a "Mixed Signals / Review"
   section (Valid Player Pool only by default - the same role-safety gate as
   Rising Opportunity, so monitor-only/inactive/unresolved/excluded players
-  never appear there unless legitimately promoted); and a "Player Case
-  Detail" selector showing the full breakdown (why liked, what could break
-  the play, role/availability context, Recent 2/3 vs season, salary/
-  projection/value, matchup evidence with sample size, team environment
-  evidence, and data-quality notes).
-- CSV exports (Player Pool table, Rising Opportunity, Mixed Signals /
-  Review) all include the case-summary fields alongside the existing
-  audit fields.
+  never appear there); and a "Player Case Detail" selector showing the full
+  breakdown (why liked, what could break the play, role/availability
+  context, Recent 2/3 vs season, salary/projection/value, matchup evidence
+  with its real distinct-defensive-game sample size, team environment
+  evidence, missing evidence for the next-higher tier, sample-size
+  warnings, classification reason, and data-quality notes).
+- CSV exports (Player Pool table, Rising Opportunity, Workload Watchlist,
+  Mixed Signals / Review) all include the case-summary fields alongside the
+  existing audit fields.
+- **Temporal integrity** (Reporting Integrity hardening): every cached table
+  build stamps `stats_through_week`, `slate_week`, and
+  `analysis_generated_at_utc` (when this exact result was last recomputed -
+  see "Caching & slate rollover integrity" below). The page shows
+  *"Recomputed analysis — not a preserved pre-lock evaluation."* - this app
+  keeps no frozen snapshot of a player's case from before a slate locked;
+  every case is recomputed from current data each time the underlying
+  inputs change, and is never presented as what the app said before lock.
 
 ### What this layer deliberately does NOT do
 
@@ -1028,10 +1111,12 @@ pace, Vegas line, implied team total, or game spread (none of those fields
 exist in this project's data). It never changes `projected_points`/
 `projected_value`, never overrides `role_eligible_for_pool`/
 `role_eligible_for_top_values`, and never promotes a player beyond the
-exact same narrow Player Pool-only rule the Opportunity Model already
-enforces (see "In-Season Opportunity Model" above) - this is decision
-support that makes existing, already-computed signals easier to read
-together, not a replacement for your own judgment.
+exact same role-safety rule the Opportunity Model already enforces (see
+"In-Season Opportunity Model" above - by default, that rule promotes
+nothing; a rising `bench_no_clear_path` player is Workload Watchlist
+research visibility only) - this is decision support that makes existing,
+already-computed signals easier to read together, not a replacement for
+your own judgment.
 
 ## Player identity & the DK / nflreadpy / ESPN crosswalk
 
@@ -1270,6 +1355,60 @@ payloads during development; real traffic only actually reaches ESPN once
 this runs in GitHub Actions or another environment with normal outbound
 access.
 
+## Caching & slate rollover integrity (`lib/cache_fingerprint.py`)
+
+`st.cache_data` keys a cache entry on its **function arguments**, never on
+files it happens to read from disk. A cached builder that only takes
+`file_bytes` (the DK salary CSV's own bytes) as its key, but internally
+calls several zero-argument `lib.data.load_*` loaders, will keep serving a
+stale result within the same running process if one of those underlying
+parquet/json files changes - a pipeline refresh, a role-context update, a
+new slate's metadata - because none of that is part of the cache key. This
+was a real gap (Reporting Integrity hardening) and is fixed:
+
+- `lib.cache_fingerprint.reporting_inputs_fingerprint()` `stat()`s every
+  file (`metadata.json`, `dk_slate_metadata.json`, `players_current.parquet`,
+  `players_prior_season_baseline.parquet`, `defense_reporting.parquet`,
+  `team_reporting.parquet`, `player_opportunity_reporting.parquet`,
+  `player_role_context.parquet`) plus the role-safety/signal-alignment
+  config modules (`lib/opportunity_config.py`, `lib/role_config.py`),
+  OUTSIDE the cache boundary, and combines their (path, mtime, size) into
+  one short hashed string.
+- Both `pages/5_Matchup_Analyzer.py`'s `_build_table` and
+  `pages/3_DFS_Lineup_Helper.py`'s `process_dk_csv` take that fingerprint as
+  an explicit, ordinary `st.cache_data` argument alongside `file_bytes` -
+  never a no-argument cached function relying on disk reads alone. A
+  changed salary CSV, a refreshed player/opportunity/team/defense mart, a
+  refreshed role-context snapshot, or an edited config threshold all
+  correctly invalidate the cache and force a real recompute.
+- `tests/test_cache_fingerprint.py` covers: the fingerprint changes when a
+  tracked file's content changes, stays stable when nothing changes, is
+  order-independent, changes when a tracked file disappears, and never
+  crashes on a missing file.
+
+**Slate rollover warnings** (both pages): the loaded DK salary slate is
+checked against what the statistical pipeline considers the intended
+upcoming slate, never silently assumed to match.
+
+- Loaded slate week < the pipeline's `next_slate_week` → *"Previous slate
+  loaded — not current upcoming-slate research."* The slate stays fully
+  usable for reviewing that past week; it's just never described as this
+  week's live research.
+- Loaded slate season ≠ the pipeline's active season → a season-mismatch
+  warning, since player stats/role context/matchup data would then be for a
+  different season than the salary slate.
+- A required data source (current-season player stats, defense reporting,
+  role/eligibility context) is empty/unavailable → a warning naming exactly
+  which source, rather than silently rendering with guessed values.
+
+**Temporal integrity**: `pages/5_Matchup_Analyzer.py`'s cached table build
+stamps `stats_through_week`, `slate_week`, and `analysis_generated_at_utc`
+(set INSIDE the cached function, so it genuinely reflects when this exact
+result was last recomputed, not just the current page render time). The
+page displays *"Recomputed analysis — not a preserved pre-lock
+evaluation."* - this app keeps no frozen snapshot of a player's case from
+before a slate locked, and never fabricates one from current data.
+
 ## Testing
 
 ```bash
@@ -1379,7 +1518,14 @@ Defense vs Position has its own dedicated test files too:
   a real trend *label* only at the full 3-game window), the documented
   trend-label thresholds, current-season vs. preseason-baseline behavior,
   exclusion of other-season/non-REG rows, and output schema/no-duplicate-row
-  checks.
+  checks. **Reporting Integrity hardening additions**: 2 WR rows (and a
+  4-WR extreme case) in the same week count as exactly ONE
+  `defensive_games_played`, never two or four, while
+  `player_game_row_count` correctly still counts every row; and
+  `sample_size_label` is proven to key off `defensive_games_played`, not
+  `player_game_row_count` - a defense with 5 same-week player-row
+  appearances but only 1 real defensive game still reads
+  `insufficient_sample`.
 - `tests/test_defense_trends.py` - the non-UI filter/pivot/sort/display
   module: position/team/min-games/sample-size filtering, matrix pivoting
   (position-independent, null - not 0 - for a defense/position pair with no
@@ -1451,21 +1597,29 @@ The In-Season Opportunity Model has its own dedicated test file too:
   and early-sample behavior; a monkeypatched-config test proving thresholds
   are read from `lib.opportunity_config`, not hardcoded; schema/no-duplicate-
   row checks; and the role-safety gate's full rule set (inactive/
-  role_unresolved never promoted, contingent_backup always passes through
-  unchanged and stays monitor-only, the bench_no_clear_path promotion firing
-  only when every gate - freshness, min games, rising label, workload floor -
-  passes, and never crashing on null role fields).
+  role_unresolved never promoted; contingent_backup always passes through
+  unchanged and stays monitor-only; **`bench_no_clear_path` is never
+  promoted into `opportunity_pool_eligible` by workload alone, even when
+  every gate - freshness, min games, rising label, workload floor - passes
+  (Reporting Integrity hardening - this was a real bug, fixed)**; the SAME
+  rising-workload player instead gets `workload_watchlist_eligible`/
+  `role_review_required` - research visibility only; a monkeypatched test
+  proves the disabled-by-default `OPPORTUNITY_POOL_PROMOTION_ENABLED` flag
+  is the ONLY way pool promotion can ever happen, and only when explicitly
+  turned on; and the gate never crashes on null role fields).
 - `tests/test_position_explorer.py` / `tests/test_matchup_analyzer.py`
   additions - the opportunity merge/filter helpers (never leaking one
-  player's classification onto another), end-to-end promotion of a
-  `bench_no_clear_path` player with qualifying rising workload into the
-  research Player Pool (and proof a non-rising bench player at the same
-  role is NOT promoted, and a promoted player never appears in Featured/Top
-  Value), a rising contingent player staying monitor-only by default and
-  surfacing only via its own explicit toggle, backward-compatibility when
-  the opportunity column is entirely absent, and `AppTest` coverage of the
-  new columns/filters/"Rising Opportunity" section rendering safely
-  (including with an empty result).
+  player's classification onto another); proof a `bench_no_clear_path`
+  player with qualifying rising workload is NEVER promoted into the Valid
+  Player Pool and instead appears ONLY in `workload_watchlist_section`
+  (never simultaneously role-excluded and pool-eligible); proof a non-rising
+  bench player is in neither; a rising contingent player staying
+  monitor-only by default and surfacing only via its own explicit toggle;
+  backward-compatibility when the opportunity column is entirely absent;
+  and `AppTest` coverage of the new columns/filters/"Rising Opportunity"/
+  "Workload Watchlist" sections, the "Previous slate loaded" and
+  season-mismatch warnings, and the "Recomputed analysis" disclaimer,
+  rendering safely (including with an empty result).
 
 The Player Case Summary / Signal Alignment layer has its own dedicated test
 file too:
@@ -1474,20 +1628,26 @@ file too:
   (unmatched/`role_unresolved`/`inactive` always produce Insufficient Data
   regardless of how favorable every other signal is); a `contingent_backup`
   player never reaches Strongly/Mostly Supported and stays High Variance; a
-  promoted `bench_no_clear_path` player's case names "Player Pool only" as
-  a concern while a non-promoted one names "Depth/role limitation"; the
-  four required alignment shapes (favorable DvP + declining opportunity →
-  Mixed Signals/High Variance, never Strongly Supported; tough DvP + safe
-  role + stable workload + good value → Mostly Supported with matchup as
-  the named concern; safe role + strong value + rising opportunity +
-  favorable matchup → Strongly Supported; multiple concerns → Weak Case
-  even with a positive raw value); positives/concerns traceable to the
-  exact evidence with DvP sample size always retained; data-quality notes
-  flagging a fragile role or low-confidence opportunity; output schema/no-
-  duplicate-row checks; CSV/display-table/filter helpers; the "Mixed
-  Signals / Review" bucket's reuse of the existing Valid Player Pool safety
-  gate (proving a promoted bench player can appear there only because its
-  Key Concern literally says so, never as a raw leak); and `AppTest`
+  `bench_no_clear_path` player whose case is watchlist-only names "research
+  visibility only" as a concern while one not clearing the watchlist gates
+  names "Depth/role limitation"; the four required alignment shapes
+  (favorable DvP + declining opportunity → Mixed Signals/High Variance,
+  never Strongly Supported; tough DvP + safe role + stable workload + good
+  value → Mostly Supported with matchup as the named concern; safe role +
+  strong value + rising opportunity + favorable matchup → Strongly
+  Supported; multiple concerns → Weak Case even with a positive raw value);
+  **a "Mostly Supported" case with zero concerns always names its missing
+  corroboration in `missing_evidence` (never manufactures a concern to
+  explain the lower tier, and never duplicates that missing evidence into
+  `concerns`)**; **an insufficient defensive-game sample can never be read
+  as a high-confidence favorable matchup just because the player-row/
+  appearance count is large**; a low-confidence opportunity sample produces
+  a `sample_warnings` entry, never a fabricated concern; positives/concerns
+  traceable to the exact evidence with the real distinct-defensive-game
+  sample size always retained; data-quality notes flagging a fragile role
+  or low-confidence opportunity; output schema/no-duplicate-row checks;
+  CSV/display-table/filter helpers; the "Mixed Signals / Review" bucket's
+  reuse of the existing Valid Player Pool safety gate; and `AppTest`
   coverage of the new columns/filters/sections/player-detail selector
   rendering safely, including empty-result paths.
 
@@ -1576,15 +1736,14 @@ file too:
   during the season as a result; this pass did not change when that table
   gets populated, since that's explicitly protected "current season/
   baseline mode logic."
-- **Committed Week 3 salary slate is a research placeholder, not a real DK
-  export.** No live DraftKings export was available to commit for this
-  pass's validation, so `data/dk_salaries/current.csv` was generated from
-  REAL player names/teams (`players_current.parquet`) and the REAL Week 3
-  schedule (`nflreadpy.load_schedules`), with salaries estimated from each
-  player's real current-season average (`dk_slate_metadata.json`'s
-  `source: "synthetic_research_placeholder"` marks it as such). Replace it
-  with a real export via `python load_dk_salaries.py` for actual slate use
-  - the Matchup Analyzer/Lineup Helper pages work identically either way.
+- **Committed salary slate is Week 4, from a real DraftKings export**
+  (`dk_slate_metadata.json`'s `source: "manual_copy"`) - an earlier research
+  placeholder slate (synthetic salaries over real player/schedule data) was
+  used during an earlier pass's validation and has since been replaced.
+  This Reporting Integrity pass deliberately left the committed Week 4
+  slate unchanged and did not overwrite it with any synthetic test data;
+  replace it with the real Week 5 export via `python load_dk_salaries.py`
+  once available.
 - **ESPN injury source was unreachable during the Opportunity Model pass's
   own validation** (every player showed `role_unresolved`), which a
   subsequent real work-machine data sync resolved - live Player Pool/
@@ -1603,3 +1762,25 @@ file too:
   `lib/opportunity_config.py`), not derived from historical backtesting -
   they're deliberately easy to see and tune in one place as more of the
   season accumulates.
+- **Reporting Integrity hardening pass - remaining limitations.**
+  - `lib.cache_fingerprint` hashes file (path, mtime, size), not file
+    content - a file rewritten with byte-identical content and a refreshed
+    mtime still invalidates the cache (a conservative false-positive, never
+    a false-negative), and a tool that preserves mtime while truly changing
+    content (rare, not how this project's own pipeline writes files) could
+    theoretically miss an invalidation. The fingerprint also only covers
+    the files/config this app's own cached builders are known to read
+    today; a future reporting dependency on a new file must be added to
+    `REPORTING_SOURCE_FILES`/`CONFIG_SOURCE_FILES` by hand.
+  - The Workload Watchlist / "Previous slate loaded" / season-mismatch
+    warnings are deliberately simple threshold checks (slate week vs.
+    `next_slate_week`, slate season vs. active season) - they don't attempt
+    to detect every possible slate/stats mismatch (e.g. a slate for the
+    right week but a different, unusual game set).
+  - `analysis_generated_at_utc` reflects when the CACHED result was last
+    recomputed within this running process - it is not a durable, cross-
+    restart audit log; no historical case history is persisted anywhere.
+  - The `OPPORTUNITY_POOL_PROMOTION_ENABLED` hook exists and is tested, but
+    remains firmly OFF by default and is not expected to be enabled without
+    a separate, explicit product decision - this pass did not evaluate
+    whether that exception should ever ship.

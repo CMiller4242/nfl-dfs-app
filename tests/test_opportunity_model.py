@@ -390,39 +390,79 @@ def test_already_eligible_classifications_pass_through_unchanged():
         assert gate["opportunity_top_value_eligible"] is True
 
 
-def test_bench_no_clear_path_promoted_when_all_gates_pass():
+def test_bench_no_clear_path_never_promoted_to_pool_by_workload_alone():
+    # Role-safety hardening: a workload signal ALONE must never override
+    # bench_no_clear_path (no confirmed injury path) - this is the exact
+    # "Jared Wayne" scenario the Reporting Integrity pass fixes. By default
+    # (OPPORTUNITY_POOL_PROMOTION_ENABLED == False), clearing every workload
+    # gate must still NEVER grant opportunity_pool_eligible.
+    row = _gate_row(
+        "bench_no_clear_path", False, role_data_freshness="fresh", games_played=3,
+        position="WR", opportunity_label="rising_opportunity", targets_last_2_per_game=6.0,
+    )
+    gate = compute_role_safety_gate(row)
+    assert gate["opportunity_pool_eligible"] is False
+    assert gate["opportunity_top_value_eligible"] is False
+    assert "never overridden" in gate["opportunity_eligibility_reason"].lower()
+
+
+def test_bench_no_clear_path_rising_workload_is_watchlist_only_not_pool():
+    # The SAME rising-workload player instead gets research-only visibility
+    # via the Workload Watchlist - never Player Pool eligibility.
+    row = _gate_row(
+        "bench_no_clear_path", False, role_data_freshness="fresh", games_played=3,
+        position="WR", opportunity_label="rising_opportunity", targets_last_2_per_game=6.0,
+    )
+    gate = compute_role_safety_gate(row)
+    assert gate["opportunity_pool_eligible"] is False
+    assert gate["workload_watchlist_eligible"] is True
+    assert gate["role_review_required"] is True
+    assert "research visibility" in gate["workload_watchlist_reason"].lower()
+    assert "not player pool" in gate["workload_watchlist_reason"].lower()
+
+
+def test_bench_no_clear_path_promotion_hook_requires_explicit_config_opt_in(monkeypatch):
+    # The ONLY way workload can ever add pool eligibility for
+    # bench_no_clear_path is the disabled-by-default config flag, and only
+    # when a human has explicitly flipped it - never implicitly.
+    import lib.opportunity_model as opportunity_model
+
+    monkeypatch.setattr(opportunity_model, "OPPORTUNITY_POOL_PROMOTION_ENABLED", True)
     row = _gate_row(
         "bench_no_clear_path", False, role_data_freshness="fresh", games_played=3,
         position="WR", opportunity_label="rising_opportunity", targets_last_2_per_game=6.0,
     )
     gate = compute_role_safety_gate(row)
     assert gate["opportunity_pool_eligible"] is True
-    assert gate["opportunity_top_value_eligible"] is False  # never promoted to Top Value
-    assert "Player Pool only" in gate["opportunity_eligibility_reason"]
+    assert gate["opportunity_top_value_eligible"] is False  # never promoted to Top Value even then
 
 
-def test_bench_no_clear_path_not_promoted_when_role_data_stale():
+def test_bench_no_clear_path_not_watchlisted_when_role_data_stale():
     row = _gate_row("bench_no_clear_path", False, role_data_freshness="stale")
     gate = compute_role_safety_gate(row)
     assert gate["opportunity_pool_eligible"] is False
+    assert gate["workload_watchlist_eligible"] is False
 
 
-def test_bench_no_clear_path_not_promoted_when_not_rising():
+def test_bench_no_clear_path_not_watchlisted_when_not_rising():
     row = _gate_row("bench_no_clear_path", False, opportunity_label="stable_opportunity")
     gate = compute_role_safety_gate(row)
     assert gate["opportunity_pool_eligible"] is False
+    assert gate["workload_watchlist_eligible"] is False
 
 
-def test_bench_no_clear_path_not_promoted_below_workload_floor():
+def test_bench_no_clear_path_not_watchlisted_below_workload_floor():
     row = _gate_row("bench_no_clear_path", False, position="WR", targets_last_2_per_game=1.0)
     gate = compute_role_safety_gate(row)
     assert gate["opportunity_pool_eligible"] is False
+    assert gate["workload_watchlist_eligible"] is False
 
 
-def test_bench_no_clear_path_not_promoted_below_min_games():
+def test_bench_no_clear_path_not_watchlisted_below_min_games():
     row = _gate_row("bench_no_clear_path", False, games_played=1)
     gate = compute_role_safety_gate(row)
     assert gate["opportunity_pool_eligible"] is False
+    assert gate["workload_watchlist_eligible"] is False
 
 
 def test_primary_workload_last_2_is_position_aware():

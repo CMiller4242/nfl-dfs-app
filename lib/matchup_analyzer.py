@@ -34,7 +34,12 @@ from lib.dk_helper import (
 )
 from lib.defense_trends import DVP_TREND_DISPLAY
 from lib.eligibility import attach_role_context_to_dk_rows
-from lib.opportunity_config import CONFIDENCE_LABEL_DISPLAY, OPPORTUNITY_LABEL_DISPLAY, POOL_PROMOTION_DISPLAY_LABEL
+from lib.opportunity_config import (
+    CONFIDENCE_LABEL_DISPLAY,
+    OPPORTUNITY_LABEL_DISPLAY,
+    POOL_PROMOTION_DISPLAY_LABEL,
+    WORKLOAD_WATCHLIST_DISPLAY_LABEL,
+)
 from lib.opportunity_model import compute_role_safety_gate
 from lib.player_identity import normalize_team
 from lib.team_trends import SAMPLE_SIZE_DISPLAY
@@ -90,9 +95,9 @@ EXTRA_CURRENT_COLUMNS = [
 # lib.dk_helper.compute_projections's DEFENSE_CONTEXT_DISPLAY_FIELDS.
 DEFENSE_EXTRA_COLUMNS = [
     "defense_team", "position",
-    "games_in_sample", "sample_size_label",
+    "games_in_sample", "player_game_row_count", "defensive_games_played", "sample_size_label",
     "league_avg_points_allowed_for_position",
-    "last_3_games_count", "last_3_games_points_allowed_per_game",
+    "last_3_games_count", "recent_defensive_games_used", "last_3_games_points_allowed_per_game",
     "last_3_games_matchup_index", "last_3_games_matchup_delta",
     "dvp_recent_trend_delta", "dvp_trend_label",
 ]
@@ -330,6 +335,15 @@ def build_matchup_analyzer_table(
     df["opportunity_pool_eligible"] = gate["opportunity_pool_eligible"]
     df["opportunity_top_value_eligible"] = gate["opportunity_top_value_eligible"]
     df["opportunity_eligibility_reason"] = gate["opportunity_eligibility_reason"]
+    df["workload_watchlist_eligible"] = gate["workload_watchlist_eligible"]
+    df["workload_watchlist_reason"] = gate["workload_watchlist_reason"]
+    df["role_review_required"] = gate["role_review_required"]
+    # True only when the disabled-by-default OPPORTUNITY_POOL_PROMOTION_ENABLED
+    # config flag has been explicitly turned on - see
+    # lib.opportunity_model.compute_role_safety_gate. By default this is
+    # always False, and `workload_watchlist_eligible` (research-only, never
+    # Player Pool/Top Value) is what carries a rising bench_no_clear_path
+    # player's signal instead.
     df["is_pool_only_rising_promotion"] = (
         (df["role_classification"] == "bench_no_clear_path") & (df["opportunity_pool_eligible"] == True)  # noqa: E712
     )
@@ -367,13 +381,18 @@ def _describe_review_reason(row) -> str:
 def valid_player_pool(df: pd.DataFrame, include_conditional: bool = False) -> pd.DataFrame:
     """
     Valid Player Pool = the existing role engine's own role_eligible_for_pool,
-    OR (additively) a player the Opportunity Model's narrow, configured
-    bench_no_clear_path promotion granted `opportunity_pool_eligible` to -
-    see lib.opportunity_model.compute_role_safety_gate. That promotion field
-    is False for every row unless `build_matchup_analyzer_table` computed it
-    (and False for inactive/role_unresolved/contingent_backup always), so
-    this is a pure extension, never a behavior change, when opportunity
-    data isn't present.
+    OR (additively) `opportunity_pool_eligible` - see
+    lib.opportunity_model.compute_role_safety_gate. By default
+    `opportunity_pool_eligible` is IDENTICAL to `role_eligible_for_pool` (the
+    opportunity model adds no promotion), so this OR is a no-op in the
+    default configuration. It only ever diverges when a human has
+    explicitly enabled the disabled-by-default
+    `OPPORTUNITY_POOL_PROMOTION_ENABLED` config flag (lib.opportunity_config)
+    - workload alone can NEVER add a bench_no_clear_path/inactive/
+    role_unresolved/contingent_backup player to this pool otherwise. A
+    rising-workload bench_no_clear_path player who does NOT clear that
+    (disabled) flag instead appears only in `workload_watchlist_section`
+    below - research visibility, never Player Pool eligibility.
     """
     opportunity_promoted = (
         df["opportunity_pool_eligible"] == True if "opportunity_pool_eligible" in df.columns  # noqa: E712
@@ -422,6 +441,23 @@ def plays_to_monitor(df: pd.DataFrame) -> pd.DataFrame:
 
 def excluded_by_role_context(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["role_classification"] == "bench_no_clear_path"]
+
+
+def workload_watchlist_section(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    "Workload Watchlist / Role Review" (Issue 2 hardening): bench_no_clear_path
+    rows whose recent workload clears the configured rising-workload gates
+    (see lib.opportunity_model.compute_role_safety_gate /
+    lib.opportunity_config's "Workload Watchlist / Role Review policy").
+    RESEARCH VISIBILITY ONLY - these rows are a subset of
+    `excluded_by_role_context` and are never unioned into
+    `valid_player_pool` or `featured_top_value`. A player never appears
+    here described as role-eligible; `role_classification` stays
+    `bench_no_clear_path` and `role_eligible_for_pool` stays False.
+    """
+    if "workload_watchlist_eligible" not in df.columns:
+        return df.iloc[0:0]
+    return df[df["workload_watchlist_eligible"] == True]  # noqa: E712
 
 
 def inactive_players(df: pd.DataFrame) -> pd.DataFrame:
@@ -581,7 +617,8 @@ MATCHUP_COLUMNS = {
     "fantasy_points_allowed_per_game": "DvP FPPG Allowed", "matchup_index": "Matchup Index",
     "matchup_delta": "Matchup Delta", "position_rank_most_favorable": "Matchup Rank",
     "position_percentile_most_favorable": "Matchup Percentile",
-    "dvp_trend_display": "Last-3 DvP Trend", "games_in_sample": "DvP Sample Count",
+    "dvp_trend_display": "Last-3 DvP Trend", "defensive_games_played": "Defensive Games",
+    "player_game_row_count": "Opposing Player Appearances",
 }
 TEAM_ENV_COLUMNS = {
     "team_season_total_yards_per_game": "Team Total Yards/Game",
@@ -627,7 +664,8 @@ def build_csv_export(df: pd.DataFrame) -> pd.DataFrame:
                   "role_classification", "projection_status", "canonical_team", "opponent",
                   "dvp_trend_label", "prior_season_match_method",
                   "opportunity_label", "opportunity_pool_eligible", "opportunity_top_value_eligible",
-                  "opportunity_eligibility_reason", "is_pool_only_rising_promotion"]
+                  "opportunity_eligibility_reason", "is_pool_only_rising_promotion",
+                  "workload_watchlist_eligible", "workload_watchlist_reason", "role_review_required"]
     export_cols = audit_cols + [c for c in columns if c in df.columns and c not in audit_cols]
     export_cols = [c for c in export_cols if c in df.columns]
     return df[export_cols].reset_index(drop=True)
