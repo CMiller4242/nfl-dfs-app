@@ -915,6 +915,124 @@ rather than inline in the pipeline) and written to
 and only filter/format it - no rolling/recent aggregation ever re-runs on a
 widget interaction.
 
+## Player Case Summary / Signal Alignment (`lib/player_case_summary.py`, `pages/5_Matchup_Analyzer.py`)
+
+Answers, for each slate player: why does the app like them, what could
+break the play, are the major signals aligned or in tension, and which
+research category (Featured, Player Pool only, Monitor, Excluded, Needs
+Review) are they in? This is a **descriptive, auditable layer over signals
+that already exist** - it computes nothing new about a player's stats,
+role, projection, matchup, or team environment, and it is explicitly **not**
+a composite score, ownership model, or lineup generator.
+
+### Architecture - a layer on top of the already-built matchup table
+
+`lib/player_case_summary.py` takes the row shape
+`lib.matchup_analyzer.build_matchup_analyzer_table` already produces (DK
+slate + identity match + the unchanged projection formula + role/
+eligibility + the Opportunity Model + defense + team reporting - every
+existing safety rule already applied) and adds eight descriptive columns:
+`signal_alignment`, `case_summary`, `primary_positive`, `primary_concern`,
+`positives`, `concerns`, `data_quality_notes`, `recommendation_context`.
+`pages/5_Matchup_Analyzer.py` calls `build_case_summary` once, inside the
+same `st.cache_data`-wrapped builder that already constructs the matchup
+table - no case data is recomputed per widget interaction, and no separate
+parquet/pipeline step was needed since (like the matchup table itself) this
+depends on the current DK slate, not season-level data.
+
+### The five signal categories (never blended into one number)
+
+1. **Role / availability** - reads `role_classification`/`role_data_freshness`
+   (lib.eligibility, unmodified). Positive: Confirmed Starter, Injury-
+   Elevated. Concern: Monitor Injury Status, Depth/role limitation, stale
+   role data, or an unresolved identity/match.
+2. **Opportunity** - reads `opportunity_label`/`opportunity_reason`/
+   `confidence_label` (lib.opportunity_model, unmodified). Positive: Rising
+   or Stable Opportunity. Concern: Declining/Limited Opportunity or an
+   insufficient sample.
+3. **Salary/value** - reads `projected_value` (lib.dk_helper's unchanged
+   projection formula) against two configurable display thresholds in
+   `lib/player_case_summary.py` (`VALUE_FAVORABLE_THRESHOLD_PTS_PER_1K` =
+   3.0, `VALUE_CONCERN_THRESHOLD_PTS_PER_1K` = 2.0) - reported
+   transparently, never scored.
+4. **Matchup** - reads `position_percentile_most_favorable`/
+   `fantasy_points_allowed_per_game`/`games_in_sample` (defense_reporting.parquet,
+   via the existing join). Favorable at or above the 65th percentile,
+   tough at or below the 35th (`MATCHUP_FAVORABLE_PERCENTILE`/
+   `MATCHUP_CONCERN_PERCENTILE`) - every statement keeps its DvP sample size.
+5. **Team environment** - reads `team_recent_form_label`/
+   `team_offensive_momentum_yards` (team_reporting.parquet, built from
+   dfs_data_pipeline's existing, documented `RECENT_FORM_HEATING_UP_PCT`/
+   `RECENT_FORM_COOLING_OFF_PCT` thresholds - reused, not redefined). No
+   game script, spread, implied team total, or Vegas environment is
+   inferred - none of those fields exist anywhere in this project.
+
+### Signal alignment - a descriptive classification, not a score
+
+`signal_alignment` is one of **Strongly Supported, Mostly Supported, Mixed
+Signals, High Variance, Weak Case, Insufficient Data** - decided entirely by
+explicit boolean conditions over the five categories above
+(`lib.player_case_summary._decide_alignment`), never a weighted sum. Every
+condition that fired is kept verbatim in `positives`/`concerns`, so a label
+is always traceable to the exact evidence behind it. In order:
+
+- **Insufficient Data** short-circuits first and unconditionally - an
+  unmatched player, a `role_unresolved` identity, or an `inactive` player
+  never reaches any other evaluation, regardless of how favorable the rest
+  of the signals look.
+- **High Variance** preempts everything else for a fragile role (a
+  `contingent_backup` monitor-only player, or the narrow
+  `bench_no_clear_path` → Player Pool promotion from the Opportunity Model)
+  or a positive case that rests entirely on a rising-but-low-confidence
+  opportunity reading.
+- **Strongly Supported** requires a safe role, a favorable value, a genuine
+  opportunity case (rising, or stable AND independently corroborated by a
+  favorable matchup/team signal), a favorable matchup or team signal, and
+  zero concerns anywhere.
+- **Mostly Supported** requires a safe role, a favorable value, a real
+  (non-declining/non-limited) opportunity signal, and at most one other
+  concern.
+- **Weak Case** fires when two or more concerns exist with little
+  corroborating positive evidence - even a genuinely positive raw salary
+  value does not override multiple real concerns.
+- Everything else with evidence on both sides lands in **Mixed Signals**.
+
+A monitor-only or inactive player can never be "Strongly Supported" - see
+the dedicated tests in `tests/test_player_case_summary.py` for the exact
+required example shapes (a favorable matchup with declining opportunity
+lands in Mixed Signals/High Variance, never Strongly Supported; a tough
+matchup with a safe role, strong stable workload, and good value lands in
+Mostly Supported with the matchup as the named concern).
+
+### UI integration
+
+- **Matchup Analyzer Expanded**: the main table gains Signal Alignment/
+  Primary Positive/Primary Concern columns (inserted right after identity,
+  before Role); a Signal Alignment filter; a "Mixed Signals / Review"
+  section (Valid Player Pool only by default - the same role-safety gate as
+  Rising Opportunity, so monitor-only/inactive/unresolved/excluded players
+  never appear there unless legitimately promoted); and a "Player Case
+  Detail" selector showing the full breakdown (why liked, what could break
+  the play, role/availability context, Recent 2/3 vs season, salary/
+  projection/value, matchup evidence with sample size, team environment
+  evidence, and data-quality notes).
+- CSV exports (Player Pool table, Rising Opportunity, Mixed Signals /
+  Review) all include the case-summary fields alongside the existing
+  audit fields.
+
+### What this layer deliberately does NOT do
+
+No Smash Score or any other composite number; no ownership projection; no
+lineup optimization; no inferred snap share, route rate, red-zone work,
+pace, Vegas line, implied team total, or game spread (none of those fields
+exist in this project's data). It never changes `projected_points`/
+`projected_value`, never overrides `role_eligible_for_pool`/
+`role_eligible_for_top_values`, and never promotes a player beyond the
+exact same narrow Player Pool-only rule the Opportunity Model already
+enforces (see "In-Season Opportunity Model" above) - this is decision
+support that makes existing, already-computed signals easier to read
+together, not a replacement for your own judgment.
+
 ## Player identity & the DK / nflreadpy / ESPN crosswalk
 
 DraftKings' salary CSV, nflreadpy's player stats, nflreadpy's depth charts,
@@ -1349,6 +1467,30 @@ The In-Season Opportunity Model has its own dedicated test file too:
   new columns/filters/"Rising Opportunity" section rendering safely
   (including with an empty result).
 
+The Player Case Summary / Signal Alignment layer has its own dedicated test
+file too:
+
+- `tests/test_player_case_summary.py` - role safety is never overridden
+  (unmatched/`role_unresolved`/`inactive` always produce Insufficient Data
+  regardless of how favorable every other signal is); a `contingent_backup`
+  player never reaches Strongly/Mostly Supported and stays High Variance; a
+  promoted `bench_no_clear_path` player's case names "Player Pool only" as
+  a concern while a non-promoted one names "Depth/role limitation"; the
+  four required alignment shapes (favorable DvP + declining opportunity →
+  Mixed Signals/High Variance, never Strongly Supported; tough DvP + safe
+  role + stable workload + good value → Mostly Supported with matchup as
+  the named concern; safe role + strong value + rising opportunity +
+  favorable matchup → Strongly Supported; multiple concerns → Weak Case
+  even with a positive raw value); positives/concerns traceable to the
+  exact evidence with DvP sample size always retained; data-quality notes
+  flagging a fragile role or low-confidence opportunity; output schema/no-
+  duplicate-row checks; CSV/display-table/filter helpers; the "Mixed
+  Signals / Review" bucket's reuse of the existing Valid Player Pool safety
+  gate (proving a promoted bench player can appear there only because its
+  Key Concern literally says so, never as a raw leak); and `AppTest`
+  coverage of the new columns/filters/sections/player-detail selector
+  rendering safely, including empty-result paths.
+
 ## Known limitations
 
 - **Early-season small samples.** With 1-2 games played, `consistency_score`
@@ -1443,23 +1585,14 @@ The In-Season Opportunity Model has its own dedicated test file too:
   `source: "synthetic_research_placeholder"` marks it as such). Replace it
   with a real export via `python load_dk_salaries.py` for actual slate use
   - the Matchup Analyzer/Lineup Helper pages work identically either way.
-- **ESPN injury source was unreachable during this pass's validation.** With
-  no fresh injury fetch and a preserved fallback snapshot older than
-  `INJURY_FRESHNESS_HOURS`, every player's `role_classification` correctly
-  fails closed to `role_unresolved` (Needs Review) rather than a guess - see
-  "Depth chart & injury role/eligibility engine." This means the live
-  Player Pool / Featured counts were 0 in this environment at validation
-  time; `tests/test_matchup_analyzer.py`'s synthetic role-context fixtures
-  independently prove every category (Valid Pool, Featured, Monitor,
-  Excluded, Inactive) works correctly once role data resolves.
-- **No live bench_no_clear_path→Player-Pool promotion example in this
-  environment, for the same reason.** Every player being `role_unresolved`
-  means nobody reaches the `bench_no_clear_path` branch the Opportunity
-  Model's promotion gate checks at all during this pass's live validation -
-  `tests/test_matchup_analyzer.py::test_bench_no_clear_path_with_rising_workload_is_promoted_to_pool`
-  (and its sibling "not promoted" tests) exercise the full rule with
-  synthetic role/opportunity fixtures instead, end to end through
-  `build_matchup_analyzer_table`.
+- **ESPN injury source was unreachable during the Opportunity Model pass's
+  own validation** (every player showed `role_unresolved`), which a
+  subsequent real work-machine data sync resolved - live Player Pool/
+  Featured counts and a real `bench_no_clear_path` → Player Pool promotion
+  example are both available now (see the Player Case Summary pass's
+  validation report). `tests/test_matchup_analyzer.py`'s synthetic role-
+  context fixtures independently prove every category works regardless of
+  which state the live ESPN fetch happens to be in on a given run.
 - **Opportunity classification is most informative once the season has 3+
   games for most players.** Through Week 3/4, `confidence_label` is
   frequently `early_sample` or `insufficient_sample` (92 of 454 current

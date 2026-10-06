@@ -745,3 +745,76 @@ def test_page_rising_opportunity_section_handles_empty_results_safely():
     at.checkbox(key="ma_rising_only").set_value(True)
     at.run()
     assert not at.exception
+
+
+# ---------------------------------------------------------------------------
+# AppTest: Player Case Summary / Signal Alignment layer
+# ---------------------------------------------------------------------------
+def test_page_renders_case_summary_columns_and_sections():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    subheaders = [el.value for el in at.subheader]
+    assert any("Mixed Signals" in s for s in subheaders)
+    assert any("Player Case Detail" in s for s in subheaders)
+    # Main table includes the compact case columns.
+    assert len(at.dataframe) >= 1
+    assert "Signal Alignment" in at.dataframe[0].value.columns
+
+
+def test_page_signal_alignment_filter_does_not_raise():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+
+    at.multiselect(key="ma_signal_alignment").set_value(["Mixed Signals", "High Variance"])
+    at.run()
+    assert not at.exception
+
+
+def test_page_player_case_detail_selection_renders_without_exception():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+
+    detail_select = [el for el in at.selectbox if el.key == "ma_case_detail_player"]
+    if detail_select:
+        options = detail_select[0].options
+        if options:
+            detail_select[0].set_value(options[0])
+            at.run()
+            assert not at.exception
+
+
+def test_page_mixed_signals_review_section_handles_empty_results_safely():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    at.multiselect(key="ma_signal_alignment").set_value(["Strongly Supported"])
+    at.run()
+    assert not at.exception
+    # Narrowing to a position with no matching rows should also stay safe.
+    at.multiselect(key="ma_positions").set_value(["QB"])
+    at.run()
+    assert not at.exception
+
+
+def test_page_mixed_signals_review_never_leaks_excluded_inactive_unresolved_monitor():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    if at.dataframe:
+        # Find the Mixed Signals / Review table by its distinctive columns.
+        for df_element in at.dataframe:
+            cols = list(df_element.value.columns)
+            if "Key Positive" in cols and "Key Concern" in cols:
+                assert "Role" in cols
+                roles_shown = set(df_element.value["Role"].unique())
+                assert "Inactive" not in roles_shown
+                assert "Role Needs Review" not in roles_shown
+                assert "Monitor Injury Status" not in roles_shown
+                # "No Clear Opportunity Path" (bench_no_clear_path) may
+                # legitimately appear ONLY via the narrow, configured rising-
+                # workload Player Pool promotion - never a raw, unpromoted leak.
+                if "No Clear Opportunity Path" in roles_shown:
+                    promoted_rows = df_element.value[df_element.value["Role"] == "No Clear Opportunity Path"]
+                    assert promoted_rows["Key Concern"].str.contains("Player Pool only", na=False).all()

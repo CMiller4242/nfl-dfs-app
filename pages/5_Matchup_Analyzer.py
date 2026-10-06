@@ -40,6 +40,17 @@ from lib.matchup_analyzer import (
     volume_vs_matchup_chart_data,
 )
 from lib.opportunity_config import OPPORTUNITY_LABEL_DISPLAY, POOL_PROMOTION_DISPLAY_LABEL
+from lib.player_case_summary import (
+    CASE_SUMMARY_COLUMNS,
+    SIGNAL_ALIGNMENT_VALUES,
+    build_case_csv_export,
+    build_case_display_table,
+    build_case_summary,
+    filter_by_signal_alignment,
+    format_case_detail,
+    mixed_signals_review_section,
+    positives_text,
+)
 from lib.role_config import DEPTH_CHART_FRESHNESS_HOURS, INJURY_FRESHNESS_HOURS
 
 st.set_page_config(page_title="Matchup Analyzer | NFL DFS", page_icon="🔎", layout="wide")
@@ -160,7 +171,7 @@ st.divider()
 @st.cache_data(show_spinner="Building matchup research table...")
 def _build_table(file_bytes: bytes) -> pd.DataFrame:
     dk = pd.read_csv(io.BytesIO(file_bytes))
-    return build_matchup_analyzer_table(
+    matchup_table = build_matchup_analyzer_table(
         dk,
         load_players_current(),
         load_players_prior_season_baseline(),
@@ -169,6 +180,12 @@ def _build_table(file_bytes: bytes) -> pd.DataFrame:
         load_player_role_context(),
         load_player_opportunity_reporting(),
     )
+    # Player Case Summary / Signal Alignment - a separate, descriptive-only
+    # layer on top of the already-built matchup table (see
+    # lib.player_case_summary's module docstring). Computed once here,
+    # cached alongside the rest of the table - never recomputed per widget
+    # interaction.
+    return build_case_summary(matchup_table)
 
 
 table = _build_table(file_bytes)
@@ -189,7 +206,7 @@ FILTER_DEFAULTS = {
     "ma_matchup_pctile_min": 0, "ma_matchup_pctile_max": 100,
     "ma_min_momentum": 0.0, "ma_min_games": 0,
     "ma_opportunity_labels": [], "ma_rising_only": False, "ma_min_opportunity_confidence": "Any",
-    "ma_show_monitor_rising": False,
+    "ma_show_monitor_rising": False, "ma_signal_alignment": [],
 }
 for _key, _default in FILTER_DEFAULTS.items():
     st.session_state.setdefault(_key, _default)
@@ -280,6 +297,11 @@ with st.expander("Opportunity filters (In-Season Opportunity Model)"):
             key="ma_min_opportunity_confidence",
         )
 
+with st.expander("Player Case filters (Signal Alignment)"):
+    signal_alignment_filter = st.multiselect(
+        "Signal alignment", SIGNAL_ALIGNMENT_VALUES, key="ma_signal_alignment",
+    )
+
 st.button("Reset filters", on_click=_reset_filters)
 
 # ---------------------------------------------------------------------------
@@ -310,6 +332,8 @@ filtered = apply_research_filters(
 
 if not show_early_sample:
     filtered = filtered[~filtered["is_early_sample"]]
+
+filtered = filter_by_signal_alignment(filtered, alignments=signal_alignment_filter or None)
 
 CATEGORY_FUNCS = {
     "Valid Player Pool": lambda d: valid_player_pool(d, include_conditional=include_conditional),
@@ -358,6 +382,18 @@ st.caption(
 display_position = position_filter[0] if len(position_filter) == 1 else None
 display_table = build_display_table(filtered, display_position)
 
+# Compact player-case columns (Signal Alignment / Primary Positive / Primary
+# Concern - item 20) inserted right after identity, before Role - `filtered`
+# and `display_table` share the same row index, so this is a safe align-by-
+# index concat, never a re-join.
+case_display = build_case_display_table(filtered)
+if not case_display.empty and not display_table.empty:
+    insert_at = display_table.columns.get_loc("Role") if "Role" in display_table.columns else len(display_table.columns)
+    cols = list(display_table.columns)
+    display_table = pd.concat(
+        [display_table[cols[:insert_at]], case_display, display_table[cols[insert_at:]]], axis=1
+    )
+
 PCT_COLUMNS = ["Target Share %", "Air Yards Share %", "Catch Rate", "Comp %", "Matchup Percentile"]
 RATE_COLUMNS = [
     "Current Season FPPG", "Prior Season FPPG", "Delta vs Prior Season", "Projected Points",
@@ -384,9 +420,16 @@ else:
         display_table.sort_values("Projected Value", ascending=False, na_position="last") if "Projected Value" in display_table.columns else display_table,
         width="stretch", hide_index=True, column_config=column_config,
     )
+    pool_csv = build_csv_export(filtered).reset_index(drop=True)
+    case_cols = [c for c in CASE_SUMMARY_COLUMNS if c in filtered.columns]
+    case_extra = filtered[case_cols].reset_index(drop=True).copy()
+    for col in ("positives", "concerns"):
+        if col in case_extra.columns:
+            case_extra[col] = case_extra[col].apply(positives_text)
+    pool_csv = pd.concat([pool_csv, case_extra], axis=1)
     st.download_button(
         "Download Player Pool research table as CSV",
-        build_csv_export(filtered).to_csv(index=False).encode("utf-8"),
+        pool_csv.to_csv(index=False).encode("utf-8"),
         file_name="matchup_analyzer_player_pool.csv",
         mime="text/csv",
     )
@@ -448,15 +491,77 @@ else:
     cols = ["Name", "Position", "TeamAbbrev", "opponent", "Salary", "projected_value",
             "opportunity_reason", "role_display", "Pool Status",
             "recent_2_vs_season_display", "matchup_index"]
-    st.dataframe(
-        rising_display[cols].rename(columns={
-            "Name": "Player", "TeamAbbrev": "Team", "opponent": "Opponent", "Salary": "Salary",
-            "projected_value": "Projected Value", "opportunity_reason": "Opportunity Reason",
-            "role_display": "Role", "recent_2_vs_season_display": "Recent 2 vs Season",
-            "matchup_index": "Matchup Index",
-        }).sort_values("Projected Value", ascending=False, na_position="last"),
-        width="stretch", hide_index=True,
+    rising_renamed = rising_display[cols].rename(columns={
+        "Name": "Player", "TeamAbbrev": "Team", "opponent": "Opponent", "Salary": "Salary",
+        "projected_value": "Projected Value", "opportunity_reason": "Opportunity Reason",
+        "role_display": "Role", "recent_2_vs_season_display": "Recent 2 vs Season",
+        "matchup_index": "Matchup Index",
+    }).sort_values("Projected Value", ascending=False, na_position="last")
+    st.dataframe(rising_renamed, width="stretch", hide_index=True)
+    st.download_button(
+        "Download Rising Opportunity as CSV", rising_renamed.to_csv(index=False).encode("utf-8"),
+        file_name="matchup_analyzer_rising_opportunity.csv", mime="text/csv",
     )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Mixed Signals / Review (Player Case Summary) - Valid Player Pool only by
+# default, same role-safety gate as Rising Opportunity above.
+# ---------------------------------------------------------------------------
+st.subheader("🧩 Mixed Signals / Review")
+st.caption(
+    "Valid Player Pool rows whose evidence is genuinely mixed (real positives AND real concerns) or whose "
+    "positive case rests on a fragile role/low-confidence signal - worth a closer look before use. Never "
+    "monitor-only, inactive, unresolved, or excluded-by-role by default."
+)
+mixed_review = mixed_signals_review_section(filtered, include_conditional=include_conditional)
+if mixed_review.empty:
+    st.caption("No Mixed Signals / High Variance players in the current filter.")
+else:
+    mixed_display = mixed_review.copy()
+    mixed_display["Key Positive"] = mixed_display["primary_positive"].fillna("—")
+    mixed_display["Key Concern"] = mixed_display["primary_concern"].fillna("—")
+    mixed_cols = ["Name", "Position", "TeamAbbrev", "signal_alignment", "Key Positive", "Key Concern",
+                  "role_display", "Salary", "projected_value"]
+    mixed_renamed = mixed_display[mixed_cols].rename(columns={
+        "Name": "Player", "TeamAbbrev": "Team", "signal_alignment": "Signal Alignment",
+        "role_display": "Role", "Salary": "Salary", "projected_value": "Projected Value",
+    }).sort_values("Projected Value", ascending=False, na_position="last")
+    st.dataframe(mixed_renamed, width="stretch", hide_index=True)
+    st.download_button(
+        "Download Mixed Signals / Review as CSV", mixed_renamed.to_csv(index=False).encode("utf-8"),
+        file_name="matchup_analyzer_mixed_signals_review.csv", mime="text/csv",
+    )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Player-detail: full case breakdown for one selected player
+# ---------------------------------------------------------------------------
+st.subheader("🔍 Player Case Detail")
+detail_options = sorted(filtered["Name"].dropna().unique())
+if not detail_options:
+    st.caption("No players in the current filter.")
+else:
+    detail_name = st.selectbox("Select a player", detail_options, key="ma_case_detail_player")
+    detail_row = filtered[filtered["Name"] == detail_name].iloc[0]
+    detail = format_case_detail(detail_row)
+
+    st.markdown(f"**Signal Alignment: {detail_row.get('signal_alignment', '—')}**")
+    st.markdown(f"**Role:** {detail_row.get('role_display', '—')}")
+    st.markdown("**Why the app likes this player:**")
+    st.write(detail["why_liked"])
+    st.markdown("**What could break the play:**")
+    st.write(detail["what_could_break"])
+    with st.expander("Full evidence breakdown", expanded=False):
+        st.markdown(f"- **Role/availability context:** {detail['role_context']}")
+        st.markdown(f"- **Recent 2 vs 3 versus season:** {detail['recent_context']}")
+        st.markdown(f"- **Salary/projection/value:** {detail['salary_context']}")
+        st.markdown(f"- **Matchup evidence:** {detail['matchup_context']}")
+        st.markdown(f"- **Team environment evidence:** {detail['team_context']}")
+        st.markdown(f"- **Data quality notes:** {detail['data_quality_notes']}")
+        st.caption(detail["recommendation_context"])
 
 st.divider()
 
@@ -613,8 +718,13 @@ with st.expander("How to read this page"):
   view automatically - it's computed entirely separately from salary or projection (see the Lineup
   Helper page's "How projections and role/eligibility are calculated" for the full classification
   rules, reused unchanged here).
+- **Signal Alignment** (Strongly Supported / Mostly Supported / Mixed Signals / High Variance /
+  Weak Case / Insufficient Data) is a DESCRIPTIVE classification over five existing signals - role,
+  opportunity, salary/value, matchup, and team environment - never a composite score. Every
+  Primary Positive/Concern and the full evidence breakdown (Player Case Detail below) trace back
+  to a specific, named condition - there is no hidden numeric aggregation anywhere in this layer.
 - This page is decision support, not a lineup generator - it surfaces evidence (role, volume,
-  matchup, team environment) so you can apply your own judgment. It never computes a composite
-  score, ownership projection, or ceiling/boom-bust model.
+  matchup, team environment, opportunity, and the case-summary layer above) so you can apply your
+  own judgment. It never computes a composite score, ownership projection, or ceiling/boom-bust model.
         """
     )
