@@ -793,12 +793,79 @@ Matchup Index (one point per team+opponent+position actually in the slate).
 Every chart excludes rows with a null value on either axis rather than
 plotting a fabricated zero.
 
+### Player Comparison / Case Detail (`lib/player_comparison.py`)
+
+A presentation-only section (not a separate page) for comparing up to
+`MAX_COMPARISON_PLAYERS` (4) players side-by-side, from the FULL loaded
+slate (independent of the Controls filters above). It computes **nothing
+new** - every cell in `lib.player_comparison.build_comparison_table` reads
+one already-existing field from the already-built matchup/case-summary row
+(`Salary`, `projected_points`, `projected_value`, `role_display`/
+`role_classification`, `role_data_freshness`, `eligibility_reason`,
+`opportunity_label_display`, `opportunity_reason`,
+`opportunity_confidence_display`, `position_percentile_most_favorable`,
+`fantasy_points_allowed_per_game`, `defensive_games_played`,
+`team_recent_form_label`, `team_offensive_momentum_yards`,
+`signal_alignment`) - see `lib.player_comparison.COMPARISON_METRICS` for
+the exact list. There is no ranking, highlighting, or automatic "winner":
+metrics are rows, players are columns, and a missing value always renders
+as `"Unavailable"`, never a fabricated 0 - missing evidence is never
+recast as a negative finding.
+
+- **Stable identity, never a bare name**: each DK slate row's selector/
+  comparison-column label is built from `lib.player_comparison.
+  slate_row_uid` - the SAME `(Name, TeamAbbrev, Position, Salary)` identity
+  tuple this module already treats a slate row as unique by (see
+  `rising_opportunity_section`'s own `drop_duplicates` subset) - so two
+  different players sharing a name are always distinguishable by team and
+  position in the selector.
+- **Eligibility section is reused, never reimplemented**:
+  `lib.player_comparison.player_section_label` calls the EXACT SAME
+  `valid_player_pool` / `featured_top_value` / `plays_to_monitor` /
+  `excluded_by_role_context` / `needs_review_rows` / `inactive_players`
+  functions the rest of the page already uses, on a one-row frame - a
+  restricted/inactive player's status in a comparison is always identical
+  to its status everywhere else on the page, never softened.
+- **Case Details** (one expander per selected player) reuse
+  `lib.player_case_summary.format_case_detail` verbatim - classification
+  reason, positive evidence, concerns, missing evidence, sample warnings,
+  and eligibility restrictions are the SAME fields shown in the page's
+  "Player Case Detail" section, never independently reclassified.
+- **Slate-change safety**: selections are keyed by `slate_row_uid` and
+  pruned against the CURRENT slate's uids
+  (`lib.player_comparison.resolve_selected_uids`) every run. When the
+  loaded salary file changes (a new upload, or the committed file being
+  replaced) and a previously-selected player no longer exists on the new
+  slate, that selection is dropped automatically with an explicit message
+  - never left pointing at stale data, never crashing on an invalid widget
+  value.
+- **Schema safety**: `REQUIRED_COMPARISON_COLUMNS` is checked
+  (`lib.schema_guard.missing_columns`) before the section renders. A
+  legacy mart missing a required column shows one actionable message
+  ("Run `python dfs_data_pipeline.py`...") instead of a raw `KeyError`.
+  **This is not hypothetical** - the real, currently-committed
+  `data/defense_reporting.parquet` predates the prior Reporting Integrity
+  pass's pipeline change and genuinely lacks `defensive_games_played`
+  (regenerating it needs network access to nflreadpy this environment
+  doesn't have). `lib.matchup_analyzer._merge_defense_extra` already fills
+  that gap with null at merge time, so the comparison's own guard doesn't
+  fire for this specific case - affected cells just read "Unavailable" -
+  but the guard exists for the case where a future schema change removes a
+  column that merge helper doesn't know to backfill.
+- **No probability or game-script inference**: Matchup Favorability
+  Percentile is presented as exactly that - a percentile of historical DvP
+  evidence - never as a probability of success, and nothing here infers
+  game script, offensive intent, or pass/run tendency from fields that
+  don't exist in this project's data.
+
 ### What this page deliberately does NOT do
 
 No Smash Score, ownership projection, boom/bust model, ceiling model, or any
 other composite ranking - every number on the page traces back to a real,
 named source column. It is decision support, not a lineup generator (see
-the in-page "How to read this page" expander).
+the in-page "How to read this page" expander). The Player Comparison
+section adds no exception to this - it is a side-by-side READ of existing
+evidence, never a new score or an automatic pick.
 
 ## In-Season Opportunity Model (`lib/opportunity_model.py`, `lib/opportunity_config.py`, `data/player_opportunity_reporting.parquet`)
 
@@ -1651,6 +1718,51 @@ file too:
   coverage of the new columns/filters/sections/player-detail selector
   rendering safely, including empty-result paths.
 
+The Player Comparison / Case Detail UX pass has its own dedicated test
+files too:
+
+- `tests/test_player_comparison.py` - stable identifiers distinguishing
+  duplicate names by team/position; comparison labels handling missing
+  name/team/salary without crashing; candidate filtering (same-position
+  default, "All" lifting it, restricted/inactive players never excluded
+  from candidacy); stale-selection resolution preserving order and marking
+  everything stale against an empty current slate; `player_section_label`
+  matching every existing section function's own criteria exactly
+  (Inactive/Excluded/Monitor/Featured/Needs Review); comparison-table
+  formatting (missing values render "Unavailable" never 0, real values get
+  correct units, one column per selected player, no ranking/winner/score
+  row ever appears in the output).
+- `tests/test_schema_guard.py` - presence-only column checking (a null-
+  valued-but-present column is never "missing"), `None`/empty-frame
+  handling, and the refresh message naming both the missing columns and
+  the fix.
+- `tests/test_matchup_analyzer.py` additions - restricted/inactive players
+  (Hurt Runner/Bench Wideout/Unresolved QB) retaining their real
+  eligibility section and context text inside a comparison; a missing DvP
+  sample rendering "Unavailable"; a round-trip through the comparison
+  helpers leaving the source table byte-identical (no mutation); `AppTest`
+  coverage of selecting 2 and 4 players, the native `max_selections=4`
+  selection-limit behavior, a single selection prompting for more instead
+  of rendering, duplicate names producing two distinguishable selector
+  entries, a changed salary file safely dropping stale selections with an
+  explanatory message, the historical-slate caption appearing above the
+  comparison section, a monkeypatched legacy-schema scenario showing the
+  refresh message, and - importantly - proof that the REAL currently-
+  committed `defense_reporting.parquet`'s missing `defensive_games_played`
+  column renders "Unavailable" everywhere in the comparison rather than
+  crashing or silently substituting `games_in_sample`. Also documents (via
+  a test that asserts the `TypeError` it raises) a pre-existing, out-of-
+  scope defect in `lib.player_case_summary._evaluate_opportunity` found
+  while building this pass - see "Known limitations."
+- `tests/test_defense_matchups_page.py` (new `AppTest` file - this page had
+  no page-level test coverage before this pass) - proves the REAL committed
+  mart's missing-column condition now produces an actionable refresh
+  message instead of the raw, unhandled `KeyError` it previously raised
+  (verified against the prior commit); proves the guard never substitutes
+  `games_in_sample` for the missing `defensive_games_played`; and proves
+  the guard gets out of the way once a (simulated) regenerated mart has the
+  required columns.
+
 ## Known limitations
 
 - **Early-season small samples.** With 1-2 games played, `consistency_score`
@@ -1784,3 +1896,40 @@ file too:
     remains firmly OFF by default and is not expected to be enabled without
     a separate, explicit product decision - this pass did not evaluate
     whether that exception should ever ship.
+- **Player Comparison / Case Detail UX pass - findings and remaining limitations.**
+  - **The real, committed `data/defense_reporting.parquet` was found to be
+    on the OLD schema** (missing `defensive_games_played`/
+    `player_game_row_count`) - the prior Reporting Integrity pass fixed the
+    PIPELINE CODE but the mart itself was never regenerated (that requires
+    network access to nflreadpy this environment doesn't have). Before this
+    pass added a schema guard, `pages/2_Defense_Matchups.py` raised a raw,
+    unhandled `KeyError: 'defensive_games_played'` on this real data -
+    verified against the prior commit. It now shows an actionable "run the
+    pipeline" message instead. **Run `python dfs_data_pipeline.py` against a
+    real data source to regenerate the mart** and clear this condition;
+    until then, Defense vs Position is unusable and Matchup Analyzer's
+    matchup-sample fields read "Unavailable" (gracefully, via
+    `lib.matchup_analyzer._merge_defense_extra`'s existing null-fill, not
+    this pass's guard).
+  - **A pre-existing defect was found, not fixed** (out of scope - "do not
+    change... case-summary classification logic"): `lib.player_case_
+    summary._evaluate_opportunity` does `if label == "rising_opportunity"`
+    with no `pd.notna()` guard. Any role-safe (non-inactive/unresolved/
+    unmatched) player with a null `opportunity_label` - which happens
+    whenever `player_opportunity_reporting.parquet` is missing or empty -
+    raises `TypeError: boolean value of NA is ambiguous` instead of
+    degrading gracefully. Not reachable with today's real committed data
+    (that mart is populated), but reachable if it ever goes missing/empty
+    while other marts remain. See
+    `tests/test_matchup_analyzer.py::test_build_case_summary_requires_non_null_opportunity_label_for_safe_roles`,
+    which documents and locks in the current behavior rather than silently
+    patching it.
+  - The comparison's own `REQUIRED_COMPARISON_COLUMNS` schema guard is
+    effectively a defense-in-depth backstop today, not the mechanism
+    currently preventing a crash on the real stale defense mart - the merge
+    helper's existing null-fill already handles that case. It would fire if
+    a future change to `build_matchup_analyzer_table` dropped one of its
+    own output columns outright.
+  - Comparison selection state (`cmp_selected_uids`) is session-local
+    (`st.session_state`), like every other filter on this page - it is not
+    saved, shared, or restored across browser sessions.

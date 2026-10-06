@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 from datetime import datetime, timezone
@@ -58,7 +59,17 @@ from lib.player_case_summary import (
     mixed_signals_review_section,
     positives_text,
 )
+from lib.player_comparison import (
+    MAX_COMPARISON_PLAYERS,
+    REQUIRED_COMPARISON_COLUMNS,
+    attach_row_uid,
+    build_comparison_table,
+    candidate_players,
+    comparison_label,
+    resolve_selected_uids,
+)
 from lib.role_config import DEPTH_CHART_FRESHNESS_HOURS, INJURY_FRESHNESS_HOURS
+from lib.schema_guard import missing_columns, refresh_message
 
 st.set_page_config(page_title="Matchup Analyzer | NFL DFS", page_icon="🔎", layout="wide")
 
@@ -515,6 +526,107 @@ else:
         file_name="matchup_analyzer_player_pool.csv",
         mime="text/csv",
     )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Player Comparison (presentation-only UX pass) - up to MAX_COMPARISON_PLAYERS
+# players, selected from the FULL loaded slate (independent of the Controls
+# filters above), compared side-by-side using fields this page already
+# computes. See lib.player_comparison's module docstring - no new
+# projection, eligibility, opportunity classification, or case-summary
+# signal is computed here, and no column is ranked or named a "winner."
+# ---------------------------------------------------------------------------
+st.subheader("🆚 Player Comparison")
+st.caption(
+    f"Salary slate: season {slate_meta.get('season', '—')}, Week {slate_meta.get('week', '—')} · "
+    f"Stats through Week {meta.get('latest_completed_week', '—')}."
+    + (" **Previous slate loaded — historical/review context, not current upcoming-slate research.**"
+       if _slate_week_val is not None and _intended_upcoming_week is not None and _slate_week_val < _intended_upcoming_week
+       else "")
+)
+st.caption(
+    f"Compare up to {MAX_COMPARISON_PLAYERS} players side-by-side using the same projection, "
+    "role/eligibility, opportunity, matchup, and case-summary fields shown elsewhere on this page. "
+    "Restricted/inactive players remain selectable and show their restriction here, never hidden. "
+    "A higher matchup percentile reflects historical DvP evidence, not a probability of success - "
+    "this is a side-by-side read of existing evidence, never a new ranking, score, or automatic pick."
+)
+
+_cmp_missing = missing_columns(table, REQUIRED_COMPARISON_COLUMNS)
+if _cmp_missing:
+    st.warning(refresh_message(_cmp_missing), icon="⚠️")
+else:
+    table_with_uid = attach_row_uid(table)
+
+    # Slate-change detection: a changed salary file (new bytes, regardless of
+    # whether the underlying marts also changed) must never leave a stale
+    # selection pointing at a player who no longer exists on this slate -
+    # see lib.player_comparison.resolve_selected_uids.
+    _cmp_slate_signature = hashlib.sha256(file_bytes).hexdigest()
+    st.session_state.setdefault("cmp_selected_uids", [])
+    st.session_state.setdefault("cmp_slate_signature", None)
+    st.session_state.setdefault("cmp_position", POSITIONS[0] if POSITIONS else "All")
+
+    cmp_position = st.selectbox(
+        "Comparison position (defaults to same-position comparison)",
+        ["All"] + POSITIONS, key="cmp_position",
+    )
+    candidates = candidate_players(table_with_uid, cmp_position)
+
+    previous_uids = st.session_state["cmp_selected_uids"]
+    valid_uids, stale_uids = resolve_selected_uids(candidates, previous_uids)
+    valid_uids = valid_uids[:MAX_COMPARISON_PLAYERS]
+    slate_changed = (
+        st.session_state["cmp_slate_signature"] is not None
+        and st.session_state["cmp_slate_signature"] != _cmp_slate_signature
+    )
+    if stale_uids and slate_changed:
+        st.info(
+            f"The loaded salary slate changed - {len(stale_uids)} player selection(s) were removed "
+            "because they're no longer on this slate."
+        )
+    st.session_state["cmp_selected_uids"] = valid_uids
+    st.session_state["cmp_slate_signature"] = _cmp_slate_signature
+
+    label_by_uid = {r["slate_row_uid"]: comparison_label(r) for _, r in candidates.iterrows()}
+    selected_uids = st.multiselect(
+        f"Select up to {MAX_COMPARISON_PLAYERS} players to compare",
+        options=list(label_by_uid.keys()),
+        format_func=lambda u: label_by_uid.get(u, u),
+        max_selections=MAX_COMPARISON_PLAYERS,
+        key="cmp_selected_uids",
+    )
+
+    if len(selected_uids) < 2:
+        st.caption("Select at least 2 players to compare.")
+    else:
+        selected_rows = candidates[candidates["slate_row_uid"].isin(selected_uids)]
+        # isin() does not preserve selection order - restore it explicitly.
+        selected_rows = selected_rows.set_index("slate_row_uid").loc[selected_uids].reset_index()
+        comparison_table = build_comparison_table(selected_rows)
+        st.dataframe(comparison_table, width="stretch")
+
+        st.markdown("**Case Details**")
+        st.caption(
+            "Reuses the exact Player Case Summary fields shown in the Player Case Detail section below - "
+            "nothing here is independently reclassified."
+        )
+        for _, row in selected_rows.iterrows():
+            with st.expander(comparison_label(row), expanded=False):
+                detail = format_case_detail(row)
+                st.markdown(f"**Signal Alignment:** {row.get('signal_alignment', '—')}")
+                st.caption(detail["classification_reason"])
+                st.markdown("**Positive evidence:**")
+                st.write(detail["why_liked"])
+                st.markdown("**Concerns:**")
+                st.write(detail["what_could_break"])
+                st.markdown("**Missing evidence (not a concern - absent corroboration):**")
+                st.write(detail["missing_evidence"])
+                st.markdown("**Sample-size warnings:**")
+                st.write(detail["sample_warnings"])
+                st.markdown("**Eligibility restrictions:**")
+                st.write(detail["role_context"])
 
 st.divider()
 
