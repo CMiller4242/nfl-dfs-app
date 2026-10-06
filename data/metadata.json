@@ -3,12 +3,12 @@
   "active_season": 2026,
   "source_season": 2026,
   "app_mode": "in_season",
-  "latest_completed_week": 3,
-  "next_slate_week": 4,
-  "last_updated": "2026-10-05T20:12:49.473204+00:00",
+  "latest_completed_week": 4,
+  "next_slate_week": 5,
+  "last_updated": "2026-10-06T17:02:30.402464+00:00",
   "status": "ok",
-  "player_rows": 1078,
-  "player_count": 454,
+  "player_rows": 1436,
+  "player_count": 474,
   "teams": [
     "ARI",
     "ATL",
@@ -50,5 +50,22 @@
   "defense_reporting_mode": "in_season",
   "defense_reporting_rows": 128,
   "defense_reporting_season": 2026,
-  "opportunity_reporting_rows": 454
+  "opportunity_reporting_rows": 474,
+  "team_offense_position_reporting_rows": 128,
+  "team_defense_position_reporting_rows": 128,
+  "upcoming_schedule_rows": 416,
+  "upcoming_schedule_available": true,
+  "fantasy_scoring_basis": "PPR",
+  "unresolved_position_production": {
+    "unresolved_position_rows": 12,
+    "unresolved_position_points": 32.0,
+    "unresolved_positions": [
+      "C",
+      "CB",
+      "DT",
+      "FB",
+      "G",
+      "P"
+    ]
+  }
 }
