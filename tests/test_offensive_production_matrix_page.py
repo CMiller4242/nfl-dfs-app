@@ -49,13 +49,15 @@ def _synthetic_marts():
 
 
 # ---------------------------------------------------------------------------
-# Real committed data: graceful degradation, never a raw KeyError (Part 8)
+# Missing-mart scenario: graceful degradation, never a raw KeyError (Part 8).
+# Forced deterministically via monkeypatch - never by asserting that the
+# real, currently-committed mart happens to be absent, since a real
+# pipeline run (live network access, which this suite never has) may have
+# already regenerated it.
 # ---------------------------------------------------------------------------
-def test_page_renders_actionable_message_not_crash_when_mart_missing_on_real_data():
-    assert data_module.load_team_offense_position_reporting().empty, (
-        "team_offense_position_reporting.parquet now exists on the real committed data - "
-        "this test's premise (the mart hasn't been regenerated in this environment) no longer holds."
-    )
+def test_page_shows_refresh_message_not_a_crash_on_simulated_missing_offense_mart(monkeypatch):
+    monkeypatch.setattr(data_module, "load_team_offense_position_reporting", lambda: pd.DataFrame())
+    monkeypatch.setattr(data_module, "load_team_defense_position_reporting", lambda: pd.DataFrame())
     st.cache_data.clear()
     at = AppTest.from_file(PAGE_PATH, default_timeout=120)
     at.run()
@@ -63,16 +65,41 @@ def test_page_renders_actionable_message_not_crash_when_mart_missing_on_real_dat
     assert any("Run `python dfs_data_pipeline.py`" in w.value for w in at.warning)
 
 
-def test_page_drilldown_still_works_when_matrix_mart_is_missing():
+def test_page_drilldown_still_works_when_offense_mart_is_simulated_missing(monkeypatch):
     # Part 8: a missing/legacy mart must disable only the AFFECTED
     # component - the player-distribution drill-down (which only needs
-    # players_weekly) must keep working.
+    # players_weekly) must keep working. Both the "mart missing" condition
+    # and the "players_weekly has data" condition are forced explicitly
+    # here, rather than relying on ambient real-data state for either.
+    monkeypatch.setattr(data_module, "load_team_offense_position_reporting", lambda: pd.DataFrame())
+    monkeypatch.setattr(data_module, "load_team_defense_position_reporting", lambda: pd.DataFrame())
+    monkeypatch.setattr(data_module, "load_players_weekly", lambda: _synthetic_weekly())
     st.cache_data.clear()
     at = AppTest.from_file(PAGE_PATH, default_timeout=120)
     at.run()
     assert not at.exception
-    if not data_module.load_players_weekly().empty:
-        assert len(at.selectbox) >= 2  # team + position selectors for the drilldown
+    assert any("Run `python dfs_data_pipeline.py`" in w.value for w in at.warning)
+    assert len(at.selectbox) >= 2  # team + position selectors for the drilldown
+
+
+def test_page_shows_matrix_not_refresh_message_on_simulated_present_offense_mart():
+    # Current-schema success coverage alongside the missing-mart scenario
+    # above - when the offense mart IS present with the current schema,
+    # the refresh-message warning must NOT appear. Uses the same synthetic,
+    # isolated marts the rest of this file already builds via
+    # `_synthetic_marts()`, so it is deterministic regardless of whether
+    # the real committed marts exist yet in this environment.
+    weekly, offense, defense, upcoming = _synthetic_marts()
+    with mock.patch.object(data_module, "load_team_offense_position_reporting", return_value=offense), \
+         mock.patch.object(data_module, "load_team_defense_position_reporting", return_value=defense), \
+         mock.patch.object(data_module, "load_upcoming_schedule", return_value=upcoming), \
+         mock.patch.object(data_module, "load_players_weekly", return_value=weekly):
+        st.cache_data.clear()
+        at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+        at.run()
+        assert not at.exception
+        assert not any("Run `python dfs_data_pipeline.py`" in w.value for w in at.warning)
+        assert not any("older pipeline schema" in w.value for w in at.warning)
 
 
 def test_page_legacy_schema_missing_percentile_column_shows_refresh_message(monkeypatch):
