@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import streamlit as st
 
+from lib.cache_fingerprint import reporting_inputs_fingerprint
 from lib.data import (
     POSITIONS,
     data_freshness_caption,
@@ -210,9 +211,38 @@ source_cols[2].metric("Slate week", slate_week if slate_week is not None else "�
 source_cols[3].metric("File last updated", slate_updated_display)
 st.caption(f"Active file: `{active_filename}`")
 
+# ---------------------------------------------------------------------------
+# Slate rollover integrity (Issue 4): an older slate stays fully usable for
+# review, it's just never described as current upcoming-slate research -
+# see pages/5_Matchup_Analyzer.py's identical convention.
+# ---------------------------------------------------------------------------
+_intended_upcoming_week = meta.get("next_slate_week")
+if slate_week is not None and _intended_upcoming_week is not None and slate_week < _intended_upcoming_week:
+    st.warning(
+        f"**Previous slate loaded — not current upcoming-slate research.** The loaded DK salary slate "
+        f"is Week {slate_week}, but the statistical pipeline's intended upcoming slate is Week "
+        f"{_intended_upcoming_week}. Still fully usable for reviewing that past week's research.",
+        icon="⚠️",
+    )
+if slate_season is not None and active_season is not None and slate_season != active_season:
+    st.warning(
+        f"**Salary slate season mismatch.** The loaded DK salary slate is season {slate_season}, but "
+        f"the statistical pipeline's active season is {active_season}. Treat projections with caution "
+        "until the matching season's data or slate is loaded.",
+        icon="🚨",
+    )
+
 
 @st.cache_data(show_spinner="Matching players and computing projections...")
-def process_dk_csv(file_bytes: bytes, mode: str) -> pd.DataFrame:
+def process_dk_csv(file_bytes: bytes, mode: str, inputs_fingerprint: str) -> pd.DataFrame:
+    """
+    `inputs_fingerprint` (lib.cache_fingerprint.reporting_inputs_fingerprint)
+    is an explicit, hashed cache argument covering every parquet/json file
+    this function reads internally (players_current, prior-season baseline,
+    defense_reporting) besides `file_bytes`/`mode` themselves - see that
+    module's docstring for why a no-argument cached function reading these
+    internally would never notice a changed file on disk.
+    """
     dk_df = pd.read_csv(io.BytesIO(file_bytes))
     missing = validate_dk_columns(dk_df)
     if missing:
@@ -234,7 +264,7 @@ def process_dk_csv(file_bytes: bytes, mode: str) -> pd.DataFrame:
 
 
 try:
-    result = process_dk_csv(file_bytes, app_mode)
+    result = process_dk_csv(file_bytes, app_mode, reporting_inputs_fingerprint())
 except ValueError as exc:
     st.error(str(exc))
     st.stop()

@@ -217,12 +217,19 @@ DEFENSE_REPORTING_COLUMNS = [
     # Identity / context
     "season", "defense_team", "position", "games_in_sample", "latest_completed_week",
     "source_last_updated_utc", "reporting_mode", "sample_size_label",
+    # Honest sample-count fields (see build_defense_reporting docstring):
+    # `games_in_sample`/`player_game_row_count` are the SAME raw player-row
+    # count (kept both for backward compatibility and for an explicit name
+    # that cannot be misread as a defensive-game count). `defensive_games_played`
+    # is the real distinct-week count this defense has faced this position,
+    # and is what sample_size_label/confidence/min-games filters use.
+    "player_game_row_count", "defensive_games_played",
     # Season DvP (every completed player-row averaged directly - see docstring)
     "fantasy_points_allowed_per_game", "league_avg_points_allowed_for_position",
     "matchup_index", "matchup_delta",
     "position_rank_most_favorable", "position_percentile_most_favorable",
     # Recent DvP (last DEFENSE_RECENT_FORM_GAMES played weeks, from build_defense_position_weekly)
-    "last_3_games_count", "last_3_games_points_allowed_per_game",
+    "last_3_games_count", "recent_defensive_games_used", "last_3_games_points_allowed_per_game",
     "last_3_games_matchup_index", "last_3_games_matchup_delta",
     "dvp_recent_trend_delta", "dvp_trend_label",
 ]
@@ -776,15 +783,46 @@ def build_defense_reporting(weekly_df, season, reporting_mode, now=None):
     fantasy-points-allowed / matchup_index / matchup_delta / percentile
     always means a MORE FAVORABLE matchup for the offensive DFS player.
 
-    Season DvP averages every completed player-row directly (not through
-    `build_defense_position_weekly`), exactly preserving the old DAX's
-    `AVERAGE(PlayerStats[fantasy_points_ppr])` - a week where a defense
-    faced 2 WRs contributes 2 rows to that average, matching the original
-    Power BI report's own behavior ("games_in_sample" is a raw row count for
-    the same reason). Recent DvP (last `DEFENSE_RECENT_FORM_GAMES` played
-    weeks), by contrast, is computed from `build_defense_position_weekly`
-    (one row per week) so every week counts equally there - see
-    `_defense_recent_form`.
+    Season DvP (`fantasy_points_allowed_per_game`) averages every completed
+    PLAYER-ROW directly (not through `build_defense_position_weekly`),
+    exactly preserving the old DAX's `AVERAGE(PlayerStats[fantasy_points_ppr])`
+    - a week where a defense faced 2 WRs contributes 2 rows to that average,
+    matching the original Power BI report's own behavior. This raw row count
+    is `games_in_sample` (kept, unchanged, for backward compatibility) /
+    `player_game_row_count` (the same value under an honest name) - it is a
+    count of opposing-player APPEARANCES, never a count of defensive games.
+    Read `fantasy_points_allowed_per_game` as "average PPR per opposing
+    player appearance," not as a sum of positional fantasy points allowed
+    per defense-game.
+
+    `defensive_games_played` is the real distinct-defensive-game count (one
+    per week this defense faced the position at all, from
+    `build_defense_position_weekly`'s already one-row-per-week grain) and is
+    what `sample_size_label`, confidence, and any "minimum games" filter use
+    - a week with 2 WR appearances is exactly ONE defensive game, never two.
+    This number is always <= `games_in_sample`/`player_game_row_count` for
+    single-player positions (QB/TE in most offenses) and can be materially
+    smaller for WR, where multiple starters commonly face the same defense
+    the same week.
+
+    Recent DvP (last `DEFENSE_RECENT_FORM_GAMES` played weeks) is computed
+    from `build_defense_position_weekly` (one row per week) so every week
+    counts equally there - see `_defense_recent_form`. Its sample count,
+    `last_3_games_count` (aliased here as `recent_defensive_games_used`),
+    was ALREADY a correct distinct-game count before this pass; only the
+    season-level count had the row/game ambiguity.
+
+    Season DvP and recent DvP are not directly comparable confidence-wise:
+    season DvP weights every player-row equally (so a defense that faced 2
+    WRs in one week counts that week "twice" in the season average), while
+    recent DvP weights every WEEK equally (that same week counts once,
+    averaged across whichever players appeared). A trend comparison between
+    the two (`dvp_recent_trend_delta`/`dvp_trend_label`) is therefore
+    comparing a row-weighted average against a week-weighted average, not
+    two numbers computed the same way - this is intentional (it preserves
+    each number's own documented historical formula) but is a real
+    difference in what's being averaged, not just a difference in window
+    length.
 
     `reporting_mode` is "in_season" or "preseason_baseline" (last season's
     full completed season used as a Week 1 stand-in - see
@@ -827,6 +865,18 @@ def build_defense_reporting(weekly_df, season, reporting_mode, now=None):
     )
 
     weekly = build_defense_position_weekly(weekly_df, season)
+
+    # Distinct-defensive-game count: `weekly` is already one row per
+    # (defense_team, position, week) by construction, so a plain row count
+    # here IS a distinct-game count - no new "games_in_sample" semantics are
+    # invented, this just counts a table that was already at the right grain.
+    defensive_games = (
+        weekly.groupby(["defense_team", "position"]).size().rename("defensive_games_played").reset_index()
+    )
+    season_grp = season_grp.merge(defensive_games, on=["defense_team", "position"], how="left")
+    season_grp["defensive_games_played"] = season_grp["defensive_games_played"].fillna(0).astype(int)
+    season_grp["player_game_row_count"] = season_grp["games_in_sample"]
+
     league_avg_lookup = league_avg.to_dict()
     season_points_lookup = season_grp.set_index(["defense_team", "position"])["fantasy_points_allowed_per_game"]
 
@@ -845,11 +895,14 @@ def build_defense_reporting(weekly_df, season, reporting_mode, now=None):
     merged["reporting_mode"] = reporting_mode
     merged["latest_completed_week"] = int(weekly_df["week"].max())
     merged["source_last_updated_utc"] = (now or datetime.now(timezone.utc)).isoformat()
-    merged["sample_size_label"] = merged["games_in_sample"].apply(_sample_size_label)
+    # Confidence/sample-size labeling uses the distinct-defensive-game count,
+    # never the player-row count - see build_defense_reporting's docstring.
+    merged["sample_size_label"] = merged["defensive_games_played"].apply(_sample_size_label)
+    merged["recent_defensive_games_used"] = merged["last_3_games_count"]
 
     if reporting_mode == "preseason_baseline":
         recency_numeric_cols = [
-            "last_3_games_count", "last_3_games_points_allowed_per_game",
+            "last_3_games_count", "recent_defensive_games_used", "last_3_games_points_allowed_per_game",
             "last_3_games_matchup_index", "last_3_games_matchup_delta", "dvp_recent_trend_delta",
         ]
         merged[recency_numeric_cols] = float("nan")

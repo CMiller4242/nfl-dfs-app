@@ -39,6 +39,7 @@ from dfs_data_pipeline import safe_divide
 from lib.opportunity_config import (
     MIN_GAMES_FOR_ANY_CLASSIFICATION,
     MIN_GAMES_FOR_ESTABLISHED_SAMPLE,
+    OPPORTUNITY_POOL_PROMOTION_ENABLED,
     OPPORTUNITY_POOL_PROMOTION_MIN_GAMES,
     OPPORTUNITY_POOL_PROMOTION_WORKLOAD_FLOOR,
     QB_DECLINING_ATTEMPTS_DELTA,
@@ -521,42 +522,68 @@ def compute_role_safety_gate(row) -> dict:
     `role_data_freshness`, `role_eligible_for_pool`,
     `role_eligible_for_top_values`), return
     {opportunity_pool_eligible, opportunity_top_value_eligible,
-    opportunity_eligibility_reason}.
+    opportunity_eligibility_reason, workload_watchlist_eligible,
+    workload_watchlist_reason, role_review_required}.
 
-    This NEVER overrides inactive or role_unresolved, and NEVER promotes
-    contingent_backup (a rising-opportunity player who is contingent on a
-    Questionable/Doubtful blocker remains monitor-only - see
-    lib.opportunity_config). The only classification this can promote
-    beyond the existing role engine's own role_eligible_for_pool is
-    bench_no_clear_path, and only into the Player Pool (never Top Value),
-    and only when every configured gate passes.
+    Role-safety hardening (Reporting Integrity pass): a workload signal
+    ALONE can never override inactive, role_unresolved, bench_no_clear_path,
+    or contingent_backup - see lib.opportunity_config's "Workload Watchlist
+    / Role Review policy" docstring. `opportunity_pool_eligible` /
+    `opportunity_top_value_eligible` therefore always mirror the existing,
+    unmodified role engine's own `role_eligible_for_pool` /
+    `role_eligible_for_top_values` UNLESS the disabled-by-default
+    `OPPORTUNITY_POOL_PROMOTION_ENABLED` config flag has been explicitly
+    turned on by a human - that flag is the only way workload can ever add
+    pool eligibility beyond the role engine's own determination, and even
+    then only for bench_no_clear_path, only into the Player Pool (never Top
+    Value), and only once every gate below passes.
+
+    Independently of that flag, a bench_no_clear_path player whose recent
+    workload clears the same gates always gets
+    `workload_watchlist_eligible = True` / `role_review_required = True` -
+    a RESEARCH-ONLY signal for a separate "Workload Watchlist / Role
+    Review" section, never Player Pool eligibility or Top Value approval.
     """
     role_classification = row.get("role_classification")
     role_eligible_for_pool = _safe_bool(row.get("role_eligible_for_pool"))
     role_eligible_for_top_values = _safe_bool(row.get("role_eligible_for_top_values"))
+
+    base = {
+        "opportunity_pool_eligible": role_eligible_for_pool,
+        "opportunity_top_value_eligible": role_eligible_for_top_values,
+        "opportunity_eligibility_reason": (
+            "Existing role eligibility applies; opportunity classification adds no promotion here."
+        ),
+        "workload_watchlist_eligible": False,
+        "workload_watchlist_reason": None,
+        "role_review_required": False,
+    }
 
     if role_classification in ("inactive", "role_unresolved") or role_classification is None:
         reason = (
             "Role safety: inactive players are never eligible." if role_classification == "inactive"
             else "Role safety: role/injury identity is unresolved."
         )
-        return {
-            "opportunity_pool_eligible": False,
-            "opportunity_top_value_eligible": False,
-            "opportunity_eligibility_reason": reason,
-        }
+        base["opportunity_pool_eligible"] = False
+        base["opportunity_top_value_eligible"] = False
+        base["opportunity_eligibility_reason"] = reason
+        return base
 
-    if role_eligible_for_pool or role_classification != "bench_no_clear_path":
-        return {
-            "opportunity_pool_eligible": role_eligible_for_pool,
-            "opportunity_top_value_eligible": role_eligible_for_top_values,
-            "opportunity_eligibility_reason": (
-                "Existing role eligibility applies; opportunity classification adds no promotion here."
-            ),
-        }
+    if role_classification != "bench_no_clear_path":
+        # role_eligible_for_pool/top_values already reflects the existing
+        # role engine's own determination (e.g. contingent_backup's
+        # pool-eligible-but-not-top-values split) - opportunity data adds
+        # nothing here, by design.
+        return base
 
-    # Only remaining case: role_classification == "bench_no_clear_path" and
-    # role_eligible_for_pool is False - the one narrow, configured promotion.
+    # bench_no_clear_path: never pool/top-value eligible from workload alone.
+    base["opportunity_pool_eligible"] = False
+    base["opportunity_top_value_eligible"] = False
+    base["opportunity_eligibility_reason"] = (
+        "Bench, no clear path - role safety is never overridden by workload alone; "
+        "see Workload Watchlist / Role Review for research visibility."
+    )
+
     role_data_freshness = row.get("role_data_freshness")
     role_fresh = pd.notna(role_data_freshness) and role_data_freshness == "fresh"
     games_played = row.get("games_played")
@@ -565,23 +592,35 @@ def compute_role_safety_gate(row) -> dict:
     workload = primary_workload_last_2(row)
     floor = OPPORTUNITY_POOL_PROMOTION_WORKLOAD_FLOOR.get(position)
 
-    promote = (
+    watchlist_eligible = bool(
         role_fresh
         and pd.notna(games_played) and games_played >= OPPORTUNITY_POOL_PROMOTION_MIN_GAMES
         and pd.notna(opportunity_label) and opportunity_label == "rising_opportunity"
         and floor is not None and pd.notna(workload) and workload >= floor
     )
-    if promote:
-        return {
-            "opportunity_pool_eligible": True,
-            "opportunity_top_value_eligible": False,
-            "opportunity_eligibility_reason": (
-                f"Player Pool only - rising workload ({workload:.1f} primary volume/game, last 2 games) "
-                "overcomes the bench/no-clear-path exclusion for research purposes; not yet Top-Value eligible."
-            ),
-        }
-    return {
-        "opportunity_pool_eligible": False,
-        "opportunity_top_value_eligible": False,
-        "opportunity_eligibility_reason": "Bench, no clear path, and the rising-workload promotion gates are not met.",
-    }
+
+    if not watchlist_eligible:
+        base["opportunity_eligibility_reason"] = (
+            "Bench, no clear path, and the rising-workload watchlist gates are not met."
+        )
+        return base
+
+    base["workload_watchlist_eligible"] = True
+    base["role_review_required"] = True
+    base["workload_watchlist_reason"] = (
+        f"Rising workload ({workload:.1f} primary volume/game, last 2 games) despite a "
+        "bench/no-clear-path role with no confirmed injury path ahead of them - research "
+        "visibility only, not Player Pool eligibility or Top Value approval."
+    )
+
+    if OPPORTUNITY_POOL_PROMOTION_ENABLED:
+        # Disabled by default - see lib.opportunity_config. Only reachable
+        # when a human has explicitly opted into this exception.
+        base["opportunity_pool_eligible"] = True
+        base["opportunity_eligibility_reason"] = (
+            f"Player Pool only - rising workload ({workload:.1f} primary volume/game, last 2 games) "
+            "overcomes the bench/no-clear-path exclusion for research purposes (explicit config "
+            "opt-in enabled); not Top-Value eligible."
+        )
+
+    return base

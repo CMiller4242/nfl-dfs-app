@@ -38,7 +38,34 @@ def test_fantasy_points_allowed_per_game_is_simple_average_of_every_row():
     out = build_defense_reporting(pd.DataFrame(rows), 2025, "in_season")
     row = _get(out, "DEFA", "WR")
     assert row["games_in_sample"] == 3  # raw row count, not distinct weeks
+    assert row["player_game_row_count"] == 3  # same value under an honest name
     assert row["fantasy_points_allowed_per_game"] == pytest.approx((20 + 30 + 10) / 3)
+
+
+def test_two_wr_rows_same_week_is_still_one_defensive_game():
+    # Issue 1 (reporting-integrity pass): many player-rows from one game must
+    # never inflate the DISTINCT defensive-game count. Week 1 has 2 WR
+    # appearances but is exactly one defensive game; week 2 is a second.
+    rows = [
+        _row("DEFA", "WR", 1, 20),
+        _row("DEFA", "WR", 1, 30),  # second WR, same week - NOT a second game
+        _row("DEFA", "WR", 2, 10),
+    ]
+    out = build_defense_reporting(pd.DataFrame(rows), 2025, "in_season")
+    row = _get(out, "DEFA", "WR")
+    assert row["player_game_row_count"] == 3  # 3 opposing-player appearances
+    assert row["defensive_games_played"] == 2  # but only 2 distinct defensive games
+    assert row["defensive_games_played"] < row["player_game_row_count"]
+
+
+def test_many_wr_rows_one_game_still_counts_as_one_defensive_game():
+    # A more extreme version: 4 different WRs all facing the same defense in
+    # the same single week must still be exactly one defensive game.
+    rows = [_row("DEFA", "WR", 1, pts) for pts in (10, 15, 20, 25)]
+    out = build_defense_reporting(pd.DataFrame(rows), 2025, "in_season")
+    row = _get(out, "DEFA", "WR")
+    assert row["player_game_row_count"] == 4
+    assert row["defensive_games_played"] == 1
 
 
 def test_league_avg_points_allowed_is_scoped_within_position():
@@ -169,6 +196,18 @@ def test_two_games_gives_a_real_trend_number_but_still_insufficient_sample_label
     # ...but the LABEL still requires the full recent-form window (3 games)
     # before it will name a confident direction.
     assert row["dvp_trend_label"] == "insufficient_sample"
+
+
+def test_sample_size_label_uses_distinct_defensive_games_not_player_row_count():
+    # Issue 1: a defense with only 1 distinct defensive game must read
+    # "insufficient_sample" EVEN IF multiple WRs facing it that one week
+    # make the player-row count look larger than it really is.
+    rows = [_row("DEFA", "WR", 1, pts) for pts in (10, 15, 20, 25, 30)]  # 5 rows, 1 week
+    out = build_defense_reporting(pd.DataFrame(rows), 2025, "in_season")
+    row = _get(out, "DEFA", "WR")
+    assert row["player_game_row_count"] == 5
+    assert row["defensive_games_played"] == 1
+    assert row["sample_size_label"] == "insufficient_sample"  # driven by the 1 real game, not 5 rows
 
 
 def test_trend_label_thresholds_use_the_documented_constants():

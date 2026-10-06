@@ -30,6 +30,7 @@ def _row(**overrides):
         "opportunity_reason": "Rising opportunity — 9.0 targets/game over last 2 versus 6.3 season average (+2.7).",
         "confidence_label": "established_sample",
         "position_percentile_most_favorable": 80.0, "games_in_sample": 10,
+        "defensive_games_played": 10, "player_game_row_count": 10,
         "fantasy_points_allowed_per_game": 14.0, "league_avg_points_allowed_for_position": 11.0,
         "team_recent_form_label": "heating_up", "team_offensive_momentum_yards": 15.0,
         "recent_2_vs_season_display": "9.0 targets/g (+2.7)", "recent_3_vs_season_display": "8.0 targets/g (+1.5)",
@@ -164,18 +165,82 @@ def test_positives_include_role_opportunity_value_matchup_team_statements():
 
 
 def test_matchup_statement_always_retains_sample_size():
-    favorable = _row(position_percentile_most_favorable=90.0, games_in_sample=12)
-    tough = _row(position_percentile_most_favorable=10.0, games_in_sample=4)
+    favorable = _row(position_percentile_most_favorable=90.0, defensive_games_played=12)
+    tough = _row(position_percentile_most_favorable=10.0, defensive_games_played=4)
     case_favorable = build_case_for_row(favorable)
     case_tough = build_case_for_row(tough)
-    assert "sample: 12 games" in " ".join(case_favorable["positives"])
-    assert "sample: 4 games" in " ".join(case_tough["concerns"])
+    assert "sample: 12 defensive games" in " ".join(case_favorable["positives"])
+    assert "sample: 4 defensive games" in " ".join(case_tough["concerns"])
 
 
 def test_matchup_data_unavailable_is_a_concern_not_a_fabricated_neutral():
-    row = _row(position_percentile_most_favorable=pd.NA, games_in_sample=pd.NA)
+    row = _row(position_percentile_most_favorable=pd.NA, defensive_games_played=pd.NA)
     case = build_case_for_row(row)
     assert any("Matchup data unavailable" in c for c in case["concerns"])
+
+
+# ---------------------------------------------------------------------------
+# Issue 3 hardening: positive / negative / missing / insufficient-sample
+# evidence are kept distinct, and "Mostly Supported" with zero concerns
+# must name its missing corroboration rather than manufacturing a concern.
+# ---------------------------------------------------------------------------
+def test_mostly_supported_with_zero_concerns_names_the_missing_corroboration():
+    # Role safe, a merely-stable (not rising) opportunity, with NEITHER the
+    # matchup NOR team environment independently favorable, and value in the
+    # neutral band (neither favorable nor a concern) - zero concerns
+    # anywhere, but clearly not enough to be Strongly Supported either.
+    row = _row(
+        opportunity_label="stable_opportunity",
+        opportunity_reason="Stable Opportunity — workload holding steady versus the season average.",
+        position_percentile_most_favorable=50.0,  # neutral, not favorable
+        team_recent_form_label="stable",  # no team corroboration
+        projected_value=2.5,  # neutral band: not favorable (>=3.0), not a concern (<2.0)
+    )
+    case = build_case_for_row(row)
+    assert case["signal_alignment"] == "Mostly Supported"
+    assert case["concerns"] == []  # nothing negative was found
+    assert len(case["missing_evidence"]) > 0  # but real corroboration is still absent
+    assert "Missing for Strongly Supported" in case["classification_reason"]
+    assert "Not yet Strongly Supported" in case["case_summary"]
+
+
+def test_missing_evidence_is_never_duplicated_into_concerns():
+    row = _row(
+        opportunity_label="stable_opportunity",
+        opportunity_reason="Stable Opportunity — workload holding steady versus the season average.",
+        position_percentile_most_favorable=50.0,
+        team_recent_form_label="stable",
+        projected_value=2.5,
+    )
+    case = build_case_for_row(row)
+    missing_text = " ".join(case["missing_evidence"]).lower()
+    concerns_text = " ".join(case["concerns"]).lower()
+    assert missing_text  # something is actually missing
+    assert concerns_text == ""  # and none of it was smuggled into concerns
+
+
+def test_insufficient_defensive_games_caps_matchup_confidence_despite_large_row_count():
+    # A large player-row/appearance count must never be read as a large
+    # defensive-game sample - a matchup with only 1 distinct defensive game
+    # cannot be a high-confidence favorable matchup, even at the 90th
+    # percentile and even with a big player_game_row_count.
+    row = _row(
+        position_percentile_most_favorable=90.0,
+        defensive_games_played=1,
+        player_game_row_count=8,
+        team_recent_form_label="stable",  # isolate the matchup signal - no team corroboration either
+    )
+    case = build_case_for_row(row)
+    assert not any("Favorable matchup" in p for p in case["positives"])
+    assert any("cannot be read as a high-confidence favorable matchup" in c for c in case["concerns"])
+    assert case["signal_alignment"] != "Strongly Supported"
+
+
+def test_low_confidence_opportunity_produces_a_sample_warning_not_a_concern():
+    row = _row(confidence_label="early_sample")
+    case = build_case_for_row(row)
+    assert len(case["sample_warnings"]) > 0
+    assert not any("sample" in c.lower() and "opportunity classification" in c.lower() for c in case["concerns"])
 
 
 def test_value_unavailable_is_flagged_as_a_concern():
