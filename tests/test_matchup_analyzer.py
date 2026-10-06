@@ -1104,11 +1104,15 @@ def test_page_comparison_historical_slate_shown_above_comparison(monkeypatch):
     assert any("historical/review context" in c.value for c in at.caption)
 
 
-def test_page_comparison_on_real_committed_data_shows_unavailable_not_a_crash_or_row_count():
+def test_page_comparison_with_simulated_legacy_defense_schema_shows_unavailable_not_a_crash(
+    monkeypatch, synthetic_legacy_defense_reporting
+):
     """
-    The REAL, currently-committed `data/defense_reporting.parquet` predates
-    the prior pass's pipeline change and has no `defensive_games_played`
-    column at all (see tests/test_defense_matchups_page.py). Because
+    A `defense_reporting` mart that predates the Reporting Integrity pass's
+    pipeline change (see tests/conftest.py's `synthetic_legacy_defense_reporting`
+    fixture - isolated from whatever schema the real, currently-committed
+    mart actually has, since a real pipeline run may have already
+    regenerated it) has no `defensive_games_played` column at all. Because
     `lib.matchup_analyzer._merge_defense_extra` always fills every
     configured extra column with NA when the source mart lacks it, the
     merged table still HAS the column (just null) - this page's own schema
@@ -1118,7 +1122,8 @@ def test_page_comparison_on_real_committed_data_shows_unavailable_not_a_crash_or
     """
     import lib.data as data_module
 
-    assert "defensive_games_played" not in data_module.load_defense_reporting().columns
+    assert "defensive_games_played" not in synthetic_legacy_defense_reporting.columns
+    monkeypatch.setattr(data_module, "load_defense_reporting", lambda: synthetic_legacy_defense_reporting)
 
     st.cache_data.clear()
     at = AppTest.from_file(PAGE_PATH, default_timeout=120)
@@ -1136,6 +1141,25 @@ def test_page_comparison_on_real_committed_data_shows_unavailable_not_a_crash_or
             found = True
             assert (df_element.value.loc["Distinct Defensive Games in Sample"] == "Unavailable").all()
     assert found
+
+
+def test_page_comparison_with_simulated_current_defense_schema_shows_real_sample_counts(
+    monkeypatch, synthetic_current_defense_reporting
+):
+    # Current-schema success coverage alongside the legacy scenario above -
+    # once defensive_games_played is present, the comparison must be able
+    # to show a real (non-"Unavailable") sample count for a matched
+    # opponent/position, isolated from real data state either way.
+    import lib.data as data_module
+
+    assert "defensive_games_played" in synthetic_current_defense_reporting.columns
+    monkeypatch.setattr(data_module, "load_defense_reporting", lambda: synthetic_current_defense_reporting)
+
+    st.cache_data.clear()
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    assert not any("older pipeline schema" in w.value for w in at.warning)
 
 
 def test_page_comparison_legacy_schema_missing_column_shows_refresh_message(monkeypatch):
