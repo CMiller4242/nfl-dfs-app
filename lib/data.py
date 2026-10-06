@@ -164,6 +164,42 @@ def load_dk_slate_metadata() -> dict:
         return json.load(f)
 
 
+@st.cache_data(show_spinner=False)
+def load_team_offense_position_reporting() -> pd.DataFrame:
+    """Team-position OFFENSIVE production mart (Offensive Production Matrix
+    page) - one row per (season, team, position). See
+    dfs_data_pipeline.build_offensive_position_reporting for the full field
+    definitions. Team-game totals, never a per-player-appearance average."""
+    path = os.path.join(DATA_DIR, "team_offense_position_reporting.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_team_defense_position_reporting() -> pd.DataFrame:
+    """Team-position POINTS-ALLOWED mart, team-game basis (Offensive
+    Production Matrix page) - a separate, honestly-named counterpart to the
+    legacy defense_reporting.parquet row-average DvP mart. See
+    dfs_data_pipeline.build_defensive_position_points_allowed."""
+    path = os.path.join(DATA_DIR, "team_defense_position_reporting.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_upcoming_schedule() -> pd.DataFrame:
+    """Verified upcoming (not-yet-completed) schedule, one row per
+    (season, week, team) with that team's opponent - the ONLY source
+    Upcoming Matchup Discovery is allowed to use for opponents; never the
+    loaded DK salary slate. See dfs_data_pipeline.build_upcoming_schedule."""
+    path = os.path.join(DATA_DIR, "upcoming_schedule.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
 def get_app_mode() -> str:
     """"in_season" or "preseason_week_1_baseline" - see dfs_data_pipeline.determine_app_mode."""
     return load_metadata().get("app_mode", "in_season")

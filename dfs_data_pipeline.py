@@ -915,6 +915,372 @@ def build_defense_reporting(weekly_df, season, reporting_mode, now=None):
     return result
 
 
+#  --- Offensive Production Matrix: team-position reporting ------------------
+#
+# These are the NEW, separately-named marts behind the Offensive Production
+# Matrix page (pages/6_Offensive_Production_Matrix.py). They answer a
+# different question than the existing `defense_reporting` DvP mart above:
+# "how much does THIS TEAM produce at a position, per team-game" (offense)
+# and "how much does a defense allow at a position, per TEAM-GAME, not per
+# opposing-player-appearance" (a comparable, honestly-named defensive
+# counterpart). Neither replaces nor changes `defense_reporting.parquet`,
+# `build_defense_reporting`, or the legacy `fantasy_points_allowed_per_game`
+# (row-average) metric used by the existing projection formula - those are
+# left completely untouched; see that function's docstring for why its own
+# row-average semantics are preserved on purpose.
+#
+# Fantasy scoring basis: every number here is `fantasy_points_ppr`, exactly
+# like every other mart in this pipeline - PPR, not full DraftKings scoring
+# (which also varies bonus points by sport/contest type). Labeled explicitly
+# as "PPR" wherever displayed - see FANTASY_SCORING_BASIS.
+FANTASY_SCORING_BASIS = "PPR"
+
+# "Last N completed team-games" for the recent window - same convention and
+# value as DEFENSE_RECENT_FORM_GAMES/TEAM_RECENT_FORM_GAMES, kept as its own
+# constant since this mart may need independent tuning later.
+OFFENSE_DEFENSE_POSITION_RECENT_FORM_GAMES = 3
+
+TEAM_POSITION_WEEKLY_COLUMNS = [
+    "season", "team", "position", "week",
+    "team_position_fantasy_points", "team_position_carries",
+    "team_position_targets", "team_position_receptions",
+    "contributing_player_count", "data_status",
+]
+
+
+def build_team_game_position_totals(weekly_df, season, group_col="team"):
+    """
+    One row per (season, team, position, week) - TEAM-GAME TOTALS, never an
+    average per individual player appearance: every player at that position
+    on that team that week is SUMMED together first (`team_position_fantasy_points`
+    = sum of `fantasy_points_ppr`; likewise carries/targets/receptions).
+    `group_col` picks which side of the box score this measures:
+      - "team" (default): the OFFENSE's own production at a position -
+        behind `build_offensive_position_reporting`.
+      - "opponent_team": what a DEFENSE allowed at a position, on a
+        team-game basis - behind `build_defensive_position_points_allowed`.
+        This is the SAME aggregation, just grouped by the opposing side, so
+        the two are directly comparable by construction (same formula,
+        same window, same completed-game definition).
+
+    `data_status` distinguishes a VERIFIED ZERO (`"recorded"` - at least one
+    player at that position has a real stat-table row for that team-game,
+    even if their total is exactly 0 points) from genuinely UNAVAILABLE data
+    (no player at that position has any row at all for a team-game we know
+    was played) - a completed game is never silently treated as a zero, and
+    a verified zero is never hidden as unavailable. "A team-game we know was
+    played" is derived from `weekly_df` itself: any row for that `group_col`
+    value in any of the 4 tracked positions, any week, means that team-game
+    is real and completed (bye weeks and future/incomplete games are simply
+    absent from `weekly_df`, never present with fabricated zeros) - every
+    NFL offense has had a QB pass attempt in essentially every game it has
+    actually played, making this a reliable completed-game signal without a
+    second fetch; see "Known limitations" in the README for the one
+    theoretical edge case this doesn't cover.
+
+    Inclusion policy for positions: only QB/RB/WR/TE (`POSITIONS`) are
+    aggregated here, the same closed set used everywhere else in this
+    pipeline - see `detect_unresolved_position_production` for the
+    separate, explicit flag on any material production from a player
+    outside that set (never silently dropped without being reported).
+    """
+    if weekly_df.empty:
+        return pd.DataFrame(columns=TEAM_POSITION_WEEKLY_COLUMNS)
+
+    df = weekly_df[weekly_df["position"].isin(POSITIONS)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=TEAM_POSITION_WEEKLY_COLUMNS)
+
+    team_weeks = df[[group_col, "week"]].drop_duplicates().rename(columns={group_col: "team"})
+
+    position_totals = (
+        df.groupby([group_col, "position", "week"])
+        .agg(
+            team_position_fantasy_points=("fantasy_points_ppr", "sum"),
+            team_position_carries=("carries", "sum"),
+            team_position_targets=("targets", "sum"),
+            team_position_receptions=("receptions", "sum"),
+            contributing_player_count=("player_id", "nunique"),
+        )
+        .reset_index()
+        .rename(columns={group_col: "team"})
+    )
+
+    all_combos = team_weeks.merge(pd.DataFrame({"position": POSITIONS}), how="cross")
+    merged = all_combos.merge(position_totals, on=["team", "position", "week"], how="left")
+    merged["data_status"] = merged["contributing_player_count"].apply(
+        lambda n: "recorded" if pd.notna(n) and n > 0 else "unavailable"
+    )
+    merged["season"] = season
+    return merged[TEAM_POSITION_WEEKLY_COLUMNS].sort_values(["position", "team", "week"]).reset_index(drop=True)
+
+
+def _team_position_season_recent_summary(weekly_totals: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """
+    Shared season/recent aggregation for team-position-weekly totals -
+    used identically by both the offensive and the points-allowed mart
+    below (reusing one formula for both, never two independently-drifting
+    copies). Only `data_status == "recorded"` rows are averaged or counted
+    - unavailable team-games never enter a mean and never inflate a game
+    count. `prefix` becomes the output column-name prefix ("offense" or
+    "points_allowed").
+    """
+    recorded = weekly_totals[weekly_totals["data_status"] == "recorded"]
+    if recorded.empty:
+        return pd.DataFrame(columns=["team", "position"])
+
+    season_grp = (
+        recorded.groupby(["team", "position"])
+        .agg(
+            **{
+                f"season_{prefix}_points_per_team_game": ("team_position_fantasy_points", "mean"),
+                f"season_{prefix}_games_recorded": ("team_position_fantasy_points", "count"),
+                f"season_{prefix}_carries_per_team_game": ("team_position_carries", "mean"),
+                f"season_{prefix}_targets_per_team_game": ("team_position_targets", "mean"),
+                f"season_{prefix}_receptions_per_team_game": ("team_position_receptions", "mean"),
+            }
+        )
+        .reset_index()
+    )
+    # Percentile computed STRICTLY WITHIN position - QB/RB/WR/TE never share
+    # a scale, matching the existing defense_reporting/team_reporting
+    # convention exactly. Ties share the average rank-based percentile
+    # (pandas' default `rank(pct=True)` behavior - two teams tied on points
+    # per team game get the same percentile, the mean of the ranks they'd
+    # otherwise occupy). A team with no recorded games has no row here at
+    # all, so it correctly gets NO percentile (null), never a fabricated 0 -
+    # the left-merge back onto the full team/position grid below preserves
+    # that null.
+    season_grp[f"season_{prefix}_percentile"] = (
+        season_grp.groupby("position")[f"season_{prefix}_points_per_team_game"].rank(pct=True) * 100
+    )
+
+    recent = (
+        recorded.sort_values(["team", "position", "week"])
+        .groupby(["team", "position"])
+        .tail(OFFENSE_DEFENSE_POSITION_RECENT_FORM_GAMES)
+    )
+    recent_grp = (
+        recent.groupby(["team", "position"])
+        .agg(
+            **{
+                f"recent_{prefix}_points_per_team_game": ("team_position_fantasy_points", "mean"),
+                f"recent_{prefix}_games_recorded": ("team_position_fantasy_points", "count"),
+            }
+        )
+        .reset_index()
+    )
+    recent_grp[f"recent_{prefix}_percentile"] = (
+        recent_grp.groupby("position")[f"recent_{prefix}_points_per_team_game"].rank(pct=True) * 100
+    )
+
+    return season_grp.merge(recent_grp, on=["team", "position"], how="left")
+
+
+TEAM_OFFENSE_POSITION_REPORTING_COLUMNS = [
+    "season", "team", "position", "latest_completed_week", "source_last_updated_utc",
+    "reporting_mode", "fantasy_scoring_basis",
+    "season_offense_points_per_team_game", "season_offense_games_recorded", "season_offense_percentile",
+    "season_offense_carries_per_team_game", "season_offense_targets_per_team_game",
+    "season_offense_receptions_per_team_game",
+    "recent_offense_points_per_team_game", "recent_offense_games_recorded", "recent_offense_percentile",
+    "recent_games_window",
+]
+
+
+def build_offensive_position_reporting(weekly_df, season, reporting_mode, now=None):
+    """
+    Team-position OFFENSIVE production - one row per (season, team,
+    position) - behind the Offensive Production Matrix's matrix view (Part
+    3) and the offensive half of Upcoming Matchup Discovery (Part 4).
+
+    `season_offense_points_per_team_game` is the mean, across every
+    COMPLETED team-game with recorded data, of that position's team-game
+    TOTAL (every player at the position summed together for that one game -
+    see `build_team_game_position_totals`) - never an average per
+    individual player appearance, and never including an unavailable
+    team-game as if it were a real zero. `season_offense_percentile` is
+    computed strictly within position (QB vs QB, RB vs RB, ...) - higher
+    percentile always means MORE positional production, matching this
+    pipeline's existing percentile-direction convention. A team with zero
+    recorded completed games at a position gets null here, never a
+    fabricated 0th percentile.
+    """
+    if weekly_df.empty:
+        return pd.DataFrame(columns=TEAM_OFFENSE_POSITION_REPORTING_COLUMNS)
+
+    weekly_totals = build_team_game_position_totals(weekly_df, season, group_col="team")
+    summary = _team_position_season_recent_summary(weekly_totals, "offense")
+    if summary.empty:
+        return pd.DataFrame(columns=TEAM_OFFENSE_POSITION_REPORTING_COLUMNS)
+
+    # Every (team, position) that has AT LEAST ONE completed team-game (even
+    # if entirely unavailable at this position) is represented, so a team
+    # that's genuinely never had recorded production here still shows up
+    # with null rates/percentile rather than silently vanishing from the
+    # matrix.
+    all_teams_positions = weekly_totals[["team", "position"]].drop_duplicates()
+    result = all_teams_positions.merge(summary, on=["team", "position"], how="left")
+    result["season"] = season
+    result["reporting_mode"] = reporting_mode
+    result["fantasy_scoring_basis"] = FANTASY_SCORING_BASIS
+    result["latest_completed_week"] = int(weekly_df["week"].max())
+    result["source_last_updated_utc"] = (now or datetime.now(timezone.utc)).isoformat()
+    result["recent_games_window"] = OFFENSE_DEFENSE_POSITION_RECENT_FORM_GAMES
+
+    out = result[TEAM_OFFENSE_POSITION_REPORTING_COLUMNS].sort_values(["position", "team"]).reset_index(drop=True)
+    assert not out.duplicated(subset=["team", "position"]).any(), (
+        "duplicate team-position rows in offensive position reporting - this should be unreachable"
+    )
+    return out
+
+
+TEAM_DEFENSE_POSITION_REPORTING_COLUMNS = [
+    "season", "defense_team", "position", "latest_completed_week", "source_last_updated_utc",
+    "reporting_mode", "fantasy_scoring_basis",
+    "season_points_allowed_per_defensive_game", "season_points_allowed_games_recorded",
+    "season_points_allowed_percentile",
+    "recent_points_allowed_per_defensive_game", "recent_points_allowed_games_recorded",
+    "recent_points_allowed_percentile", "recent_games_window",
+]
+
+
+def build_defensive_position_points_allowed(weekly_df, season, reporting_mode, now=None):
+    """
+    Team-position POINTS-ALLOWED on a TEAM-GAME basis - the comparable
+    defensive counterpart to `build_offensive_position_reporting` (Part 2).
+    `season_points_allowed_per_defensive_game` = the mean, across every
+    completed DEFENSIVE game with recorded data, of that position's
+    opposing-team-game TOTAL (every opposing player at the position summed
+    together for that one game). This is DELIBERATELY NOT the same number
+    as `defense_reporting.fantasy_points_allowed_per_game` (the legacy
+    mart's row-average-per-opposing-player-appearance metric, left
+    completely unchanged - see `build_defense_reporting`'s docstring) -
+    different formula, different name, never to be read interchangeably.
+
+    `season_points_allowed_percentile` is computed strictly within position
+    and uses the SAME direction convention as the legacy mart: higher
+    percentile means the defense allows MORE (more favorable matchup for
+    the offense) - deliberately never called a "defensive strength
+    percentile," which would imply the opposite direction.
+    """
+    if weekly_df.empty:
+        return pd.DataFrame(columns=TEAM_DEFENSE_POSITION_REPORTING_COLUMNS)
+
+    weekly_totals = build_team_game_position_totals(weekly_df, season, group_col="opponent_team")
+    summary = _team_position_season_recent_summary(weekly_totals, "points_allowed")
+    if summary.empty:
+        return pd.DataFrame(columns=TEAM_DEFENSE_POSITION_REPORTING_COLUMNS)
+    # The shared helper's generic naming (`_points_per_team_game`) reads as
+    # offense-flavored wording; rename to this mart's own, honestly-distinct
+    # vocabulary so it's never confused with either the offensive mart or
+    # the legacy defense_reporting row-average metric.
+    summary = summary.rename(columns={
+        "season_points_allowed_points_per_team_game": "season_points_allowed_per_defensive_game",
+        "recent_points_allowed_points_per_team_game": "recent_points_allowed_per_defensive_game",
+    })
+
+    all_teams_positions = weekly_totals[["team", "position"]].drop_duplicates()
+    result = all_teams_positions.merge(summary, on=["team", "position"], how="left")
+    result = result.rename(columns={"team": "defense_team"})
+    result["season"] = season
+    result["reporting_mode"] = reporting_mode
+    result["fantasy_scoring_basis"] = FANTASY_SCORING_BASIS
+    result["latest_completed_week"] = int(weekly_df["week"].max())
+    result["source_last_updated_utc"] = (now or datetime.now(timezone.utc)).isoformat()
+    result["recent_games_window"] = OFFENSE_DEFENSE_POSITION_RECENT_FORM_GAMES
+
+    out = result[TEAM_DEFENSE_POSITION_REPORTING_COLUMNS].sort_values(
+        ["position", "defense_team"]
+    ).reset_index(drop=True)
+    assert not out.duplicated(subset=["defense_team", "position"]).any(), (
+        "duplicate defense-position rows in points-allowed reporting - this should be unreachable"
+    )
+    return out
+
+
+def detect_unresolved_position_production(raw_player_df, season, latest_completed_week) -> dict:
+    """
+    Explicit flag (Part 1's "inclusion policy" requirement) for any player
+    with REAL fantasy production (`fantasy_points_ppr` != 0) at a raw
+    `position` outside the tracked QB/RB/WR/TE set, for the same
+    season/completed-weeks scope `build_players_weekly` uses. This never
+    changes what's included in `players_weekly.parquet` (that filtering is
+    existing, unchanged behavior) - it only reports, in `metadata.json`,
+    whether material production is being excluded from every position-
+    scoped mart in this pipeline (including the pre-existing
+    `defense_reporting`), so that exclusion is visible rather than silent.
+    """
+    empty = {"unresolved_position_rows": 0, "unresolved_position_points": 0.0, "unresolved_positions": []}
+    if raw_player_df is None or raw_player_df.empty or latest_completed_week is None:
+        return empty
+    if "position" not in raw_player_df.columns or "fantasy_points_ppr" not in raw_player_df.columns:
+        return empty
+
+    df = raw_player_df[
+        (raw_player_df["season"] == season)
+        & (raw_player_df["season_type"] == "REG")
+        & (raw_player_df["week"] <= latest_completed_week)
+        & (~raw_player_df["position"].isin(POSITIONS))
+        & (raw_player_df["fantasy_points_ppr"].fillna(0) != 0)
+    ]
+    if df.empty:
+        return empty
+    return {
+        "unresolved_position_rows": int(len(df)),
+        "unresolved_position_points": float(df["fantasy_points_ppr"].sum()),
+        "unresolved_positions": sorted(df["position"].dropna().unique().tolist()),
+    }
+
+
+UPCOMING_SCHEDULE_COLUMNS = ["season", "week", "team", "opponent_team", "is_home", "game_type"]
+
+
+def build_upcoming_schedule(schedule_df, season, latest_completed_week):
+    """
+    One row per (season, week, team) for every NOT-yet-completed REG-season
+    game - the verified source behind Upcoming Matchup Discovery (Part 4).
+    Built from the SAME `nfl.load_schedules` fetch the pipeline already
+    makes for week-completion detection (`determine_week_status`) - no new
+    external dependency. Requires `home_team`/`away_team` on `schedule_df`;
+    if either is absent (an unexpected schedule-source schema change) this
+    returns empty rather than guessing, so the page can fail closed
+    ("disable upcoming matchup discovery with an actionable explanation")
+    instead of fabricating an opponent.
+
+    A team appears here at most once per week (the schedule's natural
+    grain), as both the home and away team get their own row with the
+    OTHER side recorded as `opponent_team` - directly joinable to
+    `build_offensive_position_reporting`'s `team` column.
+    """
+    if schedule_df is None or schedule_df.empty:
+        return pd.DataFrame(columns=UPCOMING_SCHEDULE_COLUMNS)
+    required = {"season", "week", "game_type", "home_team", "away_team"}
+    if not required.issubset(schedule_df.columns):
+        return pd.DataFrame(columns=UPCOMING_SCHEDULE_COLUMNS)
+
+    games = schedule_df[(schedule_df["season"] == season) & (schedule_df["game_type"] == "REG")].copy()
+    if latest_completed_week is not None:
+        games = games[games["week"] > latest_completed_week]
+    if games.empty:
+        return pd.DataFrame(columns=UPCOMING_SCHEDULE_COLUMNS)
+
+    home = games[["season", "week", "home_team", "away_team"]].rename(
+        columns={"home_team": "team", "away_team": "opponent_team"}
+    )
+    home["is_home"] = True
+    away = games[["season", "week", "home_team", "away_team"]].rename(
+        columns={"away_team": "team", "home_team": "opponent_team"}
+    )
+    away["is_home"] = False
+
+    out = pd.concat([home, away], ignore_index=True)
+    out["game_type"] = "REG"
+    out = out.dropna(subset=["team", "opponent_team"])
+    out = out.drop_duplicates(subset=["season", "week", "team"])
+    return out[UPCOMING_SCHEDULE_COLUMNS].sort_values(["week", "team"]).reset_index(drop=True)
+
+
 def build_team_summary(raw_team_df, season, latest_completed_week):
     """
     Team-level offense volume + the team's OWN defensive production
@@ -1454,6 +1820,13 @@ def run_pipeline():
         team_summary_df = build_team_summary(raw_team_df, active_season, latest_completed_week)
         team_reporting_df = build_team_reporting(raw_team_df, active_season, latest_completed_week, "in_season")
         baseline_df = pd.DataFrame(columns=PRIOR_SEASON_BASELINE_EMPTY_COLUMNS)
+        offense_position_reporting_df = build_offensive_position_reporting(weekly_df, active_season, "in_season")
+        defense_position_points_allowed_df = build_defensive_position_points_allowed(
+            weekly_df, active_season, "in_season"
+        )
+        unresolved_position_info = detect_unresolved_position_production(
+            active_player_df, active_season, latest_completed_week
+        )
     else:
         print(f"No completed week for {active_season} yet - building {source_season} baseline for Week 1")
         weekly_df = pd.DataFrame(columns=PLAYER_STAT_COLUMNS + ["touches"])
@@ -1481,6 +1854,15 @@ def run_pipeline():
         # team_reporting's (team-level stats aren't in player-week data).
         defense_reporting_df = build_defense_reporting(prior_weekly_df, source_season, "preseason_baseline")
         defense_position_weekly_df = build_defense_position_weekly(prior_weekly_df, source_season)
+        offense_position_reporting_df = build_offensive_position_reporting(
+            prior_weekly_df, source_season, "preseason_baseline"
+        )
+        defense_position_points_allowed_df = build_defensive_position_points_allowed(
+            prior_weekly_df, source_season, "preseason_baseline"
+        )
+        unresolved_position_info = detect_unresolved_position_production(
+            prior_player_df, source_season, prior_max_week
+        )
 
         # team_reporting gets its own prior-season fetch (never merged into
         # team_stats.parquet, same separation as players_weekly vs
@@ -1511,6 +1893,13 @@ def run_pipeline():
 
     opportunity_df = build_player_opportunity_reporting(weekly_df, baseline_df, season=active_season)
 
+    # Upcoming schedule (Part 4's verified opponent source) - always derived
+    # from the ACTIVE season's own schedule fetch above, regardless of
+    # app_mode: even in preseason_week_1_baseline mode (no completed games
+    # yet), every REG game for the active season is "upcoming." Never
+    # derived from the loaded DK salary slate - see lib/upcoming_matchups.py.
+    upcoming_schedule_df = build_upcoming_schedule(active_schedule_df, active_season, latest_completed_week)
+
     weekly_df.to_parquet(os.path.join(DATA_DIR, "players_weekly.parquet"), index=False)
     current_df.to_parquet(os.path.join(DATA_DIR, "players_current.parquet"), index=False)
     team_summary_df.to_parquet(os.path.join(DATA_DIR, "team_summary.parquet"), index=False)
@@ -1524,6 +1913,13 @@ def run_pipeline():
     team_reporting_df.to_parquet(os.path.join(DATA_DIR, "team_reporting.parquet"), index=False)
     defense_reporting_df.to_parquet(os.path.join(DATA_DIR, "defense_reporting.parquet"), index=False)
     defense_position_weekly_df.to_parquet(os.path.join(DATA_DIR, "defense_position_weekly.parquet"), index=False)
+    offense_position_reporting_df.to_parquet(
+        os.path.join(DATA_DIR, "team_offense_position_reporting.parquet"), index=False
+    )
+    defense_position_points_allowed_df.to_parquet(
+        os.path.join(DATA_DIR, "team_defense_position_reporting.parquet"), index=False
+    )
+    upcoming_schedule_df.to_parquet(os.path.join(DATA_DIR, "upcoming_schedule.parquet"), index=False)
     if not raw_team_df.empty:
         raw_team_df.to_parquet(os.path.join(DATA_DIR, "team_stats.parquet"), index=False)
 
@@ -1560,6 +1956,12 @@ def run_pipeline():
             int(defense_reporting_df["season"].iloc[0]) if not defense_reporting_df.empty else None
         ),
         "opportunity_reporting_rows": int(len(opportunity_df)),
+        "team_offense_position_reporting_rows": int(len(offense_position_reporting_df)),
+        "team_defense_position_reporting_rows": int(len(defense_position_points_allowed_df)),
+        "upcoming_schedule_rows": int(len(upcoming_schedule_df)),
+        "upcoming_schedule_available": bool(not upcoming_schedule_df.empty),
+        "fantasy_scoring_basis": FANTASY_SCORING_BASIS,
+        "unresolved_position_production": unresolved_position_info,
     }
     with open(os.path.join(DATA_DIR, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)

@@ -16,6 +16,7 @@ from lib.defense_trends import (
     sort_table,
     weekly_series_with_bye_gaps,
 )
+from lib.schema_guard import missing_columns, refresh_message
 
 st.set_page_config(page_title="Defense vs Position | NFL DFS", page_icon="🛡️", layout="wide")
 
@@ -42,6 +43,21 @@ reporting_season = meta.get("defense_reporting_season")
 
 if defense_reporting.empty:
     st.warning("No defense reporting data found yet. Run `python dfs_data_pipeline.py` first.")
+    st.stop()
+
+# Schema-safety guard (Issue 1 hardening follow-up): a defense_reporting.parquet
+# generated before the distinct-defensive-game fix won't have these columns.
+# Fail with an actionable message, never a KeyError deep in a filter/chart -
+# and never substitute `games_in_sample`/`player_game_row_count` (a raw
+# opposing-player-appearance count) for a missing `defensive_games_played`.
+_REQUIRED_DEFENSE_COLUMNS = [
+    "defensive_games_played", "player_game_row_count", "sample_size_label",
+    "fantasy_points_allowed_per_game", "league_avg_points_allowed_for_position",
+    "matchup_index", "position_percentile_most_favorable",
+]
+_defense_missing = missing_columns(defense_reporting, _REQUIRED_DEFENSE_COLUMNS)
+if _defense_missing:
+    st.warning(refresh_message(_defense_missing), icon="⚠️")
     st.stop()
 
 # ---------------------------------------------------------------------------

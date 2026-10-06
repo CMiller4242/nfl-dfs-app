@@ -793,12 +793,254 @@ Matchup Index (one point per team+opponent+position actually in the slate).
 Every chart excludes rows with a null value on either axis rather than
 plotting a fabricated zero.
 
+### Player Comparison / Case Detail (`lib/player_comparison.py`)
+
+A presentation-only section (not a separate page) for comparing up to
+`MAX_COMPARISON_PLAYERS` (4) players side-by-side, from the FULL loaded
+slate (independent of the Controls filters above). It computes **nothing
+new** - every cell in `lib.player_comparison.build_comparison_table` reads
+one already-existing field from the already-built matchup/case-summary row
+(`Salary`, `projected_points`, `projected_value`, `role_display`/
+`role_classification`, `role_data_freshness`, `eligibility_reason`,
+`opportunity_label_display`, `opportunity_reason`,
+`opportunity_confidence_display`, `position_percentile_most_favorable`,
+`fantasy_points_allowed_per_game`, `defensive_games_played`,
+`team_recent_form_label`, `team_offensive_momentum_yards`,
+`signal_alignment`) - see `lib.player_comparison.COMPARISON_METRICS` for
+the exact list. There is no ranking, highlighting, or automatic "winner":
+metrics are rows, players are columns, and a missing value always renders
+as `"Unavailable"`, never a fabricated 0 - missing evidence is never
+recast as a negative finding.
+
+- **Stable identity, never a bare name**: each DK slate row's selector/
+  comparison-column label is built from `lib.player_comparison.
+  slate_row_uid` - the SAME `(Name, TeamAbbrev, Position, Salary)` identity
+  tuple this module already treats a slate row as unique by (see
+  `rising_opportunity_section`'s own `drop_duplicates` subset) - so two
+  different players sharing a name are always distinguishable by team and
+  position in the selector.
+- **Eligibility section is reused, never reimplemented**:
+  `lib.player_comparison.player_section_label` calls the EXACT SAME
+  `valid_player_pool` / `featured_top_value` / `plays_to_monitor` /
+  `excluded_by_role_context` / `needs_review_rows` / `inactive_players`
+  functions the rest of the page already uses, on a one-row frame - a
+  restricted/inactive player's status in a comparison is always identical
+  to its status everywhere else on the page, never softened.
+- **Case Details** (one expander per selected player) reuse
+  `lib.player_case_summary.format_case_detail` verbatim - classification
+  reason, positive evidence, concerns, missing evidence, sample warnings,
+  and eligibility restrictions are the SAME fields shown in the page's
+  "Player Case Detail" section, never independently reclassified.
+- **Slate-change safety**: selections are keyed by `slate_row_uid` and
+  pruned against the CURRENT slate's uids
+  (`lib.player_comparison.resolve_selected_uids`) every run. When the
+  loaded salary file changes (a new upload, or the committed file being
+  replaced) and a previously-selected player no longer exists on the new
+  slate, that selection is dropped automatically with an explicit message
+  - never left pointing at stale data, never crashing on an invalid widget
+  value.
+- **Schema safety**: `REQUIRED_COMPARISON_COLUMNS` is checked
+  (`lib.schema_guard.missing_columns`) before the section renders. A
+  legacy mart missing a required column shows one actionable message
+  ("Run `python dfs_data_pipeline.py`...") instead of a raw `KeyError`.
+  **This is not hypothetical** - the real, currently-committed
+  `data/defense_reporting.parquet` predates the prior Reporting Integrity
+  pass's pipeline change and genuinely lacks `defensive_games_played`
+  (regenerating it needs network access to nflreadpy this environment
+  doesn't have). `lib.matchup_analyzer._merge_defense_extra` already fills
+  that gap with null at merge time, so the comparison's own guard doesn't
+  fire for this specific case - affected cells just read "Unavailable" -
+  but the guard exists for the case where a future schema change removes a
+  column that merge helper doesn't know to backfill.
+- **No probability or game-script inference**: Matchup Favorability
+  Percentile is presented as exactly that - a percentile of historical DvP
+  evidence - never as a probability of success, and nothing here infers
+  game script, offensive intent, or pass/run tendency from fields that
+  don't exist in this project's data.
+
 ### What this page deliberately does NOT do
 
 No Smash Score, ownership projection, boom/bust model, ceiling model, or any
 other composite ranking - every number on the page traces back to a real,
 named source column. It is decision support, not a lineup generator (see
-the in-page "How to read this page" expander).
+the in-page "How to read this page" expander). The Player Comparison
+section adds no exception to this - it is a side-by-side READ of existing
+evidence, never a new score or an automatic pick.
+
+## Offensive Production Matrix (`pages/6_Offensive_Production_Matrix.py`)
+
+Moves the research workflow from "this defense allows points to RBs, pick
+the opposing RB" to "this OFFENSE produces strongly at RB, its opponent
+allows substantial RB production, and here is how that production is
+distributed among individual players" - connecting team-position
+discovery → player distribution → the app's existing role/opportunity/
+case-summary evidence. A favorable team-position matchup is never an
+automatic endorsement of any one player; there is no composite score,
+ownership estimate, or "contrarian" label anywhere in this feature.
+
+### Scoring basis and aggregation formula (Part 1)
+
+Every number is **PPR** (`fantasy_points_ppr`) - the same source field every
+other mart in this app uses - never full DraftKings contest scoring, and
+labeled "PPR" explicitly wherever shown (`FANTASY_SCORING_BASIS` in
+`dfs_data_pipeline.py`). `dfs_data_pipeline.build_team_game_position_totals`
+is the shared building block behind both new marts below: for each
+completed team-game, every player AT THE SAME POSITION ON THE SAME TEAM
+THAT WEEK is summed together first (`team_position_fantasy_points`, plus
+carries/targets/receptions) - a TEAM-GAME TOTAL, never an average per
+individual player appearance. Season/recent figures are then the MEAN of
+those team-game totals across the window.
+
+**Verified zero vs. unavailable**: a team-game is `data_status = "recorded"`
+(a real, verified value - possibly a true zero) when at least one player at
+that position has a stat-table row for that team-game, even if their total
+is exactly 0; it is `"unavailable"` when NO player at that position has any
+row at all for a team-game the team is otherwise known to have played
+(derived from any row at all for that team in `players_weekly.parquet` that
+week - every NFL offense has had a QB pass attempt in essentially every
+real game, making this a reliable signal without a second fetch). Only
+`"recorded"` rows are averaged or counted - an unavailable team-game is
+never treated as a zero, and bye weeks are simply absent rows, never
+present with a fabricated value.
+
+**Inclusion policy**: only QB/RB/WR/TE (`dfs_data_pipeline.POSITIONS`) are
+aggregated - the same closed set used everywhere in this app.
+`detect_unresolved_position_production` separately flags (in
+`metadata.json`'s `unresolved_position_production`, and in the page's own
+warning banner) any real fantasy production recorded at a position OUTSIDE
+that set, so it's visible rather than silently dropped - it changes nothing
+about what `players_weekly.parquet` itself includes (that filtering is
+existing, unchanged pipeline behavior).
+
+### Time windows and sample-size interpretation
+
+"Recent" is the last `OFFENSE_DEFENSE_POSITION_RECENT_FORM_GAMES` (3)
+**recorded** completed team-games - shown explicitly (`..._games_recorded`
+columns), never hidden behind just the points number. "Season" uses every
+recorded completed team-game to date. A team/position with 0 recorded
+games has NULL rates and NO percentile anywhere - never a fabricated 0 or
+a fabricated 0th-percentile rank.
+
+### Percentile direction and tie handling
+
+Percentiles (`season_offense_percentile`, `recent_offense_percentile`,
+`season_points_allowed_percentile`, `recent_points_allowed_percentile`) are
+computed **strictly within position** via pandas' `rank(pct=True)` -
+QB/RB/WR/TE never share a scale. Ties get the same percentile (the
+average-rank convention `rank(pct=True)` already uses - two teams tied on
+points-per-team-game receive the identical percentile, never an arbitrary
+tiebreak). Direction is consistent and documented everywhere it appears:
+**higher offensive percentile = more positional production**; **higher
+defensive points-allowed percentile = allows MORE** (more favorable for
+the offense) - the same direction the legacy DvP mart already uses.
+Deliberately never called a "defensive strength percentile," which would
+imply the opposite.
+
+### Legacy DvP vs. the new team-game points-allowed measure (Part 2)
+
+`dfs_data_pipeline.build_defensive_position_points_allowed` (written to
+`data/team_defense_position_reporting.parquet`) is a NEW, separately-named,
+separately-computed mart - it does **not** replace, change, or share a
+formula with the existing `defense_reporting.parquet` /
+`build_defense_reporting` (unchanged - see "Defense vs Position" above).
+
+| | Legacy `defense_reporting.fantasy_points_allowed_per_game` | New `team_defense_position_reporting.season_points_allowed_per_defensive_game` |
+|---|---|---|
+| Grain | Mean across every opposing PLAYER-ROW | Mean across every opposing TEAM-GAME TOTAL |
+| A week with 2 opposing WRs | Counts as 2 rows in the average | Counts as ONE game, with both WRs' points summed first |
+| Feeds the projection formula? | Yes (`matchup_delta`) - **unchanged by this feature** | No - research/discovery only |
+
+Never read these two numbers interchangeably. The existing projection
+formula, role/eligibility engine, Opportunity Model, and Player Case
+Summary thresholds are completely unmodified by this feature - verified by
+`tests/test_offensive_production_matrix_page.py`'s existing-page regression
+checks.
+
+### Part 3 - the matrix; Part 4 - upcoming matchup discovery
+
+The matrix (teams × QB/RB/WR/TE, cell = points-per-team-game, color = the
+within-position percentile) never relies on color alone - every cell also
+shows its raw number or percentile as text, and a separate sample-count
+table is always one click away. Colors are computed with a small, dependency-
+free red→yellow→green interpolation (`lib.team_position_matrix.percentile_to_rgb`)
+rather than requiring `matplotlib`.
+
+Upcoming Matchup Discovery joins the offensive mart to the comparable
+defensive mart via a **verified upcoming-schedule mart**
+(`data/upcoming_schedule.parquet`, built by
+`dfs_data_pipeline.build_upcoming_schedule` from the SAME `nfl.load_schedules`
+fetch the pipeline already makes for week-completion detection - no new
+external dependency) - **never** via the currently-loaded DK salary slate's
+own opponent parsing, which is a separately-versioned thing that could be
+stale while the schedule mart is current, or vice versa. If that mart is
+missing/empty, the page disables matchup discovery with an actionable
+explanation and keeps the matrix fully usable - it never fabricates an
+opponent. Both percentiles (offensive production, defensive points-allowed)
+are always shown side by side and are **never averaged into one score**;
+the default 75th/75th-percentile filter is explicitly labeled a research
+filter, not a validated prediction rule, and every threshold is
+independently adjustable. A session-only research shortlist
+(`st.session_state["opm_shortlist_uids"]`, keyed by a stable
+`(team, opponent_team, position, week)` identifier - never a bare name) is
+pruned every run against the current discovery table, so a season/week/
+reporting change never leaves a shortlist entry pointing at a matchup that
+no longer exists.
+
+### Parts 5-7 - player-distribution drill-down
+
+`lib/team_position_drilldown.py` builds every contributor at a team+
+position directly from `players_weekly.parquet` - not just the current
+starter or top projection, and never hiding a restricted/excluded player's
+historical contribution (their CURRENT role restriction is merged in
+separately and still shown). **Historical team attribution**: every
+aggregate groups by the `team` value each weekly row already carries (the
+team a player was actually ON that week) - never a player's current
+roster team, so a trade mid-season is correctly split between a player's
+old and new team, never double-counted or misattributed.
+
+Two explicitly different denominators are both shown: `share_of_team_position_*`
+divides by this position's own team-game total (every contributor summed);
+`team_target_share` divides by the TEAM'S TOTAL TARGETS ACROSS ALL
+POSITIONS in the same window - a different, wider denominator, each
+labeled in the page's own caption. A zero or negative position total makes
+a share **undefined, not misleadingly 0% or 100%** -
+`lib.team_position_drilldown._safe_share` returns null (displayed as a
+blank/"Unavailable" cell) while the raw point total is still shown. Snap
+counts and route data are never shown - no such fields exist anywhere in
+this project's data sources (confirmed against `dfs_data_pipeline.PLAYER_STAT_COLUMNS`).
+
+Part 7 connects to the EXISTING Matchup Analyzer + Player Case Summary
+output - `lib.matchup_analyzer.build_matchup_analyzer_table` +
+`lib.player_case_summary.build_case_summary` are called once by the page
+and the result is merged in by the shared `player_id` identity (both
+ultimately come from `players_weekly.parquet`), never reimplemented. When
+no DK salary slate is loaded (or a player isn't on it), the historical
+distribution view is preserved and the page explains why salary/value/case
+information is absent, rather than hiding the player's row.
+
+### Part 8 - schema safety and cache invalidation
+
+`team_offense_position_reporting.parquet`,
+`team_defense_position_reporting.parquet`, `upcoming_schedule.parquet`, and
+`players_weekly.parquet` are all tracked by
+`lib.cache_fingerprint.reporting_inputs_fingerprint` (see "Caching & slate
+rollover integrity" below), so a pipeline refresh of any of them correctly
+invalidates this page's cached reads. A legacy/missing mart shows
+`lib.schema_guard`'s actionable "Run `python dfs_data_pipeline.py`" message
+and disables ONLY the affected section (the matrix and matchup discovery,
+which share the offense/defense marts) - the player-distribution drill-down,
+which only needs `players_weekly.parquet` + role/opportunity context, keeps
+working independently. Neither section ever raises a raw `KeyError`.
+
+### What this feature deliberately does NOT do
+
+No composite matchup score, no ownership estimate, no "contrarian"
+labeling, no inferred game script/offensive intent/routes/snap roles from
+fields that don't support those conclusions, no fabricated upcoming
+salaries, no relabeling of the current salary slate, and no boom/bust,
+historical-attainment, or pre-lock-snapshot evaluation - all explicitly out
+of scope for this pass. A high matchup percentile is a percentile of
+historical evidence, never a probability of success.
 
 ## In-Season Opportunity Model (`lib/opportunity_model.py`, `lib/opportunity_config.py`, `data/player_opportunity_reporting.parquet`)
 
@@ -1370,16 +1612,24 @@ was a real gap (Reporting Integrity hardening) and is fixed:
   file (`metadata.json`, `dk_slate_metadata.json`, `players_current.parquet`,
   `players_prior_season_baseline.parquet`, `defense_reporting.parquet`,
   `team_reporting.parquet`, `player_opportunity_reporting.parquet`,
-  `player_role_context.parquet`) plus the role-safety/signal-alignment
-  config modules (`lib/opportunity_config.py`, `lib/role_config.py`),
-  OUTSIDE the cache boundary, and combines their (path, mtime, size) into
-  one short hashed string.
+  `player_role_context.parquet`, `players_weekly.parquet`,
+  `team_offense_position_reporting.parquet`,
+  `team_defense_position_reporting.parquet`, `upcoming_schedule.parquet`)
+  plus the role-safety/signal-alignment config modules
+  (`lib/opportunity_config.py`, `lib/role_config.py`), OUTSIDE the cache
+  boundary, and combines their (path, mtime, size) into one short hashed
+  string.
 - Both `pages/5_Matchup_Analyzer.py`'s `_build_table` and
   `pages/3_DFS_Lineup_Helper.py`'s `process_dk_csv` take that fingerprint as
   an explicit, ordinary `st.cache_data` argument alongside `file_bytes` -
-  never a no-argument cached function relying on disk reads alone. A
-  changed salary CSV, a refreshed player/opportunity/team/defense mart, a
-  refreshed role-context snapshot, or an edited config threshold all
+  never a no-argument cached function relying on disk reads alone.
+  `pages/6_Offensive_Production_Matrix.py` calls the same fingerprint
+  function to force its own `st.cache_data`-backed loaders to recompute
+  whenever any of these files change, covering the new offense/defense/
+  schedule marts and the raw `players_weekly.parquet` the drill-down reads
+  directly. A changed salary CSV, a refreshed player/opportunity/team/
+  defense/offense/schedule mart, a refreshed role-context snapshot, or an
+  edited config threshold all
   correctly invalidate the cache and force a real recompute.
 - `tests/test_cache_fingerprint.py` covers: the fingerprint changes when a
   tracked file's content changes, stays stable when nothing changes, is
@@ -1651,6 +1901,117 @@ file too:
   coverage of the new columns/filters/sections/player-detail selector
   rendering safely, including empty-result paths.
 
+The Player Comparison / Case Detail UX pass has its own dedicated test
+files too:
+
+- `tests/test_player_comparison.py` - stable identifiers distinguishing
+  duplicate names by team/position; comparison labels handling missing
+  name/team/salary without crashing; candidate filtering (same-position
+  default, "All" lifting it, restricted/inactive players never excluded
+  from candidacy); stale-selection resolution preserving order and marking
+  everything stale against an empty current slate; `player_section_label`
+  matching every existing section function's own criteria exactly
+  (Inactive/Excluded/Monitor/Featured/Needs Review); comparison-table
+  formatting (missing values render "Unavailable" never 0, real values get
+  correct units, one column per selected player, no ranking/winner/score
+  row ever appears in the output).
+- `tests/test_schema_guard.py` - presence-only column checking (a null-
+  valued-but-present column is never "missing"), `None`/empty-frame
+  handling, and the refresh message naming both the missing columns and
+  the fix.
+- `tests/test_matchup_analyzer.py` additions - restricted/inactive players
+  (Hurt Runner/Bench Wideout/Unresolved QB) retaining their real
+  eligibility section and context text inside a comparison; a missing DvP
+  sample rendering "Unavailable"; a round-trip through the comparison
+  helpers leaving the source table byte-identical (no mutation); `AppTest`
+  coverage of selecting 2 and 4 players, the native `max_selections=4`
+  selection-limit behavior, a single selection prompting for more instead
+  of rendering, duplicate names producing two distinguishable selector
+  entries, a changed salary file safely dropping stale selections with an
+  explanatory message, the historical-slate caption appearing above the
+  comparison section, a monkeypatched legacy-schema scenario showing the
+  refresh message, and - importantly - proof that the REAL currently-
+  committed `defense_reporting.parquet`'s missing `defensive_games_played`
+  column renders "Unavailable" everywhere in the comparison rather than
+  crashing or silently substituting `games_in_sample`. Also documents (via
+  a test that asserts the `TypeError` it raises) a pre-existing, out-of-
+  scope defect in `lib.player_case_summary._evaluate_opportunity` found
+  while building this pass - see "Known limitations."
+- `tests/test_defense_matchups_page.py` (new `AppTest` file - this page had
+  no page-level test coverage before this pass) - proves the REAL committed
+  mart's missing-column condition now produces an actionable refresh
+  message instead of the raw, unhandled `KeyError` it previously raised
+  (verified against the prior commit); proves the guard never substitutes
+  `games_in_sample` for the missing `defensive_games_played`; and proves
+  the guard gets out of the way once a (simulated) regenerated mart has the
+  required columns.
+
+The Offensive Production Matrix has its own dedicated test files too:
+
+- `tests/test_team_position_reporting.py` - multiple players summing into
+  one team-game total; player totals reconciling exactly to the mart's
+  season mean; verified zero vs. unavailable (a real recorded 0 counts, a
+  position with no player row at all never does); bye weeks never counted
+  as a game; season/recent windows using exactly the intended completed
+  games; percentile direction (higher production/points-allowed = higher
+  percentile), tie handling, and no percentile ever computed across mixed
+  positions; a missing-production team/position getting no percentile,
+  never a fabricated 0th; the offensive and defensive measures using
+  distinct completed games (a team's own games vs. games where it was the
+  opponent); unresolved-position production being flagged, not silently
+  dropped; and the upcoming-schedule mart only including not-yet-completed
+  games, giving each team exactly one row per week with the correct
+  opponent, and returning empty (never fabricating an opponent) when the
+  schedule source is missing required columns.
+- `tests/test_upcoming_matchups.py` - the discovery join only firing when a
+  verified schedule is available; both percentiles staying independent
+  (never blended into one score - explicitly asserted there's no
+  "blended"/"matchup_score" column); missing-sample matchups being flagged
+  with a warning, never hidden; independent offensive/defensive/sample
+  filters (proven to filter independently, including that a null
+  percentile never passes a minimum); and shortlist uid resolution
+  correctly splitting valid vs. stale selections.
+- `tests/test_team_position_drilldown.py` - recorded-week detection
+  skipping byes; the recent window matching the last N recorded weeks;
+  player contributions reconciling exactly to the team-position total;
+  the two different share denominators (position-scoped vs. full-team
+  target share) proven distinct on the same fixture; a zero-total
+  position's share rendering as a genuine missing value, never a
+  fabricated percentage, while the raw (zero) points are retained; every
+  contributor included, not just the top scorer; duplicate player names
+  distinguished by `player_id`; historical team attribution for a traded
+  player (proven NOT double-counted under either team); restricted
+  players (e.g. `bench_no_clear_path`) retaining their real current
+  restriction when merged in; missing role/opportunity data rendering
+  null, never guessed; the slate-connect helper marking data unavailable
+  without dropping the historical row when no slate is loaded, and
+  joining correctly by shared `player_id` when one is; and the game-by-game
+  table showing every contributor in a week as its own row.
+- `tests/test_team_position_matrix.py` - matrix pivoting (rows=teams,
+  columns=positions in a fixed QB/RB/WR/TE order), points vs. percentile
+  vs. season vs. recent all reading distinct values, missing cells
+  rendering as text `"—"` never `"0"`, the sample-count display table
+  never mixing numeric and string types in one column (a real Arrow-
+  serialization bug caught during development), and the dependency-free
+  `percentile_to_rgb` color interpolation's direction (green=high,
+  red=low), its neutral-gray missing-value color, and that it never
+  crashes on an out-of-[0,100]-range input.
+- `tests/test_offensive_production_matrix_page.py` - proves the REAL
+  currently-committed data (which has no `team_offense_position_reporting.parquet`
+  yet - this pipeline change was never run against a live network data
+  source in this environment) shows an actionable refresh message, never
+  a crash; proves the player-distribution drill-down keeps working even
+  when that mart is missing (Part 8's "stop only the affected component"
+  requirement); a legacy-schema (missing-column) scenario showing the
+  refresh message; full matrix/discovery/drill-down rendering against
+  synthetic, monkeypatched marts (never written to the real `data/`
+  directory); matchup discovery disabling itself without a schedule mart
+  while the matrix stays usable; the drill-down rendering real
+  contributor names after a team/position selection; the cache
+  fingerprint reacting to changes in the new offense/defense/schedule
+  mart files; and that the existing Matchup Analyzer and Lineup Helper
+  pages still render unaffected.
+
 ## Known limitations
 
 - **Early-season small samples.** With 1-2 games played, `consistency_score`
@@ -1784,3 +2145,76 @@ file too:
     remains firmly OFF by default and is not expected to be enabled without
     a separate, explicit product decision - this pass did not evaluate
     whether that exception should ever ship.
+- **Player Comparison / Case Detail UX pass - findings and remaining limitations.**
+  - **The real, committed `data/defense_reporting.parquet` was found to be
+    on the OLD schema** (missing `defensive_games_played`/
+    `player_game_row_count`) - the prior Reporting Integrity pass fixed the
+    PIPELINE CODE but the mart itself was never regenerated (that requires
+    network access to nflreadpy this environment doesn't have). Before this
+    pass added a schema guard, `pages/2_Defense_Matchups.py` raised a raw,
+    unhandled `KeyError: 'defensive_games_played'` on this real data -
+    verified against the prior commit. It now shows an actionable "run the
+    pipeline" message instead. **Run `python dfs_data_pipeline.py` against a
+    real data source to regenerate the mart** and clear this condition;
+    until then, Defense vs Position is unusable and Matchup Analyzer's
+    matchup-sample fields read "Unavailable" (gracefully, via
+    `lib.matchup_analyzer._merge_defense_extra`'s existing null-fill, not
+    this pass's guard).
+  - **A pre-existing defect was found, not fixed** (out of scope - "do not
+    change... case-summary classification logic"): `lib.player_case_
+    summary._evaluate_opportunity` does `if label == "rising_opportunity"`
+    with no `pd.notna()` guard. Any role-safe (non-inactive/unresolved/
+    unmatched) player with a null `opportunity_label` - which happens
+    whenever `player_opportunity_reporting.parquet` is missing or empty -
+    raises `TypeError: boolean value of NA is ambiguous` instead of
+    degrading gracefully. Not reachable with today's real committed data
+    (that mart is populated), but reachable if it ever goes missing/empty
+    while other marts remain. See
+    `tests/test_matchup_analyzer.py::test_build_case_summary_requires_non_null_opportunity_label_for_safe_roles`,
+    which documents and locks in the current behavior rather than silently
+    patching it.
+  - The comparison's own `REQUIRED_COMPARISON_COLUMNS` schema guard is
+    effectively a defense-in-depth backstop today, not the mechanism
+    currently preventing a crash on the real stale defense mart - the merge
+    helper's existing null-fill already handles that case. It would fire if
+    a future change to `build_matchup_analyzer_table` dropped one of its
+    own output columns outright.
+  - Comparison selection state (`cmp_selected_uids`) is session-local
+    (`st.session_state`), like every other filter on this page - it is not
+    saved, shared, or restored across browser sessions.
+- **Offensive Production Matrix pass - findings and remaining limitations.**
+  - **`team_offense_position_reporting.parquet`, `team_defense_position_reporting.parquet`,
+    and `upcoming_schedule.parquet` do not exist on the real committed data
+    in this environment** - the pipeline code to build them was added, but
+    running it requires live network access to nflreadpy this sandboxed
+    session doesn't have. The page's own schema guard shows an actionable
+    "Run `python dfs_data_pipeline.py`" message for the matrix/discovery
+    sections rather than crashing; the player-distribution drill-down
+    (`players_weekly.parquet`-only) is unaffected and works today.
+    `tests/test_offensive_production_matrix_page.py` proves both halves of
+    this behavior against the real, current data.
+  - **"Team played this week" is inferred from `players_weekly.parquet`
+    having any row for that team**, not from a dedicated team-level
+    completed-game source - a documented, deliberate choice (reusing
+    existing data rather than adding a new fetch), reliable in practice
+    since every real NFL offense has a QB pass attempt almost every game,
+    but theoretically imperfect for a never-observed edge case (e.g. a
+    data outage that drops every player row for a team in a week that
+    otherwise completed).
+  - **Upcoming schedule opponents only cover REG season games** one level
+    of lookahead implied by `next_slate_week` onward - there is no
+    multi-week schedule browser; Upcoming Matchup Discovery shows whichever
+    upcoming week(s) `nfl.load_schedules` currently has as not-yet-completed
+    for the active season.
+  - **No snap counts or route data anywhere in this feature** - confirmed
+    absent from `dfs_data_pipeline.PLAYER_STAT_COLUMNS` (nflreadpy's player-
+    week stats as this pipeline consumes them); carries/targets/receptions
+    are the only opportunity measures available, and the page never infers
+    blocking-vs-receiving role or snap share from a position label alone.
+  - **The research shortlist and matrix/discovery filter selections are
+    session-local** (`st.session_state`), consistent with every other
+    filter in this app - not persisted across browser sessions or restarts.
+  - **No historical projection-attainment, boom/bust, or pre-lock-snapshot
+    evaluation** was implemented, by explicit instruction for this pass -
+    the drill-down shows historical distribution only, never a projection,
+    and the page states this directly.

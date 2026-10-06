@@ -890,3 +890,271 @@ def test_page_mixed_signals_review_never_leaks_excluded_inactive_unresolved_moni
                 if "No Clear Opportunity Path" in roles_shown:
                     promoted_rows = df_element.value[df_element.value["Role"] == "No Clear Opportunity Path"]
                     assert promoted_rows["Key Concern"].str.contains("Player Pool only", na=False).all()
+
+
+# ---------------------------------------------------------------------------
+# Player Comparison / Case Detail UX (presentation-only pass)
+# ---------------------------------------------------------------------------
+import streamlit as st  # noqa: E402
+
+from lib.data import load_players_current as _load_players_current_for_cmp  # noqa: E402
+from lib.player_comparison import MAX_COMPARISON_PLAYERS  # noqa: E402
+from lib.player_comparison import attach_row_uid as _cmp_attach_row_uid  # noqa: E402
+from lib.player_comparison import build_comparison_table as _cmp_build_table  # noqa: E402
+from lib.player_comparison import candidate_players as _cmp_candidates  # noqa: E402
+from lib.player_case_summary import build_case_summary as _build_case_summary_for_cmp  # noqa: E402
+
+
+@pytest.fixture
+def cased_table(scenario):
+    """The same `_standard_scenario()` players, with real (never-null)
+    opportunity data merged in and the Player Case Summary layer applied on
+    top - exactly what `pages/5_Matchup_Analyzer.py`'s cached builder does,
+    so comparison-table tests can read `signal_alignment` etc.
+
+    NOTE: supplying a real opportunity_df here (rather than the bare
+    `table` fixture's default of None) is deliberate, not incidental - see
+    `test_build_case_summary_requires_non_null_opportunity_label_for_safe_roles`
+    below for why passing no opportunity data crashes
+    `lib.player_case_summary._evaluate_opportunity` on any role-safe player
+    (a pre-existing gap this presentation-only pass does not fix).
+    """
+    dk, current, prior, defense, team, role = scenario
+    opportunity = pd.DataFrame([
+        _opportunity_row(pid, opportunity_label="insufficient_sample", confidence_label="insufficient_sample")
+        for pid in current["player_id"]
+    ])
+    table_with_opportunity = build_matchup_analyzer_table(dk, current, prior, defense, team, role, opportunity)
+    return _build_case_summary_for_cmp(table_with_opportunity)
+
+
+def test_build_case_summary_requires_non_null_opportunity_label_for_safe_roles(scenario):
+    """
+    PRE-EXISTING GAP (found while building this UX pass, not introduced by
+    it - reproduces identically on the prior commit): `lib.player_case_
+    summary._evaluate_opportunity` does `if label == "rising_opportunity"`
+    with no `pd.notna()` guard. When `opportunity_label` is null (e.g. the
+    Opportunity Model's mart is missing/empty) for any player whose role
+    is NOT inactive/role_unresolved/unmatched (those short-circuit to
+    "Insufficient Data" before this code runs), this raises `TypeError:
+    boolean value of NA is ambiguous` instead of degrading gracefully.
+    This test documents and locks in that pre-existing behavior rather
+    than silently patching the classification logic, which is out of
+    scope for this presentation-only pass (see the task's "Do not change
+    ... case-summary classification logic").
+    """
+    dk, current, prior, defense, team, role = scenario
+    table_without_opportunity = build_matchup_analyzer_table(dk, current, prior, defense, team, role)
+    with pytest.raises(TypeError):
+        _build_case_summary_for_cmp(table_without_opportunity)
+
+
+def test_comparison_restricted_and_inactive_players_show_their_restriction(cased_table):
+    # Issue 2/Case Summary safeguards must remain visible INSIDE a
+    # comparison, never softened or hidden by this presentation pass.
+    with_uid = _cmp_attach_row_uid(cased_table)
+    selected = with_uid[with_uid["Name"].isin(["Hurt Runner", "Bench Wideout", "Unresolved QB"])]
+    comparison = _cmp_build_table(selected)
+
+    hurt_col = [c for c in comparison.columns if "Hurt Runner" in c][0]
+    bench_col = [c for c in comparison.columns if "Bench Wideout" in c][0]
+    unresolved_col = [c for c in comparison.columns if "Unresolved QB" in c][0]
+
+    assert comparison.loc["Eligibility Section", hurt_col] == "Inactive"
+    assert comparison.loc["Eligibility Section", bench_col] == "Excluded by Role Context"
+    assert comparison.loc["Eligibility Section", unresolved_col] == "Needs Review"
+    # Never silently cleared to "Unavailable" - the restriction reason is real text.
+    assert comparison.loc["Eligibility Context", bench_col] != "Unavailable"
+
+
+def test_comparison_missing_dvp_sample_renders_unavailable_not_zero(cased_table):
+    # The synthetic `_defense_row` fixture used to build `table` doesn't
+    # supply `defensive_games_played` - proving a real-shaped "missing
+    # reporting value" case renders honestly, never as 0.
+    with_uid = _cmp_attach_row_uid(cased_table)
+    selected = with_uid[with_uid["Name"] == "Rashee Rice"]
+    comparison = _cmp_build_table(selected)
+    col = comparison.columns[0]
+    assert comparison.loc["Distinct Defensive Games in Sample", col] == "Unavailable"
+
+
+def test_comparison_no_changes_to_existing_projection_role_or_opportunity_fields(cased_table):
+    # Regression guard (presentation-only pass): building the comparison
+    # layer must never mutate the underlying matchup-table/case-summary
+    # values - round-tripping a row through the comparison helpers must
+    # leave the source frame byte-identical.
+    before = cased_table.copy(deep=True)
+
+    touched = _cmp_attach_row_uid(cased_table.copy())
+    _ = _cmp_build_table(touched[touched["Name"] == "Rashee Rice"])
+
+    pd.testing.assert_frame_equal(cased_table.reset_index(drop=True), before.reset_index(drop=True))
+    rb = cased_table[cased_table["Name"] == "Rashee Rice"].iloc[0]
+    assert rb["role_classification"] == "confirmed_starter"
+    assert rb["opportunity_label"] == "insufficient_sample"
+    assert rb["opportunity_pool_eligible"] == True  # noqa: E712 - unchanged role-eligible-for-pool pass-through
+
+
+def test_page_comparison_selecting_two_players_renders_table_and_case_details():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    ms = at.multiselect(key="cmp_selected_uids")
+    assert len(ms.options) > 0
+    ms.set_value(ms.options[:2])
+    at.run()
+    assert not at.exception
+    assert len(at.expander) >= 2  # at least one Case Detail expander per selected player
+
+
+def test_page_comparison_selecting_four_players_renders_table_and_case_details():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    ms = at.multiselect(key="cmp_selected_uids")
+    four = ms.options[:4]
+    ms.set_value(four)
+    at.run()
+    assert not at.exception
+    assert len(at.multiselect(key="cmp_selected_uids").value) == 4
+
+
+def test_page_comparison_selection_limited_to_four():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    ms = at.multiselect(key="cmp_selected_uids")
+    five = ms.options[:5]
+    assert len(five) == 5
+    ms.set_value(five)
+    at.run()
+    assert not at.exception
+    assert len(at.multiselect(key="cmp_selected_uids").value) == MAX_COMPARISON_PLAYERS
+
+
+def test_page_comparison_single_selection_prompts_for_more_no_table_crash():
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    ms = at.multiselect(key="cmp_selected_uids")
+    ms.set_value(ms.options[:1])
+    at.run()
+    assert not at.exception
+    assert any("at least 2" in c.value for c in at.caption)
+
+
+def test_page_comparison_selector_distinguishes_duplicate_names():
+    real = _load_players_current_for_cmp().iloc[0]
+    real_name, real_team, real_pos = real["player_display_name"], real["team"], real["position"]
+
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    dup_csv = (
+        "Position,Name,Salary,Game Info,TeamAbbrev,AvgPointsPerGame\n"
+        f"{real_pos},{real_name},5000,BUF@{real_team} 10/12/2026 01:00PM ET,{real_team},10.0\n"
+        f"TE,{real_name},4800,BUF@KC 10/12/2026 01:00PM ET,KC,9.0\n"
+    )
+    at.file_uploader[0].upload("dup.csv", dup_csv.encode("utf-8"), "text/csv")
+    at.run()
+    assert not at.exception
+    at.selectbox(key="cmp_position").set_value("All")
+    at.run()
+    assert not at.exception
+    matches = [o for o in at.multiselect(key="cmp_selected_uids").options if real_name in o]
+    assert len(matches) == 2
+    assert matches[0] != matches[1]  # distinguishable - team/position differ in the label
+
+
+def test_page_comparison_changed_slate_cleans_up_stale_selections_safely():
+    real = _load_players_current_for_cmp().iloc[0]
+    real_name, real_team, real_pos = real["player_display_name"], real["team"], real["position"]
+
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    ms = at.multiselect(key="cmp_selected_uids")
+    ms.set_value(ms.options[:2])
+    at.run()
+    assert not at.exception
+    assert len(at.multiselect(key="cmp_selected_uids").value) == 2
+
+    synthetic_csv = (
+        "Position,Name,Salary,Game Info,TeamAbbrev,AvgPointsPerGame\n"
+        f"{real_pos},{real_name},5000,BUF@{real_team} 10/12/2026 01:00PM ET,{real_team},10.0\n"
+        "RB,Totally New Guy,5200,BUF@KC 10/12/2026 01:00PM ET,KC,11.0\n"
+    )
+    at.file_uploader[0].upload("synthetic.csv", synthetic_csv.encode("utf-8"), "text/csv")
+    at.run()
+    assert not at.exception
+    assert any("slate changed" in i.value and "removed" in i.value for i in at.info)
+    assert at.multiselect(key="cmp_selected_uids").value == []
+
+
+def test_page_comparison_historical_slate_shown_above_comparison(monkeypatch):
+    import lib.data as data_module
+
+    real_metadata = data_module.load_metadata()
+    real_slate_meta = data_module.load_dk_slate_metadata()
+
+    def _fake_metadata():
+        out = dict(real_metadata)
+        out["next_slate_week"] = (real_slate_meta.get("week") or 0) + 1
+        return out
+
+    monkeypatch.setattr(data_module, "load_metadata", _fake_metadata)
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    assert any("historical/review context" in c.value for c in at.caption)
+
+
+def test_page_comparison_on_real_committed_data_shows_unavailable_not_a_crash_or_row_count():
+    """
+    The REAL, currently-committed `data/defense_reporting.parquet` predates
+    the prior pass's pipeline change and has no `defensive_games_played`
+    column at all (see tests/test_defense_matchups_page.py). Because
+    `lib.matchup_analyzer._merge_defense_extra` always fills every
+    configured extra column with NA when the source mart lacks it, the
+    merged table still HAS the column (just null) - this page's own schema
+    guard correctly does not fire, and the comparison renders "Unavailable"
+    for every player's Distinct Defensive Games in Sample, never a crash
+    and never a silently-substituted `games_in_sample` row count.
+    """
+    import lib.data as data_module
+
+    assert "defensive_games_played" not in data_module.load_defense_reporting().columns
+
+    st.cache_data.clear()
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    assert not any("older pipeline schema" in w.value for w in at.warning)
+
+    ms = at.multiselect(key="cmp_selected_uids")
+    ms.set_value(ms.options[:2])
+    at.run()
+    assert not at.exception
+    found = False
+    for df_element in at.dataframe:
+        if "Distinct Defensive Games in Sample" in list(df_element.value.index):
+            found = True
+            assert (df_element.value.loc["Distinct Defensive Games in Sample"] == "Unavailable").all()
+    assert found
+
+
+def test_page_comparison_legacy_schema_missing_column_shows_refresh_message(monkeypatch):
+    import lib.matchup_analyzer as ma_module
+
+    original = ma_module.build_matchup_analyzer_table
+
+    def _legacy_schema_table(*args, **kwargs):
+        return original(*args, **kwargs).drop(columns=["defensive_games_played"])
+
+    monkeypatch.setattr(ma_module, "build_matchup_analyzer_table", _legacy_schema_table)
+    # `_build_table`'s st.cache_data entry for this exact (file_bytes,
+    # fingerprint) pair may already be populated by an earlier test in this
+    # same process - clear it so the monkeypatched builder is actually
+    # exercised, not a stale cache hit from the real (good-schema) run.
+    st.cache_data.clear()
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+    assert any(
+        "older pipeline schema" in w.value and "defensive_games_played" in w.value for w in at.warning
+    )
