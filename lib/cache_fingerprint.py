@@ -40,6 +40,10 @@ REPORTING_SOURCE_FILES = [
     "team_reporting.parquet",
     "player_opportunity_reporting.parquet",
     "player_role_context.parquet",
+    "team_offense_position_reporting.parquet",
+    "team_defense_position_reporting.parquet",
+    "upcoming_schedule.parquet",
+    "players_weekly.parquet",
 ]
 
 # Configuration modules whose tunables change the OUTPUT of the cached
