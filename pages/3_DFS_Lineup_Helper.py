@@ -215,6 +215,66 @@ source_cols[2].metric("Slate week", slate_week if slate_week is not None else "�
 source_cols[3].metric("File last updated", slate_updated_display)
 st.caption(f"Active file: `{active_filename}`")
 
+
+def _game_date_range(file_bytes: bytes) -> str:
+    """Parsed directly from the loaded salary CSV's own "Game Info" column
+    - never from an external schedule file - so this always reflects
+    exactly the slate actually loaded above, not an assumed/expected week."""
+    try:
+        raw_dk_df = pd.read_csv(io.BytesIO(file_bytes))
+    except Exception:
+        return "unknown"
+    dates_raw = raw_dk_df.get("Game Info")
+    if dates_raw is None:
+        return "unknown"
+    dates = dates_raw.astype(str).str.extract(r"(\d{1,2}/\d{1,2}/\d{4})")[0].dropna()
+    parsed = pd.to_datetime(dates, format="%m/%d/%Y", errors="coerce").dropna()
+    if parsed.empty:
+        return "unknown"
+    lo, hi = parsed.min(), parsed.max()
+    return lo.strftime("%b %d, %Y") if lo == hi else f"{lo.strftime('%b %d, %Y')} – {hi.strftime('%b %d, %Y')}"
+
+
+# ---------------------------------------------------------------------------
+# Data context header - a single, visible summary of exactly which inputs
+# this page's projections/matchups below are built from. Every value here
+# is read directly from the already-loaded slate/metadata above (never
+# re-derived or guessed), so a mismatch between this slate and "this
+# week's" real games is visible immediately rather than discovered later
+# by comparing numbers against an outside source.
+# ---------------------------------------------------------------------------
+st.subheader("📅 Data Context")
+context_cols = st.columns(4)
+context_cols[0].metric(
+    "Loaded slate",
+    f"{slate_season} Wk {slate_week}" if slate_season is not None and slate_week is not None else "—",
+)
+context_cols[1].metric("Salary game dates", _game_date_range(file_bytes))
+context_cols[2].metric(
+    "Stats through week", meta.get("latest_completed_week", "—"),
+    help=(
+        f"The statistical pipeline's player/defense/opportunity reporting reflects completed games "
+        f"through week {meta.get('latest_completed_week', 'unknown')} of the {active_season} season "
+        f"(data/metadata.json). This can be a different week than the loaded salary slate above - "
+        f"they are two independent inputs."
+    ),
+)
+context_cols[3].metric(
+    "Role data",
+    "OK" if depth_ok and injury_ok else "Stale/unavailable",
+    help=(
+        f"Depth chart: {depth_freshness}. ESPN injuries: {injury_freshness}. See the freshness metrics "
+        f"above for detail."
+    ),
+)
+st.caption(
+    "The loaded salary slate's season/week and game dates, the statistical pipeline's "
+    "stats-through week, and role data freshness are four independent inputs - a mismatch between "
+    "any of them (e.g. a slate for a different week than the stats reflect) is a real condition to "
+    "account for, not a bug, and is called out by the warnings below when detected."
+)
+st.divider()
+
 # ---------------------------------------------------------------------------
 # Slate rollover integrity (Issue 4): an older slate stays fully usable for
 # review, it's just never described as current upcoming-slate research -
@@ -324,13 +384,35 @@ CASE_DISPLAY_COLUMNS = [
     "opportunity_label_display", "opportunity_confidence_display",
     "signal_alignment", "case_summary", "primary_concern", "missing_evidence",
 ]
-if not is_preseason:
+if not is_preseason and "stat_player_id" in result.columns:
+    # `case_enriched` is built from THIS SAME `file_bytes` (it's the exact
+    # bytes read for `result` above, and is also part of
+    # build_case_enriched_table's own cache key) - there is no code path
+    # where a different slate's upload/committed-file bytes could produce
+    # this `case_enriched`, so a stale cache can never attach another
+    # slate's opponent-specific case summary here.
     case_enriched = build_case_enriched_table(file_bytes, reporting_inputs_fingerprint())
-    case_merge_cols = ["Name", "TeamAbbrev", "Salary"] + [
-        c for c in CASE_DISPLAY_COLUMNS if c in case_enriched.columns
-    ]
-    case_lookup = case_enriched[case_merge_cols].drop_duplicates(subset=["Name", "TeamAbbrev", "Salary"])
-    result = result.merge(case_lookup, on=["Name", "TeamAbbrev", "Salary"], how="left")
+    if "stat_player_id" in case_enriched.columns:
+        # Stable identity join key - the resolved nflreadpy player id
+        # (lib.dk_helper.match_dk_players's `stat_player_id`), never
+        # Name/Team/Salary, which can collide or shift between slates.
+        # Unmatched DK rows (stat_player_id null) are dropped from the
+        # lookup before merging, so a null key can never fan-match another
+        # null key on the other side.
+        case_merge_cols = ["stat_player_id"] + [
+            c for c in CASE_DISPLAY_COLUMNS if c in case_enriched.columns
+        ]
+        case_lookup = (
+            case_enriched[case_enriched["stat_player_id"].notna()][case_merge_cols]
+            .drop_duplicates(subset=["stat_player_id"])
+        )
+        merged = result.merge(case_lookup, on="stat_player_id", how="left")
+        # Defensive: a 1:1 identity join must never change the row count.
+        # If it somehow did, skip the merge rather than risk duplicated
+        # salary rows - the columns below then fall back to NA (shown as
+        # "data unavailable"), never fabricated or silently duplicated.
+        if len(merged) == len(result):
+            result = merged
 for col in CASE_DISPLAY_COLUMNS:
     if col not in result.columns:
         result[col] = pd.NA

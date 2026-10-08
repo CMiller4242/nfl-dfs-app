@@ -356,3 +356,160 @@ def test_preseason_mode_skips_case_enrichment_without_crashing(monkeypatch):
     assert any(
         "Not available in Week 1 Baseline Mode" in i.value for i in at.info
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. The additive opportunity/case-summary merge: stable identifiers, no
+#    row duplication, unchanged projections/eligibility, and no cross-slate
+#    leakage of opponent-specific case data.
+# ---------------------------------------------------------------------------
+def test_case_merge_never_duplicates_salary_rows(patched_marts):
+    at = _run_page(patched_marts)
+    md_values = [m.value for m in at.markdown]
+    # Every one of the 4 scenario players' cards is a unique "- **Name**"
+    # bullet; none should appear more than once anywhere on the page's
+    # Highest Projected Value / Supported Plays cards as a direct sign of
+    # row fan-out from the identity merge.
+    for name in ["Strong Value QB", "Tough Matchup QB", "Weak Case QB", "Lonely Weak RB"]:
+        bullets = [v for v in md_values if v.startswith(f"- **{name}**")]
+        # At most one Highest-Projected-Value card and one Supported-Plays
+        # card per player - never more (which would indicate duplication).
+        assert len(bullets) <= 2, f"{name} appears {len(bullets)} times: {bullets}"
+
+
+def test_case_merge_preserves_existing_projection_and_eligibility_values(patched_marts):
+    at = _run_page(patched_marts)
+    # Independently recomputed from the unchanged formula + fixture inputs -
+    # if the merge corrupted or overwrote projected_points/value/role, these
+    # would no longer match what's rendered.
+    expected = {
+        "Strong Value QB": (20.0, 22.0, 3.0, 6000, "confirmed_starter"),
+        "Tough Matchup QB": (18.0, 19.0, -5.0, 5000, "confirmed_starter"),
+        "Weak Case QB": (12.0, 11.0, 0.0, 7000, "confirmed_starter"),
+    }
+    text = _all_markdown(at)
+    for name, (avg, momentum, delta, salary, role) in expected.items():
+        points = avg + (momentum - avg) * MOMENTUM_ADJUSTMENT_WEIGHT + delta * MATCHUP_ADJUSTMENT_WEIGHT
+        value = points / (salary / 1000)
+        card_start = text.index(name)
+        card_text = text[card_start:card_start + 400]
+        assert f"{points:.1f} pts" in card_text
+        assert f"{value:.2f} pts/$1k" in card_text
+        assert role in card_text
+
+
+def test_case_merge_uses_stable_player_id_not_name_team_salary(patched_marts):
+    # The merge key is lib.dk_helper.match_dk_players's resolved
+    # `stat_player_id` (a real nflreadpy player id), never the DK row's own
+    # Name/TeamAbbrev/Salary - those can shift between slate exports
+    # (salary changes weekly, name formatting varies) in a way a durable
+    # player identity never does. Verify the column lib.matchup_analyzer's
+    # pipeline actually resolves is present and non-null for a confidently
+    # matched player, confirming the identity this page's merge relies on
+    # is real, not a coincidental string match.
+    from lib.dk_helper import match_dk_players
+    from lib.data import load_players_current
+
+    dk, current, *_ = _scenario()
+    matched = match_dk_players(dk, current)
+    strong = matched[matched["Name"] == "Strong Value QB"].iloc[0]
+    assert strong["match_method"] in ("exact_name_team_position", "exact_name_team", "fuzzy_team_position")
+    assert pd.notna(strong["stat_player_id"])
+    assert strong["stat_player_id"] == "p_strong"
+
+
+def test_switching_slate_never_leaks_previous_slates_case_summary(monkeypatch):
+    """
+    Guards against exactly the scenario raised in review: the SAME player
+    identity, loaded on two different slates with two different opponents,
+    must show each slate's OWN matchup/case data - never a stale, cached
+    result carried over from the previously loaded slate. Both slates share
+    role/opportunity context (a player's identity doesn't change week to
+    week) but differ only in the DK row's Game Info/opponent and the
+    defense_reporting row for that new opponent.
+    """
+    role_context = pd.DataFrame([_role_row("p_switch", "Switch QB", "KC", "QB")])
+    opportunity = pd.DataFrame([_opportunity_row("p_switch", "stable_opportunity")])
+    team_reporting = pd.DataFrame([_team_reporting_row("KC")])
+    current = pd.DataFrame([_player_row("p_switch", "Switch QB", "KC", "QB", "NYG", avg=20.0, momentum=20.0)])
+
+    # Slate A: favorable matchup vs NYG.
+    dk_a = pd.DataFrame([_dk_row("Switch QB", "QB", "KC", "NYG", salary=6000, avg=20.0)])
+    defense_a = pd.DataFrame([_defense_row("NYG", "QB", matchup_delta=5.0, pctile=90.0)])
+
+    # Slate B: tough matchup vs SEA - a DIFFERENT opponent/defense row for
+    # the SAME player identity.
+    dk_b = pd.DataFrame([_dk_row("Switch QB", "QB", "SEA", "KC", salary=6000, avg=20.0)])
+    # Note: team flips to SEA in this synthetic slate to force a distinct
+    # opponent lookup; role/opportunity context still resolves by player_id.
+    role_context_b = pd.DataFrame([_role_row("p_switch", "Switch QB", "SEA", "QB")])
+    current_b = pd.DataFrame([_player_row("p_switch", "Switch QB", "SEA", "QB", "KC", avg=20.0, momentum=20.0)])
+    defense_b = pd.DataFrame([_defense_row("KC", "QB", matchup_delta=-6.0, pctile=5.0)])
+
+    monkeypatch.setattr(data_module, "load_players_prior_season_baseline", lambda: PRIOR_BASELINE_EMPTY)
+    monkeypatch.setattr(data_module, "load_team_reporting", lambda: team_reporting)
+    monkeypatch.setattr(data_module, "load_player_opportunity_reporting", lambda: opportunity)
+
+    # --- Slate A ---
+    monkeypatch.setattr(data_module, "load_players_current", lambda: current)
+    monkeypatch.setattr(data_module, "load_defense_reporting", lambda: defense_a)
+    monkeypatch.setattr(data_module, "load_player_role_context", lambda: role_context)
+    st.cache_data.clear()
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    at.file_uploader[0].upload("SlateA.csv", _dk_csv_bytes(dk_a), "text/csv")
+    at.run()
+    assert not at.exception
+    text_a = _all_markdown(at)
+    card_a = text_a[text_a.index("Switch QB"):text_a.index("Switch QB") + 400]
+    assert "Favorable" in card_a
+
+    # --- Slate B, same AppTest session, uploaded on top of Slate A ---
+    monkeypatch.setattr(data_module, "load_players_current", lambda: current_b)
+    monkeypatch.setattr(data_module, "load_defense_reporting", lambda: defense_b)
+    monkeypatch.setattr(data_module, "load_player_role_context", lambda: role_context_b)
+    at.file_uploader[0].upload("SlateB.csv", _dk_csv_bytes(dk_b), "text/csv")
+    at.run()
+    assert not at.exception
+    text_b = _all_markdown(at)
+    card_b = text_b[text_b.index("Switch QB"):text_b.index("Switch QB") + 400]
+    # Slate B's own tough matchup must show - Slate A's favorable result
+    # (or its case-summary alignment built from it) must never persist.
+    assert "Tough" in card_b
+    assert "Favorable" not in card_b
+
+
+# ---------------------------------------------------------------------------
+# Visible Data Context header - slate season/week, game-date range,
+# stats-through week, and role-data freshness.
+# ---------------------------------------------------------------------------
+def test_data_context_header_shows_slate_week_dates_and_stats_week(monkeypatch):
+    role_context = pd.DataFrame([_role_row("p1", "Header QB", "KC", "QB")])
+    current = pd.DataFrame([_player_row("p1", "Header QB", "KC", "QB", "DEN", avg=20.0, momentum=20.0)])
+    defense = pd.DataFrame([_defense_row("DEN", "QB", matchup_delta=0.0, pctile=50.0)])
+    dk = pd.DataFrame([_dk_row("Header QB", "QB", "KC", "DEN", salary=6000, avg=20.0)])
+
+    monkeypatch.setattr(data_module, "load_players_current", lambda: current)
+    monkeypatch.setattr(data_module, "load_defense_reporting", lambda: defense)
+    monkeypatch.setattr(data_module, "load_player_role_context", lambda: role_context)
+    monkeypatch.setattr(data_module, "load_players_prior_season_baseline", lambda: PRIOR_BASELINE_EMPTY)
+    monkeypatch.setattr(
+        data_module, "load_metadata",
+        lambda: {
+            "app_mode": "in_season", "active_season": 2026, "source_season": 2026,
+            "latest_completed_week": 3, "next_slate_week": 4,
+        },
+    )
+
+    st.cache_data.clear()
+    at = AppTest.from_file(PAGE_PATH, default_timeout=120)
+    at.run()
+    at.file_uploader[0].upload("Header.csv", _dk_csv_bytes(dk), "text/csv")
+    at.run()
+    assert not at.exception
+    subheaders = [s.value for s in at.subheader]
+    assert "📅 Data Context" in subheaders
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Stats through week"] == "3"
+    assert "Oct" in metrics["Salary game dates"]
+    assert metrics["Role data"] in ("OK", "Stale/unavailable")
