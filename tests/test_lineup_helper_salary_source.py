@@ -3,6 +3,7 @@ import os
 import shutil
 
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from lib.dk_salary_loader import CURRENT_CSV_PATH, SLATE_METADATA_PATH
@@ -69,6 +70,13 @@ def _metrics_by_label(at):
 def test_committed_current_csv_loads_with_no_uploader_interaction(isolated_salary_files):
     _write_committed_slate(season=2026, week=1)
 
+    # st.cache_data is a process-global store - a prior test's AppTest run
+    # may have already cached load_dk_slate_metadata()'s result under the
+    # real committed file's PRE-test content. Clearing here (the same
+    # convention most other AppTest-based tests in this suite already
+    # follow) guarantees this test reads the slate just written above,
+    # regardless of what ran before it.
+    st.cache_data.clear()
     at = AppTest.from_file(PAGE_PATH, default_timeout=60)
     at.run()
 
@@ -89,6 +97,7 @@ def test_session_upload_overrides_committed_file_only_for_that_session(isolated_
     )
     _write_committed_slate(season=2025, week=18, row_count=1, csv_text=committed_csv)
 
+    st.cache_data.clear()
     at = AppTest.from_file(PAGE_PATH, default_timeout=60)
     at.run()
     assert not at.exception

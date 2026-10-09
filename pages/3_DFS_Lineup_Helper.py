@@ -13,9 +13,11 @@ from lib.data import (
     load_dk_slate_metadata,
     load_injury_metadata,
     load_metadata,
+    load_player_opportunity_reporting,
     load_player_role_context,
     load_players_current,
     load_players_prior_season_baseline,
+    load_team_reporting,
 )
 from lib.dk_helper import (
     FUZZY_MATCH_THRESHOLD,
@@ -31,6 +33,8 @@ from lib.dk_helper import (
 )
 from lib.dk_salary_loader import CURRENT_CSV_PATH, SalaryCsvValidationError, validate_salary_csv_bytes
 from lib.eligibility import attach_role_context_to_dk_rows
+from lib.matchup_analyzer import build_matchup_analyzer_table
+from lib.player_case_summary import build_case_summary
 from lib.role_config import DEPTH_CHART_FRESHNESS_HOURS, INJURY_FRESHNESS_HOURS
 
 st.set_page_config(page_title="DFS Lineup Helper | NFL DFS", page_icon="💰", layout="wide")
@@ -211,6 +215,66 @@ source_cols[2].metric("Slate week", slate_week if slate_week is not None else "�
 source_cols[3].metric("File last updated", slate_updated_display)
 st.caption(f"Active file: `{active_filename}`")
 
+
+def _game_date_range(file_bytes: bytes) -> str:
+    """Parsed directly from the loaded salary CSV's own "Game Info" column
+    - never from an external schedule file - so this always reflects
+    exactly the slate actually loaded above, not an assumed/expected week."""
+    try:
+        raw_dk_df = pd.read_csv(io.BytesIO(file_bytes))
+    except Exception:
+        return "unknown"
+    dates_raw = raw_dk_df.get("Game Info")
+    if dates_raw is None:
+        return "unknown"
+    dates = dates_raw.astype(str).str.extract(r"(\d{1,2}/\d{1,2}/\d{4})")[0].dropna()
+    parsed = pd.to_datetime(dates, format="%m/%d/%Y", errors="coerce").dropna()
+    if parsed.empty:
+        return "unknown"
+    lo, hi = parsed.min(), parsed.max()
+    return lo.strftime("%b %d, %Y") if lo == hi else f"{lo.strftime('%b %d, %Y')} – {hi.strftime('%b %d, %Y')}"
+
+
+# ---------------------------------------------------------------------------
+# Data context header - a single, visible summary of exactly which inputs
+# this page's projections/matchups below are built from. Every value here
+# is read directly from the already-loaded slate/metadata above (never
+# re-derived or guessed), so a mismatch between this slate and "this
+# week's" real games is visible immediately rather than discovered later
+# by comparing numbers against an outside source.
+# ---------------------------------------------------------------------------
+st.subheader("📅 Data Context")
+context_cols = st.columns(4)
+context_cols[0].metric(
+    "Loaded slate",
+    f"{slate_season} Wk {slate_week}" if slate_season is not None and slate_week is not None else "—",
+)
+context_cols[1].metric("Salary game dates", _game_date_range(file_bytes))
+context_cols[2].metric(
+    "Stats through week", meta.get("latest_completed_week", "—"),
+    help=(
+        f"The statistical pipeline's player/defense/opportunity reporting reflects completed games "
+        f"through week {meta.get('latest_completed_week', 'unknown')} of the {active_season} season "
+        f"(data/metadata.json). This can be a different week than the loaded salary slate above - "
+        f"they are two independent inputs."
+    ),
+)
+context_cols[3].metric(
+    "Role data",
+    "OK" if depth_ok and injury_ok else "Stale/unavailable",
+    help=(
+        f"Depth chart: {depth_freshness}. ESPN injuries: {injury_freshness}. See the freshness metrics "
+        f"above for detail."
+    ),
+)
+st.caption(
+    "The loaded salary slate's season/week and game dates, the statistical pipeline's "
+    "stats-through week, and role data freshness are four independent inputs - a mismatch between "
+    "any of them (e.g. a slate for a different week than the stats reflect) is a real condition to "
+    "account for, not a bug, and is called out by the warnings below when detected."
+)
+st.divider()
+
 # ---------------------------------------------------------------------------
 # Slate rollover integrity (Issue 4): an older slate stays fully usable for
 # review, it's just never described as current upcoming-slate research -
@@ -263,6 +327,29 @@ def process_dk_csv(file_bytes: bytes, mode: str, inputs_fingerprint: str) -> pd.
     return compute_projections(matched, defense)
 
 
+@st.cache_data(show_spinner=False)
+def build_case_enriched_table(file_bytes: bytes, inputs_fingerprint: str) -> pd.DataFrame:
+    """
+    In-season only. Reuses the Matchup Analyzer page's existing pipeline
+    (lib.matchup_analyzer.build_matchup_analyzer_table +
+    lib.player_case_summary.build_case_summary) to attach opportunity
+    label/confidence and case-summary classification to this page's
+    "Highest Projected Value" cards - no classification logic is
+    recomputed or duplicated here, only reused.
+    """
+    dk_df = pd.read_csv(io.BytesIO(file_bytes))
+    table = build_matchup_analyzer_table(
+        dk_df,
+        load_players_current(),
+        load_players_prior_season_baseline(),
+        load_defense_reporting(),
+        load_team_reporting(),
+        load_player_role_context(),
+        load_player_opportunity_reporting(),
+    )
+    return build_case_summary(table)
+
+
 try:
     result = process_dk_csv(file_bytes, app_mode, reporting_inputs_fingerprint())
 except ValueError as exc:
@@ -286,6 +373,58 @@ result["data_basis"] = (
 # ---------------------------------------------------------------------------
 role_context_df = load_player_role_context()
 result = attach_role_context_to_dk_rows(result, role_context_df)
+
+# ---------------------------------------------------------------------------
+# Opportunity label/confidence + case-summary classification (Presentation
+# Fix). Additive only - never touches projections, eligibility, or role
+# classification. Unavailable in Week 1 Baseline Mode (no current-season
+# workload/case data exists yet), same as matchup_quality above.
+# ---------------------------------------------------------------------------
+CASE_DISPLAY_COLUMNS = [
+    "opportunity_label_display", "opportunity_confidence_display",
+    "signal_alignment", "case_summary", "primary_concern", "missing_evidence",
+]
+if not is_preseason and "stat_player_id" in result.columns:
+    # `case_enriched` is built from THIS SAME `file_bytes` (it's the exact
+    # bytes read for `result` above, and is also part of
+    # build_case_enriched_table's own cache key) - there is no code path
+    # where a different slate's upload/committed-file bytes could produce
+    # this `case_enriched`, so a stale cache can never attach another
+    # slate's opponent-specific case summary here.
+    case_enriched = build_case_enriched_table(file_bytes, reporting_inputs_fingerprint())
+    if "stat_player_id" in case_enriched.columns:
+        # Stable identity join key - the resolved nflreadpy player id
+        # (lib.dk_helper.match_dk_players's `stat_player_id`), never
+        # Name/Team/Salary, which can collide or shift between slates.
+        # Unmatched DK rows (stat_player_id null) are dropped from the
+        # lookup before merging, so a null key can never fan-match another
+        # null key on the other side.
+        case_merge_cols = ["stat_player_id"] + [
+            c for c in CASE_DISPLAY_COLUMNS if c in case_enriched.columns
+        ]
+        case_lookup = (
+            case_enriched[case_enriched["stat_player_id"].notna()][case_merge_cols]
+            .drop_duplicates(subset=["stat_player_id"])
+        )
+        merged = result.merge(case_lookup, on="stat_player_id", how="left")
+        # Defensive: a 1:1 identity join must never change the row count.
+        # If it somehow did, skip the merge rather than risk duplicated
+        # salary rows - the columns below then fall back to NA (shown as
+        # "data unavailable"), never fabricated or silently duplicated.
+        if len(merged) == len(result):
+            result = merged
+for col in CASE_DISPLAY_COLUMNS:
+    if col not in result.columns:
+        result[col] = pd.NA
+
+
+def _ordinal_suffix(value) -> str:
+    n = int(round(value))
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
 
 
 def _matchup_bucket(delta):
@@ -431,9 +570,18 @@ s5.metric("Unresolved role data", len(review_rows[review_rows.get("role_classifi
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Top value plays per position
+# Highest Projected Value - a pure value-per-salary ranking. This is NOT an
+# overall recommendation: it never looks at matchup, opportunity, or
+# case-summary signals, and can surface a player with a tough matchup or an
+# unresolved concern purely because their salary is low relative to their
+# projection. Those signals are shown on each card below (reused from the
+# existing opportunity/case-summary pipeline, not recomputed) so a tough
+# matchup or missing evidence is visible here, not just elsewhere on the page.
 # ---------------------------------------------------------------------------
-st.subheader("💎 Top Value Plays by Position")
+st.subheader("💎 Highest Projected Value")
+st.caption(
+    "Ranked by projected points per $1,000 among eligible players. This is not an overall recommendation."
+)
 st.caption(
     "Filtered to each position first, then ranked by projected value. Requires a confident stats "
     "match, a real projection, a usable salary, AND role_eligible_for_top_values - bench, inactive, "
@@ -448,11 +596,84 @@ for col, pos in zip(value_cols, POSITIONS):
         if pos_df.empty:
             st.caption("No qualifying players")
         for _, row in pos_df.iterrows():
-            st.markdown(
-                f"- **{row['Name']}** ({row['TeamAbbrev']})  \n"
-                f"  ${row['Salary']:,.0f} · {row['projected_value']:.2f} pts/$1k  \n"
-                f"  _{row.get('role_classification', 'n/a')}_"
-            )
+            pct = row.get("position_percentile_most_favorable")
+            quality = row.get("matchup_quality", "Unknown")
+            pct_text = f"{_ordinal_suffix(pct)} pctile" if pd.notna(pct) else "pctile n/a"
+            lines = [
+                f"- **{row['Name']}** ({row['TeamAbbrev']})  ",
+                f"  ${row['Salary']:,.0f} · {row['projected_points']:.1f} pts · {row['projected_value']:.2f} pts/$1k  ",
+                f"  Matchup: {quality} ({pct_text})  ",
+            ]
+            opp_label = row.get("opportunity_label_display")
+            if pd.notna(opp_label) and opp_label not in ("—",):
+                opp_conf = row.get("opportunity_confidence_display")
+                conf_text = opp_conf if pd.notna(opp_conf) else "n/a"
+                lines.append(f"  Opportunity: {opp_label} ({conf_text})  ")
+            alignment = row.get("signal_alignment")
+            if pd.notna(alignment):
+                lines.append(f"  Case: {alignment}  ")
+            concern = row.get("primary_concern")
+            missing = row.get("missing_evidence")
+            if pd.notna(concern) and concern:
+                lines.append(f"  ⚠️ {concern}  ")
+            elif isinstance(missing, (list, tuple)) and missing:
+                lines.append(f"  ⚠️ Missing evidence: {missing[0]}  ")
+            elif is_preseason:
+                lines.append("  _Opportunity/case data not available in Week 1 Baseline Mode._  ")
+            lines.append(f"  _{row.get('role_classification', 'n/a')}_")
+            st.markdown("\n".join(lines))
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Supported Plays to Investigate - reuses the existing Player Pool (role-
+# eligible, non-contingent-unless-toggled) and the existing case-summary
+# classification (lib.player_case_summary.build_case_summary). No new
+# weighted score: the only ordering applied is the case-summary's own fixed
+# alignment order, then the existing projected_value. A tough matchup alone
+# never excludes a player - case-summary already folds matchup into the
+# overall alignment rather than vetoing on it alone. Shows fewer than 3 per
+# position, or none, rather than inventing candidates to fill space.
+# ---------------------------------------------------------------------------
+st.subheader("🔎 Supported Plays to Investigate")
+if is_preseason:
+    st.info(
+        "Not available in Week 1 Baseline Mode - case-summary/opportunity classification requires "
+        "current-season workload and matchup data that doesn't exist yet."
+    )
+else:
+    st.caption(
+        "Qualifying classifications: **Strongly Supported** and **Mostly Supported** only (from the existing "
+        "case-summary model). Drawn from the Player Pool above, so the same role restrictions apply."
+    )
+    qualifying_alignments = ["Strongly Supported", "Mostly Supported"]
+    alignment_rank = {"Strongly Supported": 0, "Mostly Supported": 1}
+    if "signal_alignment" in pool_rows.columns:
+        supported_source = pool_rows[pool_rows["signal_alignment"].isin(qualifying_alignments)].copy()
+    else:
+        supported_source = pool_rows.iloc[0:0].copy()
+    if not supported_source.empty:
+        supported_source["_alignment_rank"] = supported_source["signal_alignment"].map(alignment_rank)
+        supported_source = supported_source.sort_values(
+            ["_alignment_rank", "projected_value"], ascending=[True, False]
+        )
+    supported_cols = st.columns(len(POSITIONS))
+    for col, pos in zip(supported_cols, POSITIONS):
+        pos_df = supported_source[supported_source["Position"] == pos].head(3)
+        with col:
+            st.markdown(f"**{pos}**")
+            if pos_df.empty:
+                st.caption("No Strongly/Mostly Supported plays")
+            for _, row in pos_df.iterrows():
+                concern = row.get("primary_concern")
+                lines = [
+                    f"- **{row['Name']}** ({row['TeamAbbrev']}) — _{row.get('signal_alignment')}_  ",
+                    f"  ${row['Salary']:,.0f} · {row['projected_value']:.2f} pts/$1k  ",
+                    f"  {row.get('case_summary', '')}  ",
+                ]
+                if pd.notna(concern) and concern:
+                    lines.append(f"  ⚠️ {concern}")
+                st.markdown("\n".join(lines))
 
 st.divider()
 
