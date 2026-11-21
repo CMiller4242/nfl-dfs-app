@@ -1,9 +1,9 @@
 {
   "season": 2026,
-  "week": 10,
-  "fetched_at": "2026-11-15T22:07:05.005963+00:00",
-  "source_timestamp": "2026-11-15T14:41:31Z",
-  "record_count": 596,
+  "week": 11,
+  "fetched_at": "2026-11-21T02:04:26.667766+00:00",
+  "source_timestamp": "2026-11-20T16:05:07Z",
+  "record_count": 584,
   "teams_covered": 32,
   "status": "ok"
 }
